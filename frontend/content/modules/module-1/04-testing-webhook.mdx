@@ -1,0 +1,129 @@
+---
+title: "Testing del webhook"
+description: "Tests unitarios e integración para el pipeline de webhooks"
+xpReward: 100
+---
+
+## Por qué testear el webhook primero
+
+El webhook es el punto de entrada de tu sistema. Un bug aquí significa que no recibís mensajes. La cobertura de tests en `app/webhook/` es del **100%** en WasAP.
+
+<Callout variant="tip">
+WasAP tiene 316 tests en total. Los del webhook son los más críticos porque si fallan, todo lo demás es irrelevante.
+</Callout>
+
+## Test de verificación GET
+
+```python title="tests/test_webhook.py"
+import pytest
+from httpx import AsyncClient
+
+
+@pytest.mark.asyncio
+async def test_verify_webhook_success(client: AsyncClient):
+    """Meta puede verificar el webhook con el token correcto."""
+    response = await client.get(
+        "/webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "test-verify-token",  # del fixture
+            "hub.challenge": "123456",
+        },
+    )
+    assert response.status_code == 200
+    assert response.text == "123456"
+
+
+@pytest.mark.asyncio
+async def test_verify_webhook_wrong_token(client: AsyncClient):
+    """Token incorrecto → 403."""
+    response = await client.get(
+        "/webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "wrong-token",
+            "hub.challenge": "123456",
+        },
+    )
+    assert response.status_code == 403
+```
+
+## Test de mensaje entrante
+
+```python title="tests/test_webhook.py"
+@pytest.mark.asyncio
+async def test_receive_text_message(
+    client: AsyncClient,
+    mock_whatsapp: AsyncMock,
+    mock_llm: AsyncMock,
+):
+    """Mensaje de texto → LLM llamado → respuesta enviada."""
+    mock_llm.complete.return_value = LLMResponse(text="Hola! Puedo ayudarte.")
+
+    payload = build_whatsapp_payload(
+        from_phone="5491155556666",
+        message="Hola, ¿qué puedes hacer?",
+    )
+
+    response = await client.post(
+        "/webhook",
+        json=payload,
+        headers={"X-Hub-Signature-256": sign(payload)},
+    )
+
+    assert response.status_code == 200
+    mock_llm.complete.assert_called_once()
+    mock_whatsapp.send_text.assert_called_once_with(
+        to="5491155556666",
+        text="Hola! Puedo ayudarte.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_signature_rejected(client: AsyncClient):
+    """Request sin firma válida → 403."""
+    response = await client.post(
+        "/webhook",
+        json={"object": "whatsapp_business_account"},
+        headers={"X-Hub-Signature-256": "sha256=invalid"},
+    )
+    assert response.status_code == 403
+```
+
+## El conftest.py
+
+```python title="tests/conftest.py"
+@pytest.fixture
+def mock_whatsapp(monkeypatch):
+    mock = AsyncMock(spec=WhatsAppClient)
+    monkeypatch.setattr("app.webhook.handler.wa_client", mock)
+    return mock
+
+@pytest.fixture
+def mock_llm(monkeypatch):
+    mock = AsyncMock(spec=LLMClient)
+    monkeypatch.setattr("app.webhook.handler.llm_client", mock)
+    return mock
+```
+
+<Concept term="AsyncMock">
+`unittest.mock.AsyncMock` es un mock que soporta `await`. Lo usás cuando el código bajo test hace `await alguna_funcion()`. Sin él, el mock retornaría un coroutine sin ejecutar.
+</Concept>
+
+<Quiz
+  question="¿Qué ventaja tiene usar mocks (AsyncMock) para el LLM y WhatsApp en los tests?"
+  options={["Los tests son más rápidos porque no hay I/O real, y son deterministas", "Los mocks validan que la API de Meta está disponible", "Permiten testear con mensajes reales de WhatsApp", "Eliminan la necesidad de un conftest.py"]}
+  correct={0}
+/>
+
+## Felicitaciones
+
+Completaste el **Módulo 1: Webhook Pipeline**. Ahora entendés:
+
+- El patrón push de webhooks vs polling
+- Verificación de firma HMAC para seguridad
+- Cómo parsear el payload anidado de Meta con Pydantic
+- Cómo enviar respuestas via la Graph API
+- Testing completo del pipeline con mocks
+
+En el **Módulo 2** integramos el LLM para generar respuestas inteligentes.

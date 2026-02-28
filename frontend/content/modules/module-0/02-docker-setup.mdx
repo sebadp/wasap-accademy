@@ -1,0 +1,100 @@
+---
+title: "Docker y servicios"
+description: "Levantar PostgreSQL, Redis y la API con docker-compose"
+xpReward: 50
+---
+
+## Por qué Docker
+
+WasAP depende de varios servicios: PostgreSQL para datos, Redis para caché y colas, y la API de FastAPI. Docker Compose los orquesta todos con un solo comando.
+
+<Callout variant="warning" title="Pre-requisito">
+Necesitás tener instalado Docker Desktop (Mac/Windows) o Docker Engine + Docker Compose (Linux). Si no lo tenés, instalalo antes de continuar.
+</Callout>
+
+## El docker-compose.yml
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: wasap
+      POSTGRES_USER: wasap
+      POSTGRES_PASSWORD: wasap
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:
+```
+
+<Concept term="depends_on">
+Le dice a Docker que el servicio `api` no arranca hasta que `db` y `redis` estén corriendo. Pero ojo: "corriendo" no significa "listo para aceptar conexiones". Usá health checks en producción.
+</Concept>
+
+## Comandos esenciales
+
+<Terminal title="Levantar todos los servicios">
+docker compose up -d
+</Terminal>
+
+<Terminal title="Ver logs de la API">
+docker compose logs -f api
+</Terminal>
+
+<Terminal title="Entrar al contenedor de la API">
+docker compose exec api bash
+</Terminal>
+
+<Terminal title="Apagar todo">
+docker compose down
+</Terminal>
+
+<Terminal title="Apagar y borrar volúmenes (reset total)">
+docker compose down -v
+</Terminal>
+
+## Verificar que todo funciona
+
+Una vez que corrés `docker compose up -d`, verificá:
+
+<Step number={1} title="PostgreSQL disponible">
+Conectate con `psql -h localhost -U wasap -d wasap` o usá un cliente como TablePlus/DBeaver.
+</Step>
+
+<Step number={2} title="API respondiendo">
+Abrí `http://localhost:8000/health` en el browser. Deberías ver `{"status": "ok"}`.
+</Step>
+
+<Step number={3} title="Docs de la API">
+Abrí `http://localhost:8000/docs` — FastAPI genera Swagger automáticamente.
+</Step>
+
+<Callout variant="tip">
+Guardá el comando `docker compose up -d` en un alias de bash. En WasAP lo tenemos como `make dev` en el Makefile.
+</Callout>
+
+<Quiz
+  question="¿Qué hace el flag -d en 'docker compose up -d'?"
+  options={["Descarga las imágenes sin levantar los servicios", "Corre los servicios en modo debug", "Corre los servicios en background (detached)", "Borra los contenedores anteriores antes de levantar"]}
+  correct={2}
+/>

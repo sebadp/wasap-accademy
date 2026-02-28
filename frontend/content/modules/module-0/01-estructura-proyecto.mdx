@@ -1,0 +1,86 @@
+---
+title: "Estructura del proyecto WasAP"
+description: "Arquitectura de 85 archivos Python y cómo están organizados"
+xpReward: 50
+---
+
+## El mapa del territorio
+
+Antes de escribir una línea de código, necesitás entender el territorio. WasAP tiene 85 archivos Python organizados en dominios claramente separados.
+
+<Callout variant="info">
+Cada carpeta del proyecto corresponde a un dominio de responsabilidad. Esta separación es intencional y es lo que hace al código mantenible a escala.
+</Callout>
+
+```
+wasap/
+  app/
+    webhook/          ← Módulo 1
+      handler.py
+      router.py
+    llm/              ← Módulo 2
+      client.py
+      prompts.py
+    memory/           ← Módulo 4
+      store.py
+      retriever.py
+    skills/           ← Módulo 5
+      registry.py
+    rag/              ← Módulo 7
+      pipeline.py
+    agents/           ← Módulo 10
+      orchestrator.py
+    main.py
+  tests/
+  docker-compose.yml
+```
+
+## Los dominios principales
+
+<Concept term="app/webhook/">
+Recibe los mensajes de WhatsApp via HTTP POST. Verifica la firma de Meta, parsea el payload y despacha el mensaje al handler correcto.
+</Concept>
+
+<Concept term="app/llm/">
+Toda la lógica de comunicación con LLMs (Claude, GPT, Ollama). Maneja el cliente HTTP, los prompts, tool calling y structured outputs.
+</Concept>
+
+<Concept term="app/memory/">
+Almacena y recupera el historial de conversación. Usa PostgreSQL como store principal con búsqueda semántica opcional via embeddings.
+</Concept>
+
+<Concept term="app/skills/">
+Sistema de plugins extensible. Cada skill es una función que el LLM puede invocar via tool calling. Hay 15 skills en producción.
+</Concept>
+
+<Concept term="app/rag/">
+Retrieval Augmented Generation. Pipeline que procesa documentos, genera embeddings y recupera contexto relevante antes de llamar al LLM.
+</Concept>
+
+## El flujo de un mensaje
+
+Cuando un usuario envía un mensaje a WasAP, pasa por este pipeline:
+
+<Step number={1} title="Recepción (webhook/)">
+WhatsApp hace un POST a tu endpoint. El handler verifica la firma HMAC-SHA256 de Meta y parsea el JSON.
+</Step>
+
+<Step number={2} title="Contexto (memory/ + rag/)">
+Se recupera el historial de conversación y, si hay documentos relevantes, se añaden al contexto.
+</Step>
+
+<Step number={3} title="Generación (llm/)">
+El cliente LLM recibe el prompt con contexto y genera una respuesta. Si activa un tool, ejecuta el skill correspondiente.
+</Step>
+
+<Step number={4} title="Respuesta (whatsapp/)">
+La respuesta se envía de vuelta via la API de WhatsApp Business.
+</Step>
+
+<Quiz
+  question="¿Qué módulo del proyecto WasAP se encarga de recibir los mensajes entrantes de WhatsApp?"
+  options={["app/llm/", "app/webhook/", "app/memory/", "app/skills/"]}
+  correct={1}
+/>
+
+En la próxima lección configuramos el entorno Docker para poder correr WasAP localmente.

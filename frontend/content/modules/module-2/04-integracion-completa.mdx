@@ -1,0 +1,128 @@
+---
+title: "Integrando LLM en el webhook"
+description: "Conectar el pipeline de webhooks con el LLM: el sistema completo"
+xpReward: 100
+---
+
+## El momento de la verdad
+
+Tenés el webhook funcionando (Módulo 1) y el cliente LLM listo (Módulo 2). Ahora los conectás.
+
+<Callout variant="tip">
+Este es el commit más satisfactorio del proyecto: cuando enviás "Hola" a tu número de WhatsApp y recibís una respuesta generada por Claude.
+</Callout>
+
+## El handler completo
+
+```python title="app/webhook/handler.py"
+from app.llm.client import LLMClient
+from app.whatsapp.client import WhatsAppClient
+from app.webhook.models import WhatsAppMessage
+from app.llm.prompts import build_system_prompt
+from app.database.session import get_db
+
+SYSTEM_PROMPT = """Eres WasAP, un asistente de WhatsApp conciso y útil.
+Responde en el idioma del usuario. Sé breve."""
+
+
+async def process_message(
+    message: WhatsAppMessage,
+    llm: LLMClient,
+    wa: WhatsAppClient,
+) -> None:
+    # 1. Construir el historial (por ahora, solo el mensaje actual)
+    messages = [
+        {"role": "user", "content": message.text.body}
+    ]
+
+    # 2. Generar respuesta con el LLM
+    response_text = await llm.complete(
+        messages=messages,
+        system=SYSTEM_PROMPT,
+    )
+
+    # 3. Marcar como leído (✓✓ azules)
+    await wa.mark_as_read(message.id)
+
+    # 4. Enviar respuesta
+    await wa.send_text(
+        to=message.from_,
+        text=response_text,
+    )
+```
+
+## Inyección de dependencias con FastAPI
+
+```python title="app/dependencies.py"
+from functools import lru_cache
+from app.llm.client import LLMClient
+from app.whatsapp.client import WhatsAppClient
+from app.config import get_settings
+
+@lru_cache
+def get_llm_client() -> LLMClient:
+    return LLMClient(get_settings())
+
+@lru_cache
+def get_wa_client() -> WhatsAppClient:
+    return WhatsAppClient(get_settings())
+
+
+# En el router:
+@router.post("/webhook")
+async def receive_webhook(
+    payload: WebhookPayload,
+    llm: LLMClient = Depends(get_llm_client),
+    wa: WhatsAppClient = Depends(get_wa_client),
+) -> JSONResponse:
+    messages = await extract_messages(payload)
+    for msg in messages:
+        await process_message(msg, llm, wa)
+    return JSONResponse({"status": "ok"})
+```
+
+<Concept term="Depends()">
+El sistema de dependency injection de FastAPI. Define dependencias que se resuelven automáticamente en cada request. Facilita el testing (podés inyectar mocks) y evita estado global mutable.
+</Concept>
+
+## Testear el sistema completo
+
+```python title="tests/test_integration.py"
+@pytest.mark.asyncio
+async def test_full_pipeline(
+    client: AsyncClient,
+    mock_llm: AsyncMock,
+    mock_wa: AsyncMock,
+):
+    """Test end-to-end: mensaje entrante → LLM → respuesta enviada."""
+    mock_llm.complete.return_value = "¡Hola! Soy WasAP, ¿en qué puedo ayudarte?"
+
+    payload = build_whatsapp_payload("5491155556666", "Hola")
+    response = await client.post(
+        "/webhook",
+        json=payload,
+        headers={"X-Hub-Signature-256": sign(payload)},
+    )
+
+    assert response.status_code == 200
+    mock_wa.send_text.assert_called_once_with(
+        to="5491155556666",
+        text="¡Hola! Soy WasAP, ¿en qué puedo ayudarte?",
+    )
+```
+
+<Quiz
+  question="¿Qué ventaja tiene usar Depends() en FastAPI sobre instanciar los clientes directamente en el handler?"
+  options={["Depends() hace las llamadas más rápidas", "Permite reemplazar implementaciones en tests sin modificar el código del handler", "Depends() maneja automáticamente los errores HTTP", "Es necesario para poder usar async/await"]}
+  correct={1}
+/>
+
+## Módulo 2 completado
+
+Ahora tu WasAP puede:
+
+- Recibir mensajes de WhatsApp de forma segura
+- Generear respuestas con Claude
+- Enviar respuestas de vuelta al usuario
+
+En el **Módulo 3** añadimos **memoria**: el historial de conversación que hace que el asistente recuerde lo que hablaron antes.

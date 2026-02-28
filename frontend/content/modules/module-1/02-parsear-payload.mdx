@@ -1,0 +1,97 @@
+---
+title: "Parsear el payload de WhatsApp"
+description: "Extraer mensajes del JSON anidado de Meta con Pydantic"
+xpReward: 75
+---
+
+## El payload de Meta es... complejo
+
+El JSON que envía Meta está profundamente anidado. Un mensaje de texto simple requiere navegar 5 niveles de anidamiento. Pydantic hace esto manejable.
+
+<Callout variant="tip">
+El payload tiene esta estructura porque Meta diseñó el webhook para soportar múltiples tipos de eventos, múltiples accounts y múltiples cambios en un solo request.
+</Callout>
+
+## Los modelos Pydantic
+
+```python title="app/webhook/models.py"
+from pydantic import BaseModel
+from typing import Literal
+
+
+class TextMessage(BaseModel):
+    body: str
+
+
+class WhatsAppMessage(BaseModel):
+    id: str
+    from_: str  # Número del remitente
+    timestamp: str
+    type: Literal["text", "image", "audio", "document"]
+    text: TextMessage | None = None
+
+
+class Change(BaseModel):
+    value: ChangeValue
+    field: str
+
+
+class ChangeValue(BaseModel):
+    messages: list[WhatsAppMessage] | None = None
+    statuses: list[dict] | None = None
+
+
+class Entry(BaseModel):
+    id: str
+    changes: list[Change]
+
+
+class WebhookPayload(BaseModel):
+    object: str
+    entry: list[Entry]
+```
+
+## Extraer el mensaje
+
+Con los modelos definidos, parsear el payload es limpio:
+
+```python title="app/webhook/handler.py"
+async def extract_messages(payload: WebhookPayload) -> list[WhatsAppMessage]:
+    """Extrae los mensajes de texto del payload de Meta."""
+    messages = []
+
+    for entry in payload.entry:
+        for change in entry.changes:
+            if change.field != "messages":
+                continue
+            if not change.value.messages:
+                continue
+
+            for msg in change.value.messages:
+                if msg.type == "text" and msg.text:
+                    messages.append(msg)
+
+    return messages
+```
+
+## Tipos de mensajes
+
+WasAP maneja varios tipos:
+
+| Tipo | Descripción | Soporte |
+|------|-------------|---------|
+| `text` | Mensaje de texto | ✓ Módulo 1 |
+| `image` | Imagen con caption | ✓ Módulo 11 |
+| `audio` | Audio/voz | ✓ Módulo 11 |
+| `document` | PDF, Word, etc | ✓ Módulo 11 |
+| `location` | Coordenadas GPS | Parcial |
+
+<Callout variant="info">
+Por ahora procesamos solo `text`. Los demás tipos se ignoran con un log de advertencia. En el Módulo 11 implementamos procesamiento de media.
+</Callout>
+
+<Quiz
+  question="¿Por qué se usa from_ con underscore en lugar de from como nombre del campo Pydantic?"
+  options={["Por convención de nombres de WhatsApp", "Para que el campo sea opcional", "Porque from es una palabra reservada de Python", "Para evitar colisiones con el campo from de SMTP"]}
+  correct={2}
+/>

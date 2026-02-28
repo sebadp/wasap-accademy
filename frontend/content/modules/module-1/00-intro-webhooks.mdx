@@ -1,0 +1,77 @@
+---
+title: "¿Qué es un webhook?"
+description: "El patrón push vs pull y cómo Meta notifica tus mensajes"
+xpReward: 50
+---
+
+## Push vs Pull
+
+Hay dos formas en que un sistema puede enterarse de que algo pasó:
+
+<Concept term="Pull (polling)">
+Tu aplicación pregunta periódicamente: "¿hay mensajes nuevos?" Cada N segundos hace un GET a la API. Ineficiente: 99% de las consultas devuelven "no hay nada".
+</Concept>
+
+<Concept term="Push (webhook)">
+Cuando hay un evento, el sistema externo te notifica haciendo un POST a una URL tuya. Solo recibes datos cuando hay algo real. Eficiente y en tiempo real.
+</Concept>
+
+<Callout variant="info">
+WhatsApp Business usa el patrón **push via webhooks**. Meta hace un POST a tu servidor cada vez que un usuario te envía un mensaje.
+</Callout>
+
+## Cómo funciona el webhook de Meta
+
+El flujo tiene dos partes:
+
+### 1. Verificación inicial (GET)
+
+Cuando registrás tu webhook en el portal de Meta, ellos hacen un GET a tu URL con tres parámetros:
+
+- `hub.mode` = `"subscribe"`
+- `hub.verify_token` = el token que vos configuraste
+- `hub.challenge` = un número aleatorio
+
+Tu servidor debe responder con ese número si el token coincide. Meta usa esto para verificar que controlás esa URL.
+
+```python title="app/webhook/router.py"
+@router.get("/webhook")
+async def verify_webhook(
+    hub_mode: str = Query(alias="hub.mode"),
+    hub_verify_token: str = Query(alias="hub.verify_token"),
+    hub_challenge: str = Query(alias="hub.challenge"),
+    settings: Settings = Depends(get_settings),
+) -> PlainTextResponse:
+    if hub_mode == "subscribe" and hub_verify_token == settings.meta_verify_token:
+        return PlainTextResponse(hub_challenge)
+    raise HTTPException(status_code=403, detail="Invalid verify token")
+```
+
+### 2. Recepción de mensajes (POST)
+
+Cada mensaje entrante llega como un POST con un payload JSON:
+
+```json title="Payload de ejemplo de WhatsApp"
+{
+  "object": "whatsapp_business_account",
+  "entry": [{
+    "changes": [{
+      "value": {
+        "messages": [{
+          "from": "5491155556666",
+          "id": "wamid.HBgL...",
+          "timestamp": "1700000000",
+          "text": { "body": "Hola, ¿qué puedes hacer?" },
+          "type": "text"
+        }]
+      }
+    }]
+  }]
+}
+```
+
+<Quiz
+  question="¿Por qué Meta hace un GET a tu endpoint antes de empezar a enviar mensajes?"
+  options={["Para cachear tu URL en sus servidores", "Para verificar que controlás esa URL y que el token es correcto", "Para obtener la lista de números registrados", "Para testear la velocidad de respuesta de tu servidor"]}
+  correct={1}
+/>

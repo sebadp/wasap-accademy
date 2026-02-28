@@ -31,32 +31,33 @@
 | DB Client | `backend/app/database/supabase_client.py` | Supabase Python SDK |
 | Tests | `backend/tests/` | pytest, asyncio |
 
-### Frontend (Next.js 15)
-| Domain | Key Files | Notes |
-|--------|-----------|-------|
-| Root Layout | `frontend/src/app/layout.tsx` | Providers, global styles |
-| Landing | `frontend/src/app/page.tsx` | Public landing page |
-| Auth | `frontend/src/app/(auth)/` | Login, signup, callback |
-| Academy Layout | `frontend/src/app/(academy)/layout.tsx` | Sidebar + XP bar (protected) |
-| Skill Tree | `frontend/src/app/(academy)/map/page.tsx` | SVG skill tree |
-| Modules | `frontend/src/app/(academy)/modules/` | Module + lesson pages |
-| Challenges | `frontend/src/app/(academy)/challenges/` | Pyodide challenge page |
-| Profile | `frontend/src/app/(academy)/profile/page.tsx` | User profile + stats |
-| MDX Components | `frontend/src/components/mdx/` | 10 custom components |
-| Editor | `frontend/src/components/editor/` | Monaco + Pyodide runner |
-| Gamification UI | `frontend/src/components/gamification/` | XP, badges, streaks |
-| Navigation | `frontend/src/components/navigation/` | Sidebar, navbar, breadcrumb |
-| Tutor | `frontend/src/components/tutor/` | Chat + context provider |
-| Auth Components | `frontend/src/components/auth/` | Provider + protected route |
-| Supabase Lib | `frontend/src/lib/supabase/` | Client + server clients |
-| API Client | `frontend/src/lib/api/client.ts` | Backend fetch wrapper |
-| Content Loader | `frontend/src/lib/content/` | MDX + challenge loaders |
-| Pyodide Engine | `frontend/src/lib/pyodide/` | WASM Python runtime |
-| Gamification Lib | `frontend/src/lib/gamification/` | XP/level constants |
-| Hooks | `frontend/src/hooks/` | useXP, useProgress, etc. |
-| Types | `frontend/src/types/` | TypeScript interfaces |
-| MDX Content | `frontend/content/modules/` | Lesson MDX files |
-| Challenge Code | `frontend/content/challenges/` | Starter code + tests |
+### Frontend (Next.js 16)
+| Domain | Key Files | Status | Notes |
+|--------|-----------|--------|-------|
+| Root Layout | `frontend/src/app/layout.tsx` | ✓ Done | Metadata, fuentes, globals.css |
+| Landing | `frontend/src/app/page.tsx` | ✓ Done | Hero + features + links auth |
+| Auth | `frontend/src/app/(auth)/` | ✓ Done | Login, signup, OAuth callback |
+| Auth Middleware | `frontend/src/middleware.ts` | ✓ Done | Protege rutas de academia |
+| Academy Layout | `frontend/src/app/(academy)/layout.tsx` | ✓ Done | Navbar + Sidebar (XPBar: Fase 1C) |
+| Skill Tree | `frontend/src/app/(academy)/map/page.tsx` | ✓ Done | Lista estática de 11 módulos |
+| Modules | `frontend/src/app/(academy)/modules/` | ✓ Done | Lista + detalle + lección MDX |
+| Challenges | `frontend/src/app/(academy)/challenges/` | TODO 1C | Pyodide challenge page |
+| Profile | `frontend/src/app/(academy)/profile/page.tsx` | TODO 1C | Stats + badges + streak |
+| MDX Components | `frontend/src/components/mdx/` | ✓ Done | 9 componentes (Callout, Quiz, Step…) |
+| Lesson Components | `frontend/src/components/lesson/` | ✓ Done | CompleteButton |
+| Editor | `frontend/src/components/editor/` | TODO 1C | Monaco + OutputPanel + SplitPane |
+| Challenge | `frontend/src/components/challenge/` | TODO 1C | ChallengeRunner, TestResults |
+| Gamification UI | `frontend/src/components/gamification/` | TODO 1C | XPBar, LevelUpModal, BadgeGrid, StreakCalendar |
+| Navigation | `frontend/src/components/navigation/` | ✓ Done | Navbar, Sidebar, LessonSidebar, LessonNav |
+| Tutor | `frontend/src/components/tutor/` | TODO 1C | TutorPanel, TutorMessage |
+| Supabase Lib | `frontend/src/lib/supabase/` | ✓ Done | client.ts, server.ts, middleware.ts |
+| API Client | `frontend/src/lib/api/client.ts` | ✓ Done | Typed fetch wrapper, todos los endpoints |
+| Content Loader | `frontend/src/lib/content/` | ✓ Done | loader.ts + types.ts (gray-matter) |
+| Pyodide Engine | `frontend/src/lib/pyodide/` | TODO 1C | worker-client.ts, types.ts |
+| Pyodide Worker | `frontend/public/pyodide-worker.js` | TODO 1C | Web Worker, carga desde CDN |
+| Hooks | `frontend/src/hooks/` | TODO 1C | useXP, useStreak, useBadges, useLevelUp |
+| Types | `frontend/src/types/index.ts` | ✓ Done | TypeScript interfaces alineadas al backend |
+| MDX Content | `frontend/content/modules/` | ✓ Done | 15 lecciones (módulos 0, 1, 2) |
 
 ### Database (Supabase)
 | Migration | File | Tables |
@@ -93,13 +94,14 @@ When completing any feature:
 
 ### Completed
 - [x] Paso 0: Scaffolding + documentation framework
+- [x] Fase 1A: Backend + Frontend foundation (backend 100%, frontend auth + layout + types + API client)
+- [x] Fase 1B: MDX content + components (15 lecciones, 9 componentes, shiki, lesson pages)
 
 ### In Progress
-- [ ] Fase 1A: Backend + Frontend foundation
+- [ ] Fase 1C: Challenges + gamification + tutor
 
 ### Next
-- [ ] Fase 1B: MDX content + components
-- [ ] Fase 1C: Challenges + gamification + tutor
+- [ ] Fase 2: Advanced content (módulos 3-16, leaderboard, social)
 
 ## 6. Project Principles
 

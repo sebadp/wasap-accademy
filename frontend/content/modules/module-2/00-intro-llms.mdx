@@ -1,0 +1,45 @@
+---
+title: "Cómo funcionan los LLMs"
+description: "Tokens, context window, temperatura y los parámetros que importan"
+xpReward: 50
+---
+
+## Qué es un LLM
+
+Un **Large Language Model** es un modelo de machine learning entrenado sobre texto masivo que puede predecir el siguiente token dada una secuencia de tokens de entrada.
+
+<Concept term="Token">
+La unidad mínima de texto que procesa el LLM. No es una letra ni una palabra: es un fragmento de texto que el tokenizer determina. En promedio, 1 token ≈ 0.75 palabras en inglés (algo menos en español).
+</Concept>
+
+<Concept term="Context Window">
+La cantidad máxima de tokens que el modelo puede procesar de una vez (input + output). Claude 3.5 Sonnet: 200K tokens. GPT-4o: 128K tokens. Es tu "memoria de trabajo" con el LLM.
+</Concept>
+
+## Los parámetros que usás todos los días
+
+### Temperature
+
+Controla la aleatoriedad de las respuestas:
+
+- `temperature=0.0` → determinista, siempre la misma respuesta
+- `temperature=0.7` → balance entre creatividad y coherencia (default de WasAP)
+- `temperature=1.0` → máxima variedad
+
+<Callout variant="tip">
+Para tareas de extracción de datos, clasificación o código: `temperature=0`. Para generación creativa: `temperature=0.7-1.0`.
+</Callout>
+
+### Max tokens
+
+El límite de tokens que el modelo puede generar en la respuesta. Si lo ponés muy bajo, la respuesta se corta. WasAP usa `max_tokens=1024` para respuestas de chat.
+
+### System prompt
+
+El mensaje de sistema define el "personaje" y las instrucciones persistentes del asistente. En WasAP, define que sos un asistente de WhatsApp útil, conciso y en el idioma del usuario.
+
+<Quiz
+  question="¿Qué temperature usarías para un sistema que extrae campos estructurados de texto (nombre, fecha, monto)?"
+  options={["temperature=1.0 para máxima creatividad", "temperature=0.0 para resultados deterministas", "temperature=0.5 como punto medio", "No importa, el LLM siempre da el mismo resultado"]}
+  correct={1}
+/>

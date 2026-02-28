@@ -50,28 +50,35 @@ Students don't learn from toy examples. They learn by understanding, modifying, 
 - [x] docs/ templates (exec-plans, features, testing)
 - [x] .env.example, docker-compose.yml
 
-### Fase 1A: Backend + Frontend Foundation — IN PROGRESS
-- [ ] Backend: pyproject.toml, main.py, config, auth middleware
-- [ ] Backend: API routes (progress, xp, badges, streaks)
-- [ ] Backend: Services (gamification, progress)
-- [ ] Backend: Tests
-- [ ] Frontend: Next.js init, MDX config, Supabase auth
-- [ ] Frontend: API client, Navbar, protected layout
-- [ ] Supabase: Migrations 001-004
+### Fase 1A: Backend + Frontend Foundation — DONE
+- [x] Backend: pyproject.toml, main.py, config, auth middleware
+- [x] Backend: API routes (progress, xp, badges, streaks)
+- [x] Backend: Services (gamification, progress, tutor)
+- [x] Backend: Tests (15 test cases)
+- [x] Frontend: Next.js 16 init, Supabase auth (client/server/middleware)
+- [x] Frontend: API client, Navbar, Sidebar, protected academy layout
+- [x] Frontend: Landing page, Skill Tree (/map), auth pages (login/signup/callback)
+- [x] Frontend: TypeScript types, design system (dark theme)
+- [x] Supabase: Migrations 001-004 (profiles, progress, gamification, tutor)
 
-### Fase 1B: MDX Content + Components — TODO
-- [ ] 10 MDX components
-- [ ] Content loader
-- [ ] Module 0 (5 lessons), Module 1 (7 lessons), Module 2 (7 lessons)
-- [ ] Module/lesson pages
-- [ ] ModuleSidebar, SkillTreeMap
+### Fase 1B: MDX Content + Components — DONE
+- [x] 9 MDX components (Callout, Terminal, Step, FileTree, Highlight, Concept, Quiz, ProgressBar, MDXComponents)
+- [x] Content loader (gray-matter + reading-time, server-side)
+- [x] Module 0 (5 lessons), Module 1 (5 lessons), Module 2 (5 lessons) — 15 lecciones MDX
+- [x] Module list page, module detail page, lesson page with MDX rendering
+- [x] LessonSidebar, LessonNav, CompleteButton
+- [x] Syntax highlighting via @shikijs/rehype (server-side, zero JS bundle)
 
-### Fase 1C: Challenges + Gamification + Tutor — TODO
-- [ ] Pyodide runner, challenge starter code
-- [ ] CodeEditor, SplitPane, challenge page
-- [ ] XPBar, LevelUpModal, BadgeGrid, StreakCalendar
-- [ ] AI tutor backend + frontend
-- [ ] Profile page, end-to-end testing
+### Fase 1C: Challenges + Gamification + Tutor — IN PROGRESS
+- [ ] Pyodide Web Worker runner (Python WASM in browser)
+- [ ] CodeEditor (Monaco, dynamic import) + SplitPane layout
+- [ ] Challenge page (/challenges/[challengeId]) con test runner
+- [ ] XPBar (en academy layout), LevelUpModal
+- [ ] BadgeGrid, StreakCalendar
+- [ ] AI Tutor chat component (frontend) conectado al backend
+- [ ] Profile page (/profile) con stats, badges, streak
+- [ ] Hooks: useXP, useStreak, useBadges
+- [ ] Build + lint + smoke test E2E
 
 ### Fase 2: Advanced Content (future)
 - [ ] Modules 3-16
