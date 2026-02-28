@@ -38,24 +38,24 @@
 | Landing | `frontend/src/app/page.tsx` | ✓ Done | Hero + features + links auth |
 | Auth | `frontend/src/app/(auth)/` | ✓ Done | Login, signup, OAuth callback |
 | Auth Middleware | `frontend/src/middleware.ts` | ✓ Done | Protege rutas de academia |
-| Academy Layout | `frontend/src/app/(academy)/layout.tsx` | ✓ Done | Navbar + Sidebar (XPBar: Fase 1C) |
+| Academy Layout | `frontend/src/app/(academy)/layout.tsx` | ✓ Done | Navbar + XPBarClient + Sidebar |
 | Skill Tree | `frontend/src/app/(academy)/map/page.tsx` | ✓ Done | Lista estática de 11 módulos |
 | Modules | `frontend/src/app/(academy)/modules/` | ✓ Done | Lista + detalle + lección MDX |
-| Challenges | `frontend/src/app/(academy)/challenges/` | TODO 1C | Pyodide challenge page |
-| Profile | `frontend/src/app/(academy)/profile/page.tsx` | TODO 1C | Stats + badges + streak |
+| Challenges | `frontend/src/app/(academy)/challenges/[challengeId]/` | ✓ Done | 3 challenges Pyodide (SSG) |
+| Profile | `frontend/src/app/(academy)/profile/page.tsx` | ✓ Done | Stats + BadgeGrid + StreakCalendar |
 | MDX Components | `frontend/src/components/mdx/` | ✓ Done | 9 componentes (Callout, Quiz, Step…) |
 | Lesson Components | `frontend/src/components/lesson/` | ✓ Done | CompleteButton |
-| Editor | `frontend/src/components/editor/` | TODO 1C | Monaco + OutputPanel + SplitPane |
-| Challenge | `frontend/src/components/challenge/` | TODO 1C | ChallengeRunner, TestResults |
-| Gamification UI | `frontend/src/components/gamification/` | TODO 1C | XPBar, LevelUpModal, BadgeGrid, StreakCalendar |
-| Navigation | `frontend/src/components/navigation/` | ✓ Done | Navbar, Sidebar, LessonSidebar, LessonNav |
-| Tutor | `frontend/src/components/tutor/` | TODO 1C | TutorPanel, TutorMessage |
+| Editor | `frontend/src/components/editor/` | ✓ Done | CodeEditor, OutputPanel, TestResults, SplitPane |
+| Challenge | `frontend/src/components/challenge/` | ✓ Done | ChallengeRunner |
+| Gamification UI | `frontend/src/components/gamification/` | ✓ Done | XPBar, XPBarClient, LevelUpModal, BadgeGrid, StreakCalendar, XPEvent |
+| Navigation | `frontend/src/components/navigation/` | ✓ Done | Navbar, Sidebar (con streak), LessonSidebar, LessonNav |
+| Tutor | `frontend/src/components/tutor/` | ✓ Done | TutorPanel (chat + XP warning), TutorMessage |
 | Supabase Lib | `frontend/src/lib/supabase/` | ✓ Done | client.ts, server.ts, middleware.ts |
 | API Client | `frontend/src/lib/api/client.ts` | ✓ Done | Typed fetch wrapper, todos los endpoints |
 | Content Loader | `frontend/src/lib/content/` | ✓ Done | loader.ts + types.ts (gray-matter) |
-| Pyodide Engine | `frontend/src/lib/pyodide/` | TODO 1C | worker-client.ts, types.ts |
-| Pyodide Worker | `frontend/public/pyodide-worker.js` | TODO 1C | Web Worker, carga desde CDN |
-| Hooks | `frontend/src/hooks/` | TODO 1C | useXP, useStreak, useBadges, useLevelUp |
+| Pyodide Engine | `frontend/src/lib/pyodide/` | ✓ Done | worker-client.ts (singleton), types.ts |
+| Pyodide Worker | `frontend/public/pyodide-worker.js` | ✓ Done | Web Worker, carga Pyodide desde CDN |
+| Hooks | `frontend/src/hooks/` | ✓ Done | useXP, useStreak, useBadges, useLevelUp |
 | Types | `frontend/src/types/index.ts` | ✓ Done | TypeScript interfaces alineadas al backend |
 | MDX Content | `frontend/content/modules/` | ✓ Done | 15 lecciones (módulos 0, 1, 2) |
 

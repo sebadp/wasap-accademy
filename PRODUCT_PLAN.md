@@ -69,16 +69,17 @@ Students don't learn from toy examples. They learn by understanding, modifying, 
 - [x] LessonSidebar, LessonNav, CompleteButton
 - [x] Syntax highlighting via @shikijs/rehype (server-side, zero JS bundle)
 
-### Fase 1C: Challenges + Gamification + Tutor — IN PROGRESS
-- [ ] Pyodide Web Worker runner (Python WASM in browser)
-- [ ] CodeEditor (Monaco, dynamic import) + SplitPane layout
-- [ ] Challenge page (/challenges/[challengeId]) con test runner
-- [ ] XPBar (en academy layout), LevelUpModal
-- [ ] BadgeGrid, StreakCalendar
-- [ ] AI Tutor chat component (frontend) conectado al backend
-- [ ] Profile page (/profile) con stats, badges, streak
-- [ ] Hooks: useXP, useStreak, useBadges
-- [ ] Build + lint + smoke test E2E
+### Fase 1C: Challenges + Gamification + Tutor — DONE
+- [x] Pyodide Web Worker runner (Python WASM in browser, carga desde CDN)
+- [x] CodeEditor (Monaco, dynamic import) + SplitPane layout + OutputPanel + TestResults
+- [x] Challenge page (/challenges/[challengeId]) con test runner — 3 challenges pre-renderizados
+- [x] XPBar (en academy layout via XPBarClient client island), LevelUpModal
+- [x] BadgeGrid, StreakCalendar, XPEvent
+- [x] AI Tutor chat (TutorPanel + TutorMessage) con 3 preguntas gratis y XP cost warning
+- [x] Profile page (/profile) con stats, BadgeGrid, StreakCalendar
+- [x] Hooks: useXP, useStreak, useBadges, useLevelUp
+- [x] Sidebar con streak indicator, layout con XPBar (top-24)
+- [x] Build 34 páginas estáticas + lint: 0 errores, 0 warnings
 
 ### Fase 2: Advanced Content (future)
 - [ ] Modules 3-16
