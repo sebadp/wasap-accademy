@@ -3,11 +3,15 @@
 ## Verify Feature Is Active
 
 ```bash
-# 1. Backend corriendo
-cd backend && uvicorn app.main:app --reload
-# → "Pyodide worker" routes disponibles en http://localhost:8000/docs
+# 0. Base de datos local (si no está corriendo)
+npx supabase start
+# Verificar tablas: http://127.0.0.1:54323 (Supabase Studio)
 
-# 2. Frontend corriendo
+# 1. Backend corriendo
+cd backend && make dev
+# → http://localhost:8000/docs
+
+# 2. Frontend corriendo (con frontend/.env.local configurado)
 cd frontend && npm run dev
 # → Navegar a http://localhost:3000/challenges/challenge-0
 ```
