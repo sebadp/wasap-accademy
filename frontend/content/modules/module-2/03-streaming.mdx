@@ -1,0 +1,87 @@
+---
+title: "Streaming y manejo de errores"
+description: "Respuestas en tiempo real y retry robusto con exponential backoff"
+xpReward: 75
+---
+
+## Por qué streaming
+
+Sin streaming, el usuario espera 5-10 segundos sin feedback antes de ver la respuesta completa. Con streaming, los tokens llegan en tiempo real: mejor UX, mismo costo.
+
+<Callout variant="info">
+En WhatsApp no podés hacer streaming visual (no es un chat web), pero en AgentCraft, cuando implementemos el playground, usaremos streaming para el editor.
+</Callout>
+
+## Streaming con el SDK de Anthropic
+
+```python title="app/llm/client.py"
+async def stream(
+    self,
+    messages: list[dict],
+    system: str = "",
+) -> AsyncGenerator[str, None]:
+    """Genera tokens de respuesta en tiempo real."""
+    async with self.client.messages.stream(
+        model=self.model,
+        max_tokens=1024,
+        system=system,
+        messages=messages,
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
+```
+
+## Retry con exponential backoff
+
+Las APIs de LLM fallan. La API de Anthropic tiene rate limits. WasAP implementa retry automático:
+
+```python title="app/llm/retry.py"
+import asyncio
+import anthropic
+
+
+async def complete_with_retry(
+    client: LLMClient,
+    messages: list[dict],
+    max_retries: int = 3,
+) -> str:
+    delay = 1.0  # segundos
+
+    for attempt in range(max_retries):
+        try:
+            return await client.complete(messages)
+        except anthropic.RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2  # exponential backoff
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500:
+                # Error del servidor de Anthropic, reintentamos
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                # Error del cliente (4xx), no reintentamos
+                raise
+
+    raise RuntimeError("Max retries exceeded")
+```
+
+<Concept term="Exponential backoff">
+Estrategia de retry donde el tiempo de espera se duplica en cada intento: 1s, 2s, 4s, 8s... Evita saturar el servidor con reintentos inmediatos durante picos de carga.
+</Concept>
+
+## Errores comunes de la API de Anthropic
+
+| Error | Código | Causa | Acción |
+|-------|--------|-------|--------|
+| `RateLimitError` | 429 | Demasiadas requests | Retry con backoff |
+| `APIStatusError` 529 | 529 | Sobrecarga del servidor | Retry con backoff |
+| `InvalidRequestError` | 400 | Prompt mal formado | No retry, fix el código |
+| `AuthenticationError` | 401 | API key inválida | No retry, fix la config |
+
+<Quiz
+  question="¿Por qué no se hace retry cuando la API retorna un error 400?"
+  options={["Porque el error 400 indica un problema temporal del servidor", "Porque el error 400 indica un problema en el request (prompt inválido) que no se resuelve reintentando", "Porque el SDK de Anthropic hace retry automático para 400", "Porque 400 significa que se agotó el crédito de la cuenta"]}
+  correct={1}
+/>

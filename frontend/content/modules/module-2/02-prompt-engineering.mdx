@@ -1,0 +1,84 @@
+---
+title: "Prompt Engineering para producción"
+description: "Técnicas reales usadas en WasAP: few-shot, chain-of-thought, system prompts"
+xpReward: 75
+---
+
+## El system prompt de WasAP
+
+El system prompt define el comportamiento base del asistente. En WasAP es dinámico: se construye en runtime con contexto del usuario.
+
+```python title="app/llm/prompts.py"
+SYSTEM_TEMPLATE = """Eres WasAP, un asistente de WhatsApp útil y conciso.
+
+REGLAS:
+- Responde en el idioma del usuario
+- Sé breve: WhatsApp no es un blog
+- Si no sabes algo, dilo directamente
+- Nunca inventes información
+
+CONTEXTO DEL USUARIO:
+- Nombre: {user_name}
+- Zona horaria: {timezone}
+- Fecha y hora actual: {current_datetime}
+
+HISTORIAL RECIENTE:
+{conversation_summary}
+"""
+
+
+def build_system_prompt(user: User) -> str:
+    return SYSTEM_TEMPLATE.format(
+        user_name=user.name or "Usuario",
+        timezone=user.timezone or "America/Buenos_Aires",
+        current_datetime=datetime.now(user.tz).strftime("%A %d/%m/%Y %H:%M"),
+        conversation_summary=user.conversation_summary or "Primera conversación",
+    )
+```
+
+## Few-shot prompting
+
+Para tareas específicas, WasAP incluye ejemplos en el prompt:
+
+```python title="app/skills/extraction.py"
+EXTRACTION_PROMPT = """Extrae la tarea del mensaje del usuario.
+
+Ejemplos:
+Usuario: "Recuérdame comprar leche mañana a las 9"
+Tarea: {"action": "reminder", "text": "comprar leche", "datetime": "mañana 09:00"}
+
+Usuario: "Agendá reunión con Juan el viernes a las 14"
+Tarea: {"action": "event", "text": "reunión con Juan", "datetime": "viernes 14:00"}
+
+Usuario: "{user_message}"
+Tarea:"""
+```
+
+<Concept term="Few-shot prompting">
+Incluís ejemplos input/output en el prompt para guiar al modelo hacia el formato deseado. Más efectivo que describir el formato con palabras. 2-5 ejemplos suelen ser suficientes.
+</Concept>
+
+## Structured output con XML tags
+
+Claude responde mejor cuando usás XML tags para delimitar la respuesta estructurada:
+
+```python
+prompt = """Analiza el sentimiento del mensaje y responde con:
+<sentiment>positivo|negativo|neutro</sentiment>
+<confidence>0.0-1.0</confidence>
+<reason>explicación breve</reason>
+
+Mensaje: "¡Genial, muchas gracias!"
+"""
+
+# Parsear la respuesta
+import re
+sentiment = re.search(r"<sentiment>(.*?)</sentiment>", response).group(1)
+confidence = float(re.search(r"<confidence>(.*?)</confidence>", response).group(1))
+```
+
+<Quiz
+  question="¿Cuál es la ventaja principal del few-shot prompting sobre describir el formato con instrucciones?"
+  options={["Usa menos tokens en el prompt", "Los ejemplos concretos guían al modelo más efectivamente que las instrucciones abstractas", "El modelo puede ignorar las instrucciones pero no los ejemplos", "Permite usar modelos más pequeños"]}
+  correct={1}
+/>

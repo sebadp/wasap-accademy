@@ -1,0 +1,104 @@
+---
+title: "Variables de entorno y configuración"
+description: "Configurar .env, Pydantic Settings y acceso a APIs externas"
+xpReward: 50
+---
+
+## El problema de la configuración
+
+Los valores que cambian entre entornos (desarrollo, staging, producción) no van en el código. Van en variables de entorno. WasAP usa **Pydantic Settings** para gestionarlas con tipado completo.
+
+<Callout variant="error" title="Nunca hagas esto">
+No hardcodees API keys en el código. No las commitees al repo. Usá `.env` (que está en `.gitignore`) y `.env.example` (que sí se commitea, sin valores).
+</Callout>
+
+## El .env.example de WasAP
+
+```bash
+# WhatsApp / Meta
+WHATSAPP_TOKEN=your-token
+WHATSAPP_PHONE_ID=your-phone-id
+META_VERIFY_TOKEN=your-verify-token
+META_APP_SECRET=your-app-secret
+
+# Base de datos
+DATABASE_URL=postgresql://wasap:wasap@localhost:5432/wasap
+
+# LLM
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_PROVIDER=claude   # claude | openai | ollama
+
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# App
+DEBUG=false
+LOG_LEVEL=INFO
+```
+
+## Pydantic Settings en acción
+
+```python
+from functools import lru_cache
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    whatsapp_token: str
+    whatsapp_phone_id: str
+    meta_verify_token: str
+    meta_app_secret: str
+
+    database_url: str
+
+    anthropic_api_key: str = ""
+    llm_provider: str = "claude"
+
+    redis_url: str = "redis://localhost:6379"
+
+    debug: bool = False
+    log_level: str = "INFO"
+
+    model_config = {"env_file": ".env"}
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+<Concept term="@lru_cache">
+Hace que `get_settings()` solo parsee el archivo `.env` una vez. Las llamadas posteriores devuelven la misma instancia cacheada. Esencial para performance en FastAPI.
+</Concept>
+
+<Concept term="BaseSettings">
+Pydantic Settings lee variables de entorno automáticamente. Si definís `database_url: str`, busca la variable `DATABASE_URL` (case-insensitive) en el entorno o en el `.env`.
+</Concept>
+
+## Validación automática al arrancar
+
+Si falta una variable requerida, Pydantic lanza un `ValidationError` **al arrancar la aplicación**, no cuando la necesitás. Esto te da fail-fast: sabés inmediatamente si el entorno está mal configurado.
+
+<Terminal title="Error típico de configuración faltante">
+pydantic_settings.errors.SettingsError: 1 validation error
+whatsapp_token
+  Field required [type=missing, ...]
+</Terminal>
+
+<Step number={1} title="Copiá el .env.example">
+`cp .env.example .env`
+</Step>
+
+<Step number={2} title="Completá los valores reales">
+Editá `.env` con tus credenciales. Para desarrollo local, las de WhatsApp pueden ser falsas si no vas a testear webhooks reales.
+</Step>
+
+<Step number={3} title="Verificá que la app arranca">
+`docker compose up api` y mirá que no haya errores de configuración en los logs.
+</Step>
+
+<Quiz
+  question="¿Cuál es la ventaja principal de usar @lru_cache en get_settings()?"
+  options={["Permite cambiar las variables de entorno sin reiniciar la app", "El archivo .env se parsea solo una vez, mejorando la performance", "Valida automáticamente que todas las variables estén presentes", "Sincroniza las settings con la base de datos"]}
+  correct={1}
+/>

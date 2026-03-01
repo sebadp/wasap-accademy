@@ -1,0 +1,105 @@
+---
+title: "Responder mensajes via la API de WhatsApp"
+description: "Enviar respuestas usando la Graph API de Meta"
+xpReward: 75
+---
+
+## La API de WhatsApp Business
+
+Para enviar mensajes, usamos la **Graph API de Meta**. El endpoint principal es:
+
+```
+POST https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages
+```
+
+<Callout variant="info">
+`PHONE_NUMBER_ID` es el ID de tu número de WhatsApp Business, distinto al número en sí. Lo obtenés en el portal de desarrolladores de Meta.
+</Callout>
+
+## El cliente HTTP
+
+WasAP encapsula todas las llamadas a la API de WhatsApp en un cliente:
+
+```python title="app/whatsapp/client.py"
+import httpx
+from app.config import Settings
+
+
+class WhatsAppClient:
+    BASE_URL = "https://graph.facebook.com/v18.0"
+
+    def __init__(self, settings: Settings) -> None:
+        self.phone_id = settings.whatsapp_phone_id
+        self.token = settings.whatsapp_token
+        self.client = httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {self.token}"},
+            timeout=30.0,
+        )
+
+    async def send_text(self, to: str, text: str) -> dict:
+        """Envía un mensaje de texto."""
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {"body": text},
+        }
+        response = await self.client.post(
+            f"{self.BASE_URL}/{self.phone_id}/messages",
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def mark_as_read(self, message_id: str) -> None:
+        """Marca un mensaje como leído (✓✓ azules)."""
+        await self.client.post(
+            f"{self.BASE_URL}/{self.phone_id}/messages",
+            json={
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": message_id,
+            },
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+```
+
+<Concept term="httpx.AsyncClient">
+HTTPX es el equivalente async de `requests`. El `AsyncClient` reutiliza conexiones HTTP via connection pooling, lo que mejora significativamente la performance en alta carga.
+</Concept>
+
+## Manejo de errores de la API
+
+La API de WhatsApp puede retornar errores por múltiples razones:
+
+```python title="app/whatsapp/errors.py"
+class WhatsAppError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        super().__init__(f"WhatsApp API error {code}: {message}")
+
+
+async def safe_send(client: WhatsAppClient, to: str, text: str) -> bool:
+    try:
+        await client.send_text(to, text)
+        return True
+    except httpx.HTTPStatusError as e:
+        error_body = e.response.json()
+        code = error_body.get("error", {}).get("code", 0)
+        if code == 131047:
+            # Usuario bloqueó el número
+            logger.warning(f"User {to} blocked the bot")
+        elif code == 131026:
+            # Número no existe en WhatsApp
+            logger.error(f"Phone {to} not on WhatsApp")
+        return False
+```
+
+<Quiz
+  question="¿Por qué se usa httpx.AsyncClient en lugar de la librería requests estándar?"
+  options={["Porque requests no soporta JSON", "Porque httpx tiene soporte nativo para async/await y connection pooling", "Porque la API de WhatsApp requiere HTTP/2", "Porque requests no puede manejar respuestas grandes"]}
+  correct={1}
+/>

@@ -1,0 +1,82 @@
+---
+title: "Verificación de firma HMAC"
+description: "Cómo validar que los webhooks vienen realmente de Meta"
+xpReward: 75
+---
+
+## El problema de seguridad
+
+Si tu webhook es público (y tiene que serlo, Meta necesita alcanzarlo), cualquier persona puede hacer POST a tu endpoint con payloads falsos. ¿Cómo sabés que un request viene realmente de Meta?
+
+Con **firmas HMAC-SHA256**.
+
+## Cómo funciona la firma
+
+Meta firma cada request con tu `APP_SECRET`:
+
+1. Toma el body del request (raw bytes)
+2. Calcula `HMAC-SHA256(body, APP_SECRET)`
+3. Lo incluye en el header `X-Hub-Signature-256: sha256=<hex_digest>`
+
+Tu servidor hace lo mismo y compara. Si coinciden, el request es legítimo.
+
+<Callout variant="warning" title="Nunca confíes sin verificar">
+Si no verificás la firma, cualquiera puede mandarte payloads falsos que simulen mensajes de WhatsApp. Siempre verificá en producción.
+</Callout>
+
+## Implementación en WasAP
+
+```python title="app/webhook/security.py"
+import hashlib
+import hmac
+
+
+def verify_signature(
+    payload: bytes,
+    signature_header: str,
+    app_secret: str,
+) -> bool:
+    """Verifica la firma HMAC-SHA256 de Meta."""
+    if not signature_header.startswith("sha256="):
+        return False
+
+    expected = signature_header[len("sha256="):]
+    computed = hmac.new(
+        key=app_secret.encode(),
+        msg=payload,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    # Comparación en tiempo constante para evitar timing attacks
+    return hmac.compare_digest(computed, expected)
+```
+
+<Concept term="hmac.compare_digest">
+Compara dos strings en **tiempo constante**. A diferencia de `==`, que puede terminar antes si los primeros caracteres difieren, `compare_digest` siempre tarda lo mismo. Esto previene ataques de timing donde un atacante deduce caracteres del secreto midiendo tiempos de respuesta.
+</Concept>
+
+## Middleware de FastAPI
+
+En WasAP, la verificación de firma es un **middleware** que se ejecuta antes de cualquier handler:
+
+```python title="app/webhook/middleware.py"
+@app.middleware("http")
+async def verify_meta_signature(request: Request, call_next):
+    if request.url.path == "/webhook" and request.method == "POST":
+        body = await request.body()
+        signature = request.headers.get("X-Hub-Signature-256", "")
+
+        if not verify_signature(body, signature, settings.meta_app_secret):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid signature"},
+            )
+
+    return await call_next(request)
+```
+
+<Quiz
+  question="¿Por qué se usa hmac.compare_digest en lugar del operador == para comparar firmas?"
+  options={["Porque compare_digest es más rápido que ==", "Para evitar timing attacks donde un atacante deduce el secreto midiendo tiempos de respuesta", "Porque == no funciona con strings hexadecimales", "Para poder comparar firmas de distinta longitud"]}
+  correct={1}
+/>

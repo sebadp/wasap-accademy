@@ -1,0 +1,81 @@
+---
+title: "El flow completo de un mensaje"
+description: "De la solicitud HTTP de WhatsApp a la respuesta: trazando el camino"
+xpReward: 75
+---
+
+## De punta a punta
+
+Llegó el momento de ver el big picture en acción. Vamos a trazar el camino completo que hace un mensaje de WhatsApp desde que el usuario lo envía hasta que recibe la respuesta de la IA.
+
+<Callout variant="info">
+Este flujo es el corazón de WasAP. Todo lo que vas a aprender en los próximos módulos es profundizar en cada uno de estos pasos.
+</Callout>
+
+## El pipeline completo
+
+<Step number={1} title="Usuario envía mensaje en WhatsApp">
+El usuario escribe "Hola, ¿qué puedes hacer?" en el chat de WhatsApp Business.
+</Step>
+
+<Step number={2} title="Meta hace POST a tu webhook">
+Los servidores de Meta envían un POST a `https://tu-api.com/webhook` con el payload JSON del mensaje.
+</Step>
+
+<Step number={3} title="Verificación de firma">
+Tu API verifica que el request viene realmente de Meta usando `X-Hub-Signature-256`. Si la firma no coincide, rechaza el request con 403.
+</Step>
+
+<Step number={4} title="Parseo del payload">
+El handler extrae el número de teléfono, el texto del mensaje y el message ID del payload de Meta.
+</Step>
+
+<Step number={5} title="Recuperar contexto de memoria">
+Se consulta la base de datos para obtener los últimos N mensajes de este usuario. Se añaden al prompt como historial.
+</Step>
+
+<Step number={6} title="Llamar al LLM">
+Se construye el prompt final con el sistema, el historial y el mensaje actual. Se llama a la API de Claude/OpenAI.
+</Step>
+
+<Step number={7} title="Enviar respuesta">
+La respuesta del LLM se envía de vuelta al usuario via la API de WhatsApp Business (POST a `graph.facebook.com`).
+</Step>
+
+## El código del handler
+
+```python
+async def handle_message(
+    message: WhatsAppMessage,
+    db: AsyncSession,
+    llm: LLMClient,
+    wa: WhatsAppClient,
+) -> None:
+    history = await db.get_conversation_history(
+        phone=message.from_phone,
+        limit=20,
+    )
+    prompt = build_prompt(
+        system=SYSTEM_PROMPT,
+        history=history,
+        user_message=message.text,
+    )
+    response = await llm.complete(prompt)
+    await db.save_message(phone=message.from_phone, role="user", content=message.text)
+    await db.save_message(phone=message.from_phone, role="assistant", content=response.text)
+    await wa.send_message(to=message.from_phone, text=response.text)
+```
+
+<Concept term="Dependency Injection">
+El handler recibe `db`, `llm` y `wa` como parámetros inyectados por FastAPI. Esto hace el código testeable: en los tests, inyectás mocks en lugar de las implementaciones reales.
+</Concept>
+
+<Quiz
+  question="¿Por qué se verifica la firma HMAC-SHA256 del webhook antes de procesarlo?"
+  options={["Para comprimir el payload y procesarlo más rápido", "Para asegurarse de que el request viene realmente de Meta y no de un tercero malicioso", "Para validar que el número de teléfono existe en WhatsApp", "Para autenticar al usuario final en la base de datos"]}
+  correct={1}
+/>
+
+## Felicitaciones
+
+Completaste el **Módulo 0: Setup & Onboarding**. Ahora tenés una visión completa de la arquitectura, Docker, configuración y el flow de un mensaje. En el **Módulo 1** implementamos el webhook paso a paso.
