@@ -1,86 +1,224 @@
 ---
-title: "Estructura del proyecto WasAP"
+title: "Estructura del proyecto LocalForge"
 description: "Arquitectura de 85 archivos Python y cómo están organizados"
 xpReward: 50
 ---
 
 ## El mapa del territorio
 
-Antes de escribir una línea de código, necesitás entender el territorio. WasAP tiene 85 archivos Python organizados en dominios claramente separados.
+Antes de escribir una línea de código, necesitás entender el territorio. LocalForge tiene 85+ archivos Python organizados en dominios claramente separados. Cada carpeta es un **bounded context** con una responsabilidad específica.
 
-<Callout variant="info">
-Cada carpeta del proyecto corresponde a un dominio de responsabilidad. Esta separación es intencional y es lo que hace al código mantenible a escala.
+<Callout variant="info" title="Separación por dominio">
+Cada carpeta del proyecto corresponde a un dominio de responsabilidad. Esta separación es intencional y es lo que hace al código mantenible a escala. Un cambio en el sistema de memoria no debería afectar al webhook.
 </Callout>
 
+## La estructura real del proyecto
+
+Esta es la estructura **real** de LocalForge, no una versión simplificada:
+
 ```
-wasap/
+localforge/
   app/
-    webhook/          ← Módulo 1
-      handler.py
-      router.py
-    llm/              ← Módulo 2
-      client.py
-      prompts.py
-    memory/           ← Módulo 4
-      store.py
-      retriever.py
-    skills/           ← Módulo 5
-      registry.py
-    rag/              ← Módulo 7
-      pipeline.py
-    agents/           ← Módulo 10
-      orchestrator.py
-    main.py
-  tests/
-  docker-compose.yml
+    main.py                 # FastAPI app + lifespan + scheduler jobs
+    config.py               # Settings (Pydantic Settings, .env)
+    models.py               # Pydantic models compartidos
+    dependencies.py         # FastAPI dependency injection
+    logging_config.py       # JSON structured logging
+    webhook/                # Recepción de mensajes (Módulo 1)
+      router.py             # Endpoints GET/POST + process_message
+      parser.py             # Extraer mensajes del payload de Meta
+      security.py           # Validación de firma HMAC-SHA256
+      rate_limiter.py       # Rate limiting por número de teléfono
+    llm/                    # Cliente de Ollama (Módulo 2)
+      client.py             # OllamaClient (chat + tools + embeddings)
+    whatsapp/               # WhatsApp Cloud API
+      client.py             # WhatsAppClient (send, mark_as_read, download)
+    database/               # Persistencia (Módulo 3)
+      db.py                 # SQLite init + sqlite-vec
+      repository.py         # CRUD async sobre SQLite
+    conversation/           # Gestión de conversaciones
+      manager.py            # ConversationManager + windowed history
+      summarizer.py         # Resumen automático de conversaciones largas
+    memory/                 # Sistema de memoria (Módulo 4)
+      markdown.py           # Sync bidireccional SQLite <-> MEMORY.md
+      watcher.py            # File watcher (watchdog) para edición manual
+      daily_log.py          # Daily logs append-only
+      consolidator.py       # Dedup/merge de memorias via LLM
+    skills/                 # Tool calling (Módulo 5-6)
+      models.py             # ToolDefinition, ToolCall, ToolResult
+      loader.py             # Parser de SKILL.md (frontmatter con regex)
+      registry.py           # SkillRegistry
+      executor.py           # Tool calling loop (max 5 iteraciones)
+      router.py             # classify_intent + select_tools (2-stage router)
+      tools/                # Handlers de tools builtin
+    embeddings/             # Búsqueda semántica (Módulo 7)
+      indexer.py            # embed_memory, backfill_embeddings
+    agent/                  # Modo agéntico (Módulos 15-17)
+      loop.py               # Outer agent loop
+      models.py             # AgentSession, AgentStatus
+      hitl.py               # Human-in-the-loop
+    guardrails/             # Validación pre-entrega (Módulo 12)
+      pipeline.py           # run_guardrails()
+    tracing/                # Observabilidad (Módulo 13)
+      context.py            # TraceContext, get_current_trace()
+      recorder.py           # TraceRecorder con Langfuse v3
+    formatting/             # Formateo de mensajes
+      whatsapp.py           # Markdown -> WhatsApp markup
+      splitter.py           # Split mensajes > 4096 chars
+    platforms/              # Abstracción multi-plataforma
+      base.py               # PlatformClient Protocol
+      models.py             # IncomingMessage, Platform enum
+    telegram/               # Integración Telegram (Módulo 18)
+      client.py             # TelegramClient
+      router.py             # Webhook de Telegram
+  skills/                   # SKILL.md definitions (project root)
+  tests/                    # 316+ tests con pytest
+  docker-compose.yml        # Orquestación de servicios
+  Dockerfile                # Container de producción
+  Makefile                  # Comandos de desarrollo
 ```
+
+<Concept title="Bounded Context">
+Cada carpeta en `app/` es un bounded context del Domain-Driven Design: tiene su propia responsabilidad, sus propios modelos y su propia lógica. Las dependencias entre contextos fluyen en una sola dirección (el webhook depende del LLM, pero el LLM no sabe nada del webhook).
+</Concept>
 
 ## Los dominios principales
 
-<Concept term="app/webhook/">
-Recibe los mensajes de WhatsApp via HTTP POST. Verifica la firma de Meta, parsea el payload y despacha el mensaje al handler correcto.
+<Concept title="app/webhook/">
+Recibe los mensajes de WhatsApp via HTTP POST. Verifica la firma HMAC-SHA256 de Meta, parsea el payload JSON anidado, aplica rate limiting por número de teléfono y despacha el mensaje al handler correcto via `BackgroundTasks`.
 </Concept>
 
-<Concept term="app/llm/">
-Toda la lógica de comunicación con LLMs (Claude, GPT, Ollama). Maneja el cliente HTTP, los prompts, tool calling y structured outputs.
+<Concept title="app/llm/client.py">
+`OllamaClient` encapsula toda la comunicación con Ollama. Tiene tres métodos principales: `chat()` para conversación, `chat_with_tools()` para tool calling, y `embed()` para generar embeddings. El parámetro `think: bool` controla si el modelo usa chain-of-thought (solo para qwen3, nunca con tools).
 </Concept>
 
-<Concept term="app/memory/">
-Almacena y recupera el historial de conversación. Usa PostgreSQL como store principal con búsqueda semántica opcional via embeddings.
+<Concept title="app/database/">
+SQLite via aiosqlite con sqlite-vec para búsqueda vectorial. `init_db()` retorna una tupla `(conn, vec_available: bool)` para degradar gracefully si sqlite-vec no está disponible. Usa PRAGMAs de performance: `synchronous=NORMAL`, `cache_size=-32000`, `temp_store=MEMORY`.
 </Concept>
 
-<Concept term="app/skills/">
-Sistema de plugins extensible. Cada skill es una función que el LLM puede invocar via tool calling. Hay 15 skills en producción.
+<Concept title="app/skills/">
+Sistema de plugins extensible. Cada skill se define en un archivo SKILL.md con frontmatter parseado con regex (sin PyYAML). El `SkillRegistry` registra tools, y el `executor.py` implementa el tool calling loop con máximo 5 iteraciones.
 </Concept>
 
-<Concept term="app/rag/">
-Retrieval Augmented Generation. Pipeline que procesa documentos, genera embeddings y recupera contexto relevante antes de llamar al LLM.
+<Concept title="app/memory/">
+Sistema de memoria multinivel: memorias permanentes en SQLite, daily logs en archivos Markdown, session snapshots al hacer `/clear`, y consolidación periódica via LLM para eliminar duplicados.
 </Concept>
 
 ## El flujo de un mensaje
 
-Cuando un usuario envía un mensaje a WasAP, pasa por este pipeline:
+Cuando un usuario envía un mensaje a LocalForge, pasa por un pipeline parallelizado en 4 fases:
 
-<Step number={1} title="Recepción (webhook/)">
-WhatsApp hace un POST a tu endpoint. El handler verifica la firma HMAC-SHA256 de Meta y parsea el JSON.
+<Step number={1} title="Recepción (webhook/router.py)">
+WhatsApp hace un POST a tu endpoint. El handler verifica la firma HMAC-SHA256 con `validate_signature()`, parsea el JSON con `extract_messages()`, aplica rate limiting y dedup atómico con `try_claim_message()`.
 </Step>
 
-<Step number={2} title="Contexto (memory/ + rag/)">
-Se recupera el historial de conversación y, si hay documentos relevantes, se añaden al contexto.
+<Step number={2} title="Fase A — I/O paralelo">
+Se ejecutan en paralelo: generar embedding del query, guardar el mensaje en la DB, y cargar daily logs. Además, `classify_intent()` se lanza como `asyncio.create_task` para que corra en paralelo con el I/O.
 </Step>
 
-<Step number={3} title="Generación (llm/)">
-El cliente LLM recibe el prompt con contexto y genera una respuesta. Si activa un tool, ejecuta el skill correspondiente.
+<Step number={3} title="Fase B — Búsqueda de contexto">
+Se ejecutan en paralelo: buscar memorias relevantes (semántico), buscar notas relacionadas, obtener resumen de conversación, cargar historial reciente y obtener resumen de proyectos.
 </Step>
 
-<Step number={4} title="Respuesta (whatsapp/)">
-La respuesta se envía de vuelta via la API de WhatsApp Business.
+<Step number={4} title="Fase C+D — Clasificación y generación">
+Se construye el contexto completo con `ContextBuilder` (XML tags), se inyecta en el prompt del sistema, y se llama al LLM. Si hay tools activas, el `execute_tool_loop` itera hasta obtener texto o llegar al máximo de iteraciones.
 </Step>
+
+```python
+# Las 4 fases ejecutan en paralelo dentro de cada grupo
+# Ejemplo simplificado de Phase A en router.py:
+embed_task = asyncio.create_task(
+    ollama_client.embed([user_text], model=settings.embedding_model)
+)
+save_task = asyncio.create_task(
+    repository.save_message(conv_id, "user", user_text, msg.message_id)
+)
+logs_task = asyncio.create_task(
+    daily_log.get_context(days=settings.daily_log_days)
+)
+
+# classify_intent corre en paralelo con Phase A
+classify_task = asyncio.create_task(
+    classify_intent(user_text, ollama_client)
+)
+
+# Esperar resultados de Phase A
+query_embedding, _, daily_logs = await asyncio.gather(
+    embed_task, save_task, logs_task
+)
+```
 
 <Quiz
-  question="¿Qué módulo del proyecto WasAP se encarga de recibir los mensajes entrantes de WhatsApp?"
+  question="¿Qué módulo del proyecto LocalForge se encarga de recibir los mensajes entrantes de WhatsApp?"
   options={["app/llm/", "app/webhook/", "app/memory/", "app/skills/"]}
   correct={1}
 />
 
-En la próxima lección configuramos el entorno Docker para poder correr WasAP localmente.
+## Dependency Injection con FastAPI
+
+LocalForge usa un patrón limpio de dependency injection. Todos los servicios se inicializan en el `lifespan` de FastAPI y se exponen via `app.state`:
+
+```python
+# app/dependencies.py — funciones get_*() que FastAPI inyecta
+from fastapi import Request
+from app.config import Settings
+from app.whatsapp.client import WhatsAppClient
+
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
+
+def get_whatsapp_client(request: Request) -> WhatsAppClient:
+    return request.app.state.whatsapp_client
+
+def get_repository(request: Request) -> Repository:
+    return request.app.state.repository
+
+def get_ollama_client(request: Request) -> OllamaClient:
+    return request.app.state.ollama_client
+```
+
+<Concept title="Lifespan Pattern">
+FastAPI usa `@asynccontextmanager` para el ciclo de vida de la app. Todo lo que está antes del `yield` se ejecuta al arrancar (inicializar DB, crear clientes HTTP, registrar skills). Todo lo que está después del `yield` se ejecuta al apagar (cerrar conexiones, flush de traces).
+</Concept>
+
+<Quiz
+  question="¿Cómo se paraleliza el procesamiento de mensajes en LocalForge?"
+  options={["Se usa threading con ThreadPoolExecutor", "Se ejecutan las 4 fases secuencialmente con await", "Se agrupan operaciones independientes y se ejecutan con asyncio.gather", "Se envían las tareas a un worker de Celery"]}
+  correct={2}
+/>
+
+## El archivo de modelos compartidos
+
+Los modelos Pydantic que se usan en todo el proyecto están centralizados en `app/models.py`:
+
+```python
+# app/models.py
+from pydantic import BaseModel
+
+class ChatMessage(BaseModel):
+    role: str  # "system", "user", "assistant", or "tool"
+    content: str
+    images: list[str] | None = None
+    tool_calls: list[dict] | None = None
+
+class WhatsAppMessage(BaseModel):
+    from_number: str
+    message_id: str
+    timestamp: str
+    text: str
+    type: str
+    media_id: str | None = None
+    reply_to_message_id: str | None = None
+```
+
+<Callout variant="tip" title="Convención de nombres">
+Usamos `from_number` en vez de `from` porque `from` es una palabra reservada de Python. En el payload de WhatsApp el campo se llama `"from"`, pero en nuestro modelo lo renombramos.
+</Callout>
+
+<Quiz
+  question="¿Qué retorna init_db() al inicializar la base de datos SQLite?"
+  options={["Solo la conexión a la base de datos", "Una tupla (conexión, vec_available: bool) para degradar gracefully", "Un objeto Repository listo para usar", "Un string con el path de la base de datos creada"]}
+  correct={1}
+/>
+
+En la próxima lección configuramos el entorno Docker para poder correr LocalForge localmente.

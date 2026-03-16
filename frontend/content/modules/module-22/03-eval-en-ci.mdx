@@ -222,4 +222,15 @@ make eval-seed && make eval
   correct={1}
 />
 
+<Quiz
+  question="¿Qué evalúa el modo end-to-end (e2e) que el modo classification no cubre?"
+  options={[
+    "Solo la velocidad de respuesta del LLM",
+    "El flujo completo: classify_intent → select_tools, verificando que los tools esperados estén en la selección final",
+    "La calidad gramatical de las respuestas del LLM",
+    "El consumo de tokens por request"
+  ]}
+  correct={1}
+/>
+
 En la última lección veremos cómo monitorear todo esto en producción con Langfuse.

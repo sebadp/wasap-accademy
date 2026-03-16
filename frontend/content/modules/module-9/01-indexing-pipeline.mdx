@@ -6,69 +6,160 @@ xpReward: 75
 
 ## El Pipeline de Indexación
 
-Cuando se crea una memoria o nota, WasAP la convierte en un embedding y la almacena:
+Cuando se crea una memoria o nota, LocalForge la convierte en un embedding y la almacena en sqlite-vec para búsqueda posterior:
 
 ```
-Texto → OllamaClient.embed() → [768 floats] → struct.pack → blob → sqlite-vec
+Texto → ollama_client.embed([text]) → [768 floats] → struct.pack → blob → sqlite-vec
 ```
 
 <Callout variant="info" title="Indexación automática">
-No necesitás indexar manualmente. WasAP indexa automáticamente cada `/remember`, nota nueva, y hecho extraído por flush.
+No necesitás indexar manualmente. LocalForge indexa automáticamente cada `/remember`, nota nueva, fact extraído por flush, y nota de proyecto. Todo pasa por el mismo pipeline.
 </Callout>
 
-## embed_memory()
+## sqlite-vec: Tablas Virtuales
+
+sqlite-vec es una extensión de SQLite que agrega búsqueda vectorial. Se carga al iniciar la app en `init_db()`:
+
+```python
+# app/database/db.py — Carga de sqlite-vec
+async def init_db(db_path: str, embedding_dims: int = 768) -> tuple[aiosqlite.Connection, bool]:
+    conn = await aiosqlite.connect(db_path, check_same_thread=False)
+
+    # ... schema setup ...
+
+    # Try to load sqlite-vec
+    vec_available = False
+    try:
+        import sqlite_vec
+
+        ext_path = sqlite_vec.loadable_path()
+        conn._connection.enable_load_extension(True)
+        conn._connection.load_extension(ext_path)
+        conn._connection.enable_load_extension(False)
+
+        # Create vector tables
+        await conn.execute(VEC_SCHEMA_MEMORIES.format(dims=embedding_dims))
+        await conn.execute(VEC_SCHEMA_NOTES.format(dims=embedding_dims))
+        await conn.execute(VEC_SCHEMA_PROJECT_NOTES.format(dims=embedding_dims))
+        await conn.execute(VEC_SCHEMA_TOOLS.format(dims=embedding_dims))
+        vec_available = True
+    except Exception:
+        logger.warning("sqlite-vec not available, semantic search disabled")
+
+    return conn, vec_available  # El flag controla el path de búsqueda
+```
+
+Las tablas virtuales se definen con la sintaxis `vec0`:
+
+```sql
+-- Tabla virtual para embeddings de memorias
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories
+  USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[768]);
+
+-- Tabla virtual para embeddings de notas
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_notes
+  USING vec0(note_id INTEGER PRIMARY KEY, embedding float[768]);
+
+-- Tabla virtual para embeddings de notas de proyecto
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_project_notes
+  USING vec0(note_id INTEGER PRIMARY KEY, embedding float[768]);
+
+-- Tabla virtual para embeddings de descriptions de tools
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_tools
+  USING vec0(tool_name TEXT PRIMARY KEY, embedding float[768]);
+```
+
+<Concept title="vec_available: flag de degradación grácil">
+`init_db()` retorna `(connection, vec_available: bool)`. Si sqlite-vec no se puede cargar (binario faltante, arquitectura incompatible), `vec_available = False` y la app usa búsqueda por recencia en vez de semántica. La app **nunca crashea** por falta de sqlite-vec.
+</Concept>
+
+## Serialización: struct.pack
+
+sqlite-vec espera los vectores como **blobs binarios**. Se serializan con `struct.pack`:
+
+```python
+# app/database/repository.py
+import struct
+
+class Repository:
+    @staticmethod
+    def _serialize_vector(vec: list[float]) -> bytes:
+        return struct.pack(f"{len(vec)}f", *vec)
+        # 768 floats × 4 bytes = 3072 bytes por embedding
+```
+
+<Callout variant="tip" title="¿Por qué struct.pack y no JSON?">
+Un embedding como JSON (`[0.12, -0.45, ...]`) ocuparía ~6KB de texto. El blob binario ocupa exactamente 3072 bytes (768 floats x 4 bytes). Es 2x más compacto y sqlite-vec lo procesa directamente sin parseo.
+</Callout>
+
+## embed_memory(): Indexar una Memoria
 
 ```python
 # app/embeddings/indexer.py
-import struct
+_MAX_EMBED_CHARS = 6_000  # Límite conservador para nomic-embed-text
 
 async def embed_memory(
-    repository: Repository,
-    ollama_client: OllamaClient,
     memory_id: int,
     content: str,
+    repository: Repository,
+    ollama_client: OllamaClient,
+    model: str,
 ) -> None:
+    """Compute and store embedding for a single memory. Best-effort."""
     try:
-        vector = await ollama_client.embed(content)
-        blob = struct.pack(f"{len(vector)}f", *vector)
-        await repository.save_embedding("vec_memories", memory_id, blob)
-    except Exception as e:
-        logger.warning("Failed to embed memory %d: %s", memory_id, e)
-        # Best-effort: no propagar el error
+        embeddings = await ollama_client.embed(
+            [content[:_MAX_EMBED_CHARS]], model=model
+        )
+        await repository.save_embedding(memory_id, embeddings[0])
+    except Exception:
+        logger.warning("Failed to embed memory %d", memory_id, exc_info=True)
+        # Best-effort: la memoria existe sin embedding, no se propaga el error
 ```
 
-<Concept title="struct.pack para serialización">
-`struct.pack(f"768f", *vector)` convierte 768 floats de Python a un blob binario de 3072 bytes (768 × 4 bytes por float). Es el formato que sqlite-vec espera.
-</Concept>
+El `save_embedding` en el repository hace un DELETE + INSERT (sqlite-vec no soporta UPSERT):
+
+```python
+# app/database/repository.py
+async def save_embedding(
+    self, memory_id: int, embedding: list[float], *, auto_commit: bool = True
+) -> None:
+    blob = self._serialize_vector(embedding)
+    # vec0 virtual tables don't support INSERT OR REPLACE — delete first
+    await self._conn.execute(
+        "DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,)
+    )
+    await self._conn.execute(
+        "INSERT INTO vec_memories (memory_id, embedding) VALUES (?, ?)",
+        (memory_id, blob),
+    )
+    if auto_commit:
+        await self._conn.commit()
+```
 
 ## Triggers de Indexación
 
-| Evento | Acción | Código |
-|--------|--------|--------|
-| `/remember texto` | Embed la nueva memoria | `cmd_remember` → `embed_memory()` |
-| `/forget query` | Borrar embedding | `repository.delete_embedding()` |
-| Flush pre-compactación | Embed cada fact nuevo | `flush_to_memory` → `embed_memory()` |
-| Consolidación | Borrar embeddings de memorias mergeadas | `consolidator` → `delete_embedding()` |
-| Startup | Backfill memorias sin embedding | `backfill_embeddings()` |
+<Step number={1} title="/remember texto">
+El comando guarda la memoria en SQLite y llama a `embed_memory()` para indexar el embedding.
+</Step>
 
-## backfill_embeddings()
+<Step number={2} title="/forget query">
+El comando desactiva la memoria y llama a `repository.delete_embedding()` para limpiar el vector.
+</Step>
 
-Al iniciar, WasAP indexa memorias que no tienen embedding (ej: creadas antes de activar embeddings):
+<Step number={3} title="Flush pre-compactación">
+Antes de borrar mensajes viejos, el summarizer extrae facts y los indexa con `embed_memory()`.
+</Step>
 
-```python
-async def backfill_embeddings(repository, ollama_client):
-    """Indexar memorias que no tienen embedding."""
-    memories = await repository.get_memories_without_embedding()
-    for memory in memories:
-        await embed_memory(
-            repository, ollama_client,
-            memory["id"], memory["content"]
-        )
-        await asyncio.sleep(0.1)  # No saturar Ollama
-```
+<Step number={4} title="Consolidación">
+El consolidator borra embeddings de memorias duplicadas que se mergearon.
+</Step>
 
-<Callout variant="warning" title="Background task">
-El backfill corre como background task al inicio. No bloquea el arranque de la app. Si Ollama no está disponible, simplemente loguea warnings.
+<Step number={5} title="Startup (backfill)">
+Al arrancar, `backfill_embeddings()` indexa memorias que no tienen embedding.
+</Step>
+
+<Callout variant="warning" title="embed_note y embed_project_note">
+El indexer tiene funciones análogas para notas (`embed_note`) y notas de proyecto (`embed_project_note`). El pipeline es idéntico: texto truncado a 6000 chars, embed via Ollama, guardar blob en la tabla vec correspondiente.
 </Callout>
 
 <Quiz
@@ -80,12 +171,23 @@ El backfill corre como background task al inicio. No bloquea el arranque de la a
 <Quiz
   question="¿Qué pasa si embed_memory() falla?"
   options={[
-    "La memoria no se guarda",
+    "La memoria no se guarda en la DB",
     "Se reintenta 3 veces",
-    "Se loguea un warning y la memoria se guarda sin embedding (best-effort)",
-    "La app crashea"
+    "Se loguea un warning y la memoria queda guardada sin embedding (best-effort)",
+    "La app crashea y se reinicia"
   ]}
   correct={2}
 />
 
-En la siguiente lección veremos cómo buscar usando estos vectores.
+<Quiz
+  question="¿Por qué save_embedding() hace DELETE + INSERT en vez de UPSERT?"
+  options={[
+    "Por rendimiento — DELETE + INSERT es más rápido",
+    "Porque las tablas virtuales vec0 de sqlite-vec no soportan INSERT OR REPLACE",
+    "Para mantener un historial de embeddings anteriores",
+    "Porque SQLite no soporta UPSERT en ninguna tabla"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo buscar usando estos vectores almacenados.

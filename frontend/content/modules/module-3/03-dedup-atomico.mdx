@@ -1,106 +1,170 @@
 ---
-title: "Dedup Atómico"
+title: "Dedup Atomico"
 description: "Prevenir procesamiento duplicado de mensajes sin locks ni race conditions"
 xpReward: 50
 ---
 
 ## El Problema: Mensajes Duplicados
 
-WhatsApp envía el mismo webhook **múltiples veces** si no recibió un HTTP 200 a tiempo. Si procesás cada uno, el usuario recibe la misma respuesta 2 o 3 veces.
+WhatsApp envia el mismo webhook **multiples veces** si no recibio un HTTP 200 a tiempo. Si procesas cada uno, el usuario recibe la misma respuesta 2 o 3 veces. Este no es un bug -- es un patron estandar en sistemas event-driven.
 
-<Callout variant="warning" title="No es un bug, es by design">
-WhatsApp Cloud API reintenta webhooks si no recibe acknowledgment en ~5 segundos. Esto es un patrón estándar en sistemas event-driven: "at-least-once delivery".
+<Callout variant="warning" title="At-least-once delivery">
+WhatsApp Cloud API reintenta webhooks si no recibe acknowledgment en ~5 segundos. Telegram tambien reintenta si no recibe HTTP 200. Cualquier integracion con APIs de mensajeria necesita deduplicacion.
 </Callout>
 
-## La Solución: INSERT OR IGNORE
+## La Tabla processed_messages
 
-WasAP usa una tabla con UNIQUE constraint y la operación `INSERT OR IGNORE`:
+LocalForge usa una tabla dedicada con PRIMARY KEY para garantizar unicidad:
 
 ```sql
+-- app/database/db.py — SCHEMA
 CREATE TABLE IF NOT EXISTS processed_messages (
-    message_id TEXT PRIMARY KEY,
-    processed_at TIMESTAMP DEFAULT (datetime('now'))
+    wa_message_id TEXT PRIMARY KEY,
+    processed_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
+<Concept title="PRIMARY KEY como constraint">
+El `PRIMARY KEY` en `wa_message_id` crea automaticamente un indice unico. Esto garantiza que dos filas no pueden tener el mismo ID, y la busqueda es O(log n) gracias al B-tree index subyacente.
+</Concept>
+
+## La Solucion: INSERT OR IGNORE
+
+El metodo `try_claim_message` combina la verificacion y el marcado en una sola operacion atomica:
+
 ```python
-async def is_message_processed(self, message_id: str) -> bool:
-    """Marca como procesado y retorna True si YA estaba procesado."""
-    cursor = await self.conn.execute(
-        "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
-        (message_id,),
+# app/database/repository.py
+async def try_claim_message(self, wa_message_id: str) -> bool:
+    """Atomically claim a message ID. Returns True if already processed (duplicate)."""
+    cursor = await self._conn.execute(
+        "INSERT OR IGNORE INTO processed_messages (wa_message_id) VALUES (?)",
+        (wa_message_id,),
     )
-    await self.conn.commit()
-    # Si rowcount == 0, el INSERT fue ignorado → ya existía
+    await self._conn.commit()
+    # If rowcount == 0, the INSERT was ignored -> message was already claimed
     return cursor.rowcount == 0
 ```
 
-<Concept title="INSERT OR IGNORE">
-Si el `message_id` ya existe (viola el PRIMARY KEY), SQLite **ignora** la inserción silenciosamente sin error. Si no existe, lo inserta. Esto es una operación atómica — no hay ventana para race conditions.
-</Concept>
+<Callout variant="info" title="Retorno invertido">
+Nota que `try_claim_message` retorna `True` si el mensaje **ya fue procesado** (es duplicado). Cuando `rowcount == 0`, significa que el INSERT fue ignorado porque el `wa_message_id` ya existia.
+</Callout>
+
+## Dedup Adicional: wa_message_id en messages
+
+Ademas de `processed_messages`, LocalForge tiene una segunda linea de defensa. La tabla `messages` tiene un UNIQUE constraint en `wa_message_id`:
+
+```sql
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content         TEXT NOT NULL,
+    wa_message_id   TEXT UNIQUE,  -- Segunda linea de dedup
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+Y el Repository tiene un metodo adicional:
+
+```python
+async def is_duplicate(self, wa_message_id: str) -> bool:
+    cursor = await self._conn.execute(
+        "SELECT 1 FROM messages WHERE wa_message_id = ?",
+        (wa_message_id,),
+    )
+    return await cursor.fetchone() is not None
+```
 
 ## Uso en el Webhook Handler
 
+Asi se usa en el flujo principal de procesamiento:
+
 ```python
+# app/webhook/router.py — process_message()
 async def process_message(message: WhatsAppMessage, ...):
-    # Primer paso: dedup
-    if await repository.is_message_processed(message.message_id):
+    # Primer paso: dedup atomico
+    if await repository.try_claim_message(message.message_id):
         logger.info("Duplicate message ignored", message_id=message.message_id)
         return
 
-    # Si llegamos acá, es la primera vez que vemos este mensaje
+    # Si llegamos aca, es la primera vez que vemos este mensaje
     await _handle_message(message, ...)
 ```
 
-## Por qué NO usar try/except
+## Por que NO usar SELECT + INSERT
 
-Una alternativa sería:
+Una alternativa comun pero **incorrecta** seria:
 
 ```python
-# ❌ MAL: Race condition entre SELECT y INSERT
+# MAL: Race condition entre SELECT y INSERT
 exists = await repository.check_if_exists(message_id)
 if exists:
     return
-await repository.mark_as_processed(message_id)  # Otro request puede llegar aquí
+await repository.mark_as_processed(message_id)  # Otro request puede llegar aqui!
 ```
 
 <Callout variant="error" title="Race condition">
-Entre el `SELECT` y el `INSERT`, otro request puede llegar con el mismo message_id. Ambos pasan el check y procesan el mensaje dos veces. `INSERT OR IGNORE` elimina esta ventana.
+Entre el SELECT y el INSERT, otro request puede llegar con el mismo `message_id`. Ambos pasan el check y procesan el mensaje dos veces. `INSERT OR IGNORE` elimina esta ventana porque la verificacion y la insercion son una sola operacion atomica a nivel del motor SQLite.
 </Callout>
 
-## El Patrón Completo
+## El Patron Completo: 4 Pasos
 
 <Step number={1} title="Recibir webhook">
-WhatsApp envía el payload al endpoint POST /webhook.
+WhatsApp/Telegram envia el payload al endpoint POST /webhook.
 </Step>
 
 <Step number={2} title="Responder 200 inmediatamente">
-Antes de procesar, respondemos HTTP 200 para evitar reintentos.
+Antes de procesar, respondemos HTTP 200 para evitar que la plataforma reintente. El procesamiento real se hace en background.
 </Step>
 
-<Step number={3} title="INSERT OR IGNORE">
-Intentamos insertar el message_id. Si ya existe, paramos.
+<Step number={3} title="INSERT OR IGNORE (try_claim_message)">
+Intentamos insertar el `wa_message_id`. Si `rowcount == 0`, el INSERT fue ignorado y paramos.
 </Step>
 
 <Step number={4} title="Procesar si es nuevo">
-Solo si el INSERT fue exitoso (rowcount == 1), procesamos el mensaje.
+Solo si el INSERT fue exitoso (`rowcount == 1`), procesamos el mensaje completo: transcripcion, LLM, respuesta.
 </Step>
 
+<Concept title="Idempotencia end-to-end">
+Este patron hace que todo el pipeline sea **idempotente**: no importa cuantas veces llegue el mismo webhook, el resultado es siempre el mismo. El usuario recibe exactamente una respuesta. Este es un principio fundamental de sistemas distribuidos.
+</Concept>
+
+## Limpieza de processed_messages
+
+Con el tiempo, la tabla `processed_messages` crece. LocalForge no implementa limpieza automatica porque el tamano es minimo (un TEXT ID + un timestamp por mensaje). Para apps de alto volumen, podrias agregar:
+
+```sql
+-- Limpiar mensajes procesados hace mas de 7 dias
+DELETE FROM processed_messages
+WHERE processed_at < datetime('now', '-7 days');
+```
+
 <Quiz
-  question="¿Qué retorna cursor.rowcount cuando INSERT OR IGNORE encuentra un duplicado?"
-  options={["1", "0", "-1", "Lanza una excepción"]}
+  question="Que retorna cursor.rowcount cuando INSERT OR IGNORE encuentra un duplicado?"
+  options={["1", "0", "-1", "Lanza una excepcion"]}
   correct={1}
 />
 
 <Quiz
-  question="¿Por qué INSERT OR IGNORE es mejor que SELECT + INSERT para dedup?"
+  question="Por que INSERT OR IGNORE es mejor que SELECT + INSERT para dedup?"
   options={[
-    "Es más rápido",
-    "Es una operación atómica sin ventana para race conditions",
+    "Es mas rapido en benchmarks",
+    "Es una operacion atomica sin ventana para race conditions",
     "Usa menos memoria",
-    "Soporta más tipos de datos"
+    "Soporta mas tipos de datos"
   ]}
   correct={1}
 />
 
-En la siguiente lección exploraremos sqlite-vec para almacenar y buscar vectores de embeddings.
+<Quiz
+  question="Por que LocalForge responde HTTP 200 antes de procesar el mensaje?"
+  options={[
+    "Para cumplir con el protocolo REST",
+    "Porque FastAPI lo requiere",
+    "Para evitar que WhatsApp/Telegram reintente el webhook mientras se procesa",
+    "Para mejorar las metricas de latencia"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion exploraremos sqlite-vec para almacenar y buscar vectores de embeddings.

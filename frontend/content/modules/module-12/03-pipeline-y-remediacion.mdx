@@ -176,4 +176,15 @@ Sea la original o la remediada, se envía. Nunca se bloquea el envío.
   correct={1}
 />
 
+<Quiz
+  question="¿Qué pasa si run_guardrails() lanza una excepción inesperada?"
+  options={[
+    "La respuesta se bloquea y el usuario recibe un error",
+    "Se reintenta 3 veces con backoff",
+    "Fail-open: el error se loguea y la respuesta original se envía sin modificar",
+    "Se escala a un humano para revisión manual"
+  ]}
+  correct={2}
+/>
+
 En la siguiente lección veremos cómo los fallos de guardrails alimentan el dataset de evaluación.

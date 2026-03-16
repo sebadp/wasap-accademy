@@ -184,4 +184,15 @@ docker compose logs -f app
   correct={1}
 />
 
+<Quiz
+  question="¿Cuál es el propósito del volume mount ./data:/app/data en Docker Compose?"
+  options={[
+    "Acelerar las lecturas de disco dentro del container",
+    "Permitir que Docker acceda al código fuente",
+    "Persistir los datos (SQLite DB, daily logs, MEMORY.md) entre restarts del container",
+    "Compartir datos entre múltiples containers simultáneamente"
+  ]}
+  correct={2}
+/>
+
 En la siguiente lección veremos cómo implementar health checks para monitorear la app en producción.

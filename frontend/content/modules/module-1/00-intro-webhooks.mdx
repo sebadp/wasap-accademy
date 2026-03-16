@@ -6,57 +6,84 @@ xpReward: 50
 
 ## Push vs Pull
 
-Hay dos formas en que un sistema puede enterarse de que algo pasó:
+Hay dos formas en que un sistema puede enterarse de que algo pasó en otro sistema:
 
-<Concept term="Pull (polling)">
-Tu aplicación pregunta periódicamente: "¿hay mensajes nuevos?" Cada N segundos hace un GET a la API. Ineficiente: 99% de las consultas devuelven "no hay nada".
+<Concept title="Pull (polling)">
+Tu aplicación pregunta periódicamente: "¿hay mensajes nuevos?" Cada N segundos hace un GET a la API. Es ineficiente: el 99% de las consultas devuelven "no hay nada nuevo". Además, tenés un delay proporcional al intervalo de polling.
 </Concept>
 
-<Concept term="Push (webhook)">
-Cuando hay un evento, el sistema externo te notifica haciendo un POST a una URL tuya. Solo recibes datos cuando hay algo real. Eficiente y en tiempo real.
+<Concept title="Push (webhook)">
+Cuando hay un evento, el sistema externo te **notifica** haciendo un HTTP POST a una URL tuya. Solo recibís datos cuando hay algo real. Es eficiente, en tiempo real, y no desperdiciás ancho de banda ni CPU.
 </Concept>
 
-<Callout variant="info">
-WhatsApp Business usa el patrón **push via webhooks**. Meta hace un POST a tu servidor cada vez que un usuario te envía un mensaje.
+<Callout variant="info" title="WhatsApp usa webhooks">
+WhatsApp Business usa el patrón **push via webhooks**. Meta hace un HTTP POST a tu servidor cada vez que un usuario te envía un mensaje. No necesitás hacer polling.
 </Callout>
 
-## Cómo funciona el webhook de Meta
+## El flujo completo del webhook de Meta
 
-El flujo tiene dos partes:
+El webhook de WhatsApp tiene dos fases: una **verificación inicial** (que ocurre una sola vez al registrar tu URL) y la **recepción continua** de mensajes.
 
-### 1. Verificación inicial (GET)
+### Fase 1: Verificación inicial (GET)
 
-Cuando registrás tu webhook en el portal de Meta, ellos hacen un GET a tu URL con tres parámetros:
+Cuando registrás tu webhook en el portal de Meta Developers, ellos hacen un GET a tu URL con tres query parameters:
 
-- `hub.mode` = `"subscribe"`
-- `hub.verify_token` = el token que vos configuraste
-- `hub.challenge` = un número aleatorio
+- `hub.mode` = `"subscribe"` (siempre este valor)
+- `hub.verify_token` = el token que **vos** configuraste en el portal
+- `hub.challenge` = un número aleatorio que Meta genera
 
-Tu servidor debe responder con ese número si el token coincide. Meta usa esto para verificar que controlás esa URL.
+Tu servidor debe verificar que `hub.mode == "subscribe"` y que `hub.verify_token` coincide con tu token. Si todo está bien, respondés con el valor de `hub.challenge` como plaintext. Meta usa esto para confirmar que controlás esa URL.
 
-```python title="app/webhook/router.py"
+```python
+# app/webhook/router.py — verificación de webhook (código real de LocalForge)
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import PlainTextResponse, Response
+
+router = APIRouter()
+
 @router.get("/webhook")
 async def verify_webhook(
-    hub_mode: str = Query(alias="hub.mode"),
-    hub_verify_token: str = Query(alias="hub.verify_token"),
-    hub_challenge: str = Query(alias="hub.challenge"),
-    settings: Settings = Depends(get_settings),
-) -> PlainTextResponse:
-    if hub_mode == "subscribe" and hub_verify_token == settings.meta_verify_token:
-        return PlainTextResponse(hub_challenge)
-    raise HTTPException(status_code=403, detail="Invalid verify token")
+    request: Request,
+    hub_mode: str = Query(alias="hub.mode", default=""),
+    hub_verify_token: str = Query(alias="hub.verify_token", default=""),
+    hub_challenge: str = Query(alias="hub.challenge", default=""),
+) -> Response:
+    settings = get_settings(request)
+    if hub_mode == "subscribe" and hub_verify_token == settings.whatsapp_verify_token:
+        return PlainTextResponse(content=hub_challenge)
+    return PlainTextResponse(content="Forbidden", status_code=403)
 ```
 
-### 2. Recepción de mensajes (POST)
+<Concept title="Query(alias='hub.mode')">
+FastAPI usa el parámetro `alias` de `Query()` para mapear query parameters con puntos en el nombre. Python no permite puntos en nombres de variables (`hub.mode` sería syntax error), pero el alias permite que FastAPI busque `hub.mode` en la URL y lo asigne a `hub_mode`.
+</Concept>
 
-Cada mensaje entrante llega como un POST con un payload JSON:
+<Callout variant="warning" title="Valores por defecto vacíos">
+Notá que los parámetros tienen `default=""` en vez de ser requeridos. Esto es intencional: si alguien hace un GET a `/webhook` sin parámetros (un bot escaneando tu servidor), no querés que FastAPI retorne un 422 con detalles de tu API. Con defaults vacíos, simplemente retorna 403.
+</Callout>
 
-```json title="Payload de ejemplo de WhatsApp"
+<Quiz
+  question="¿Por qué Meta hace un GET a tu endpoint antes de empezar a enviar mensajes?"
+  options={["Para cachear tu URL en sus CDN globales", "Para verificar que controlás esa URL y que el token configurado es correcto", "Para obtener la lista de números registrados en tu cuenta", "Para testear la latencia y velocidad de respuesta de tu servidor"]}
+  correct={1}
+/>
+
+### Fase 2: Recepción de mensajes (POST)
+
+Cada mensaje entrante llega como un HTTP POST con un payload JSON. Meta incluye un header `X-Hub-Signature-256` con la firma HMAC para verificar autenticidad.
+
+```json
 {
   "object": "whatsapp_business_account",
   "entry": [{
+    "id": "BIZ_ID",
     "changes": [{
       "value": {
+        "messaging_product": "whatsapp",
+        "metadata": {
+          "display_phone_number": "1234567890",
+          "phone_number_id": "123456"
+        },
         "messages": [{
           "from": "5491155556666",
           "id": "wamid.HBgL...",
@@ -64,14 +91,97 @@ Cada mensaje entrante llega como un POST con un payload JSON:
           "text": { "body": "Hola, ¿qué puedes hacer?" },
           "type": "text"
         }]
-      }
+      },
+      "field": "messages"
     }]
   }]
 }
 ```
 
+<Callout variant="tip" title="¿Por qué tanta anidación?">
+El payload está profundamente anidado porque Meta lo diseñó para soportar **múltiples accounts** (`entry`), **múltiples tipos de cambios** (`changes`), y **múltiples mensajes** (`messages`) en un solo request. En la práctica, casi siempre viene un solo mensaje, pero tu parser debe manejar el caso general.
+</Callout>
+
+## El POST handler de LocalForge
+
+Este es el handler real que recibe los webhooks de Meta:
+
+```python
+# app/webhook/router.py — handler POST (simplificado)
+@router.post("/webhook")
+async def incoming_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> Response:
+    settings = get_settings(request)
+    body = await request.body()
+
+    # Verificar firma HMAC-SHA256
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not validate_signature(body, signature, settings.whatsapp_app_secret):
+        logger.warning("Invalid webhook signature")
+        return Response(status_code=200)  # Siempre 200 para Meta
+
+    payload = await request.json()
+    messages = extract_messages(payload)
+
+    for msg in messages:
+        # Allowlist, rate limiting, dedup
+        if msg.from_number not in settings.allowed_phone_numbers:
+            continue
+        if not rate_limiter.is_allowed(msg.from_number):
+            continue
+        if await repository.try_claim_message(msg.message_id):
+            continue
+
+        # Procesar en background para retornar 200 rápido
+        background_tasks.add_task(process_message, msg=msg, ...)
+
+    return Response(status_code=200)
+```
+
+<Concept title="Defensa en profundidad">
+El handler aplica **4 capas de protección** antes de procesar un mensaje: (1) verificación de firma HMAC, (2) allowlist de números, (3) rate limiting, (4) dedup atómico. Cada capa es independiente: si una falla por un bug, las otras siguen protegiéndote.
+</Concept>
+
+## Webhooks vs REST APIs tradicionales
+
+| Aspecto | REST API (pull) | Webhook (push) |
+|---------|----------------|----------------|
+| Dirección | Tu app consulta al servidor | El servidor te notifica |
+| Latencia | Depende del intervalo de polling | Tiempo real |
+| Eficiencia | Muchas consultas vacías | Solo tráfico cuando hay datos |
+| Complejidad | Simple (solo hacer GET) | Necesitás un servidor público |
+| Seguridad | Tu token protege el acceso | Firma HMAC verifica el origen |
+
 <Quiz
-  question="¿Por qué Meta hace un GET a tu endpoint antes de empezar a enviar mensajes?"
-  options={["Para cachear tu URL en sus servidores", "Para verificar que controlás esa URL y que el token es correcto", "Para obtener la lista de números registrados", "Para testear la velocidad de respuesta de tu servidor"]}
+  question="¿Qué pasa si tu webhook de Meta retorna un status code 500?"
+  options={["Meta descarta el mensaje silenciosamente", "Meta reintenta el request hasta 7 veces con backoff exponencial", "Meta desactiva tu webhook permanentemente", "El usuario ve un mensaje de error en WhatsApp"]}
   correct={1}
 />
+
+## ngrok: exponiendo tu servidor local
+
+Para desarrollo, tu servidor corre en `localhost:8000`. Pero Meta necesita una URL pública. **ngrok** crea un túnel seguro:
+
+```bash
+# Tu servidor local
+localhost:8000 --> ngrok tunnel --> https://tu-dominio.ngrok-free.app
+
+# En docker-compose.yml:
+ngrok:
+  image: ngrok/ngrok
+  command: http --url=${NGROK_DOMAIN} --log=stdout http://localhost:8000
+```
+
+<Callout variant="info" title="Dominio estático de ngrok">
+Con una cuenta gratuita de ngrok podés obtener un dominio estático (`tu-dominio.ngrok-free.app`). Esto es importante porque cada vez que reiniciás ngrok, te da una URL nueva, y tendrías que reconfigurar el webhook en Meta. Con un dominio estático, la URL siempre es la misma.
+</Callout>
+
+<Quiz
+  question="¿Cuántas capas de protección aplica LocalForge antes de procesar un mensaje entrante?"
+  options={["2: firma HMAC y rate limiting", "3: firma HMAC, allowlist y dedup", "4: firma HMAC, allowlist, rate limiting y dedup atómico", "5: firma HMAC, allowlist, rate limiting, dedup y validación de payload"]}
+  correct={2}
+/>
+
+En la próxima lección profundizamos en la verificación de firma HMAC-SHA256: cómo funciona, por qué es necesaria, y cómo implementarla de forma segura.

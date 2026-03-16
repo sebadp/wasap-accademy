@@ -6,99 +6,236 @@ xpReward: 50
 
 ## El problema de la configuración
 
-Los valores que cambian entre entornos (desarrollo, staging, producción) no van en el código. Van en variables de entorno. WasAP usa **Pydantic Settings** para gestionarlas con tipado completo.
+Los valores que cambian entre entornos (desarrollo, staging, producción) no van en el código. Van en variables de entorno. LocalForge usa **Pydantic Settings** para gestionarlas con tipado completo y validación automática.
 
 <Callout variant="error" title="Nunca hagas esto">
-No hardcodees API keys en el código. No las commitees al repo. Usá `.env` (que está en `.gitignore`) y `.env.example` (que sí se commitea, sin valores).
+No hardcodees API keys en el código. No las commitees al repo. Usá `.env` (que está en `.gitignore`) y `.env.example` (que sí se commitea, sin valores reales).
 </Callout>
 
-## El .env.example de WasAP
+## El .env.example real de LocalForge
+
+El archivo `.env.example` tiene **todas** las variables organizadas por sección. Estas son las más importantes:
 
 ```bash
-# WhatsApp / Meta
-WHATSAPP_TOKEN=your-token
-WHATSAPP_PHONE_ID=your-phone-id
-META_VERIFY_TOKEN=your-verify-token
-META_APP_SECRET=your-app-secret
+# === WhatsApp Cloud API ===
+WHATSAPP_ACCESS_TOKEN=your_access_token_here
+WHATSAPP_PHONE_NUMBER_ID=your_phone_number_id_here
+WHATSAPP_VERIFY_TOKEN=your_verify_token_here
+WHATSAPP_APP_SECRET=your_app_secret_here
 
-# Base de datos
-DATABASE_URL=postgresql://wasap:wasap@localhost:5432/wasap
+# Comma-separated list of phone numbers allowed to interact
+ALLOWED_PHONE_NUMBERS=5491112345678
 
-# LLM
-ANTHROPIC_API_KEY=sk-ant-...
-LLM_PROVIDER=claude   # claude | openai | ollama
+# === Ollama ===
+OLLAMA_BASE_URL=http://localhost:11435
+OLLAMA_MODEL=qwen3.5:9b
 
-# Redis
-REDIS_URL=redis://localhost:6379
+# === Database (SQLite) ===
+DATABASE_PATH=data/localforge.db
 
-# App
-DEBUG=false
+# === ngrok ===
+NGROK_AUTHTOKEN=your_ngrok_authtoken_here
+NGROK_DOMAIN=your-domain.ngrok-free.app
+
+# === Logging ===
 LOG_LEVEL=INFO
+LOG_JSON=true
+
+# === Rate Limiting ===
+RATE_LIMIT_MAX=10
+RATE_LIMIT_WINDOW=60
+
+# === Audio (Whisper) ===
+WHISPER_MODEL=base
+WHISPER_DEVICE=cpu
+
+# === Tracing (Langfuse) ===
+TRACING_ENABLED=true
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+LANGFUSE_HOST=http://localhost:3000
 ```
+
+<Callout variant="info" title="ALLOWED_PHONE_NUMBERS">
+Este campo es una **allowlist** de números de teléfono. Solo los números listados pueden interactuar con el bot. Es una medida de seguridad básica pero esencial: sin ella, cualquier número de WhatsApp podría consumir tus recursos de LLM.
+</Callout>
 
 ## Pydantic Settings en acción
 
+El archivo `app/config.py` es el centro neurálgico de la configuración. Mirá cómo se definen las variables con tipos estrictos:
+
 ```python
-from functools import lru_cache
+# app/config.py (versión simplificada del real)
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
-
 class Settings(BaseSettings):
-    whatsapp_token: str
-    whatsapp_phone_id: str
-    meta_verify_token: str
-    meta_app_secret: str
+    # WhatsApp Cloud API
+    whatsapp_access_token: str
+    whatsapp_phone_number_id: str
+    whatsapp_verify_token: str
+    whatsapp_app_secret: str
+    allowed_phone_numbers: list[str]
 
-    database_url: str
+    @field_validator("allowed_phone_numbers", mode="before")
+    @classmethod
+    def parse_phone_numbers(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [n.strip() for n in v.split(",") if n.strip()]
+        return v
 
-    anthropic_api_key: str = ""
-    llm_provider: str = "claude"
+    # Ollama
+    ollama_base_url: str = "http://localhost:11435"
+    ollama_model: str = "qwen3.5:9b"
 
-    redis_url: str = "redis://localhost:6379"
+    # Database
+    database_path: str = "data/localforge.db"
+    summary_threshold: int = 40
+    history_verbatim_count: int = 8
 
-    debug: bool = False
-    log_level: str = "INFO"
+    # Rate limiting
+    rate_limit_max: int = 10
+    rate_limit_window: int = 60
 
-    model_config = {"env_file": ".env"}
+    # Audio (Whisper)
+    whisper_model: str = "base"
+    whisper_device: str = "cpu"
+    whisper_compute_type: str = "int8"
 
+    # Vision
+    vision_model: str = "llava:7b"
 
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
+    # Embeddings & Semantic Search
+    embedding_model: str = "nomic-embed-text"
+    embedding_dimensions: int = 768
+    semantic_search_enabled: bool = True
+    semantic_search_top_k: int = 10
+
+    # Tracing (Langfuse)
+    tracing_enabled: bool = True
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str = "http://localhost:3000"
+
+    model_config = {"env_file": ".env", "env_ignore_empty": True}
 ```
 
-<Concept term="@lru_cache">
-Hace que `get_settings()` solo parsee el archivo `.env` una vez. Las llamadas posteriores devuelven la misma instancia cacheada. Esencial para performance en FastAPI.
+<Concept title="field_validator">
+El `@field_validator` para `allowed_phone_numbers` convierte un string como `"5491112345678,5491198765432"` en una lista `["5491112345678", "5491198765432"]`. Esto permite que en el `.env` escribas una lista separada por comas (más natural que JSON).
 </Concept>
 
-<Concept term="BaseSettings">
-Pydantic Settings lee variables de entorno automáticamente. Si definís `database_url: str`, busca la variable `DATABASE_URL` (case-insensitive) en el entorno o en el `.env`.
+<Concept title="BaseSettings vs BaseModel">
+`BaseSettings` hereda de `BaseModel` pero agrega superpoderes: lee automáticamente variables de entorno y archivos `.env`. Si definís `database_path: str`, busca `DATABASE_PATH` (case-insensitive) en el entorno. Los campos con valores por defecto son opcionales; los sin default son **requeridos**.
 </Concept>
-
-## Validación automática al arrancar
-
-Si falta una variable requerida, Pydantic lanza un `ValidationError` **al arrancar la aplicación**, no cuando la necesitás. Esto te da fail-fast: sabés inmediatamente si el entorno está mal configurado.
-
-<Terminal title="Error típico de configuración faltante">
-pydantic_settings.errors.SettingsError: 1 validation error
-whatsapp_token
-  Field required [type=missing, ...]
-</Terminal>
-
-<Step number={1} title="Copiá el .env.example">
-`cp .env.example .env`
-</Step>
-
-<Step number={2} title="Completá los valores reales">
-Editá `.env` con tus credenciales. Para desarrollo local, las de WhatsApp pueden ser falsas si no vas a testear webhooks reales.
-</Step>
-
-<Step number={3} title="Verificá que la app arranca">
-`docker compose up api` y mirá que no haya errores de configuración en los logs.
-</Step>
 
 <Quiz
-  question="¿Cuál es la ventaja principal de usar @lru_cache en get_settings()?"
-  options={["Permite cambiar las variables de entorno sin reiniciar la app", "El archivo .env se parsea solo una vez, mejorando la performance", "Valida automáticamente que todas las variables estén presentes", "Sincroniza las settings con la base de datos"]}
+  question="¿Cuál es la ventaja principal de usar Pydantic Settings sobre os.environ.get()?"
+  options={["Es más rápido en tiempo de ejecución", "Provee tipado estricto, validación automática al arrancar, y valores por defecto", "Permite encriptar las variables de entorno", "Sincroniza las settings con un servidor de configuración remoto"]}
   correct={1}
 />
+
+## Manejo de comentarios en .env
+
+Un detalle de producción interesante: LocalForge tiene un sistema custom para manejar comentarios inline en archivos `.env`:
+
+```python
+# app/config.py — manejo robusto de comentarios en .env
+def _strip_inline_comment(value):
+    """Strip trailing inline shell comments from unquoted env values.
+    e.g. 'FIELD=value   # explanation' -> 'value'
+    """
+    if isinstance(value, str) and "#" in value:
+        value = value[: value.index("#")].strip()
+    return value
+
+class _SafeEnvSource(EnvSettingsSource):
+    def decode_complex_value(self, field_name, field, value):
+        return _safe_decode_complex(value)  # strip comment, then JSON decode
+```
+
+<Callout variant="warning" title="Por qué esto importa">
+Sin este fix, un `.env` con `ALLOWED_PHONE_NUMBERS=123  # mi número` crashea porque Pydantic intenta parsear `"123  # mi número"` como JSON para el tipo `list[str]`. El `_SafeEnvSource` custom hace strip del comentario **antes** de intentar decodificar.
+</Callout>
+
+## Validación fail-fast al arrancar
+
+Si falta una variable requerida, Pydantic lanza un `ValidationError` **al arrancar la aplicación**, no cuando la necesitás. Esto es un patrón llamado **fail-fast**:
+
+```
+pydantic_settings.errors.SettingsError: 1 validation error
+whatsapp_access_token
+  Field required [type=missing, ...]
+```
+
+<Concept title="Fail-Fast">
+El principio fail-fast dice que si algo va a fallar, es mejor que falle lo antes posible. Si tu `.env` tiene un error, preferís saberlo al arrancar (2 segundos después de `docker compose up`) y no 3 horas después cuando un usuario te manda un mensaje y el sistema intenta usar una variable que no existe.
+</Concept>
+
+## Paso a paso: configurar tu entorno
+
+<Step number={1} title="Copiá el .env.example">
+```bash
+cp .env.example .env
+```
+</Step>
+
+<Step number={2} title="Configurá las credenciales de WhatsApp">
+Andá al [Meta Developer Portal](https://developers.facebook.com), creá una app de WhatsApp Business, y copiá los 4 valores: `ACCESS_TOKEN`, `PHONE_NUMBER_ID`, `VERIFY_TOKEN`, y `APP_SECRET`.
+</Step>
+
+<Step number={3} title="Configurá ngrok">
+```bash
+# Registrate en https://ngrok.com (es gratis)
+# Copiá tu authtoken y un dominio estático
+NGROK_AUTHTOKEN=2abc...
+NGROK_DOMAIN=your-domain.ngrok-free.app
+```
+</Step>
+
+<Step number={4} title="Verificá que la app arranca">
+```bash
+docker compose --profile dev up localforge
+# Mirá los logs: no debería haber errores de configuración
+```
+</Step>
+
+<Step number={5} title="Tu número en la allowlist">
+```bash
+# Importante: sin el +, con código de país
+ALLOWED_PHONE_NUMBERS=5491112345678
+```
+</Step>
+
+## Cómo se usa Settings en el código
+
+En FastAPI, las settings se inyectan via dependency injection. Nunca se instancian directamente en el código de negocio:
+
+```python
+# app/dependencies.py
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
+
+# app/webhook/router.py — uso en un endpoint
+@router.post("/webhook")
+async def incoming_webhook(request: Request) -> Response:
+    settings = get_settings(request)
+    # settings.whatsapp_app_secret, settings.allowed_phone_numbers, etc.
+```
+
+<Callout variant="tip" title="Una sola instancia">
+En el lifespan de FastAPI, `Settings()` se crea **una sola vez** y se guarda en `app.state.settings`. Todas las rutas acceden a la misma instancia via `get_settings()`. Esto evita parsear el `.env` múltiples veces.
+</Callout>
+
+<Quiz
+  question="¿Qué pasa si una variable requerida falta en el .env al arrancar LocalForge?"
+  options={["La app arranca con un valor vacío por defecto", "La app arranca pero falla cuando se necesita la variable", "Pydantic lanza un ValidationError inmediatamente (fail-fast)", "Docker Compose detecta el error y no levanta el contenedor"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué LocalForge tiene un _SafeEnvSource custom en config.py?"
+  options={["Para encriptar las variables sensibles en memoria", "Para permitir hot-reload de variables sin reiniciar", "Para manejar comentarios inline en .env que romperían el parsing de listas", "Para validar que las URLs son accesibles antes de arrancar"]}
+  correct={2}
+/>
+
+En la próxima lección trazamos el camino completo de un mensaje: desde que el usuario lo envía hasta que recibe la respuesta.

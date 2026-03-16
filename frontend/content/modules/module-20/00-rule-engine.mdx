@@ -165,4 +165,15 @@ async def execute_action(
   correct={1}
 />
 
+<Quiz
+  question="¿Qué hace el dispatcher check_condition cuando recibe un condition_type desconocido?"
+  options={[
+    "Lanza una excepción y detiene el engine",
+    "Ejecuta la acción de todas formas como medida de seguridad",
+    "Loguea un warning y retorna False (la regla no se dispara)",
+    "Intenta parsear el tipo como SQL genérico"
+  ]}
+  correct={2}
+/>
+
 En la siguiente lección veremos los tres tipos de condiciones que puede evaluar el engine.

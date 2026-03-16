@@ -6,104 +6,233 @@ xpReward: 125
 
 ## RAG: Retrieval-Augmented Generation
 
-RAG es el patrón de **buscar información relevante** antes de que el LLM genere una respuesta. En vez de depender solo de lo que el modelo sabe, le inyectamos contexto real.
+RAG es el patrón de **buscar información relevante** antes de que el LLM genere una respuesta. En vez de depender solo del conocimiento interno del modelo (que puede estar desactualizado o no conocer datos del usuario), le inyectamos contexto real extraído de la base de datos.
 
-<Concept title="RAG">
-**R**etrieval (buscar) **A**ugmented (enriquecido) **G**eneration (generación). El LLM genera mejores respuestas porque tiene información relevante en el contexto.
+<Concept title="RAG en una oración">
+**R**etrieval (buscar datos relevantes) **A**ugmented (enriquecer el prompt) **G**eneration (generar respuesta con el LLM). El modelo produce mejores respuestas porque tiene información personalizada y actualizada en su contexto.
 </Concept>
 
-## El Pipeline Completo
+## El Pipeline Completo en 4 Fases
 
-<Step number={1} title="Phase A: Embed el query">
-El mensaje del usuario se convierte en un vector de 768 dimensiones.
+<Step number={1} title="Embed: convertir el query en vector">
+El mensaje del usuario se convierte en un vector de 768 dimensiones via Ollama. Este vector se usará para todas las búsquedas semánticas.
 </Step>
 
-<Step number={2} title="Phase B: Buscar (en paralelo)">
-Con ese vector se buscan memorias similares, notas similares, y proyectos relevantes simultáneamente.
+<Step number={2} title="Search: buscar en paralelo">
+Con ese vector se buscan memorias similares, notas similares, y notas de proyecto relevantes. Todo en paralelo con `asyncio.gather`.
 </Step>
 
-<Step number={3} title="Inject: ContextBuilder">
-Los resultados se inyectan en el system prompt dentro de tags XML.
+<Step number={3} title="Inject: construir el contexto">
+Los resultados de búsqueda se formatean y se inyectan en el system prompt dentro de tags XML usando `ContextBuilder`.
 </Step>
 
-<Step number={4} title="Generate: LLM">
-El LLM genera la respuesta usando el contexto inyectado.
+<Step number={4} title="Generate: el LLM responde">
+El LLM genera la respuesta usando todo el contexto inyectado. Conoce las memorias del usuario, sus notas, y el historial de conversación.
 </Step>
 
-## Code: Las 4 Fases en router.py
+## Code: Las Fases en _run_normal_flow
+
+Así se ve el código real en `router.py`:
 
 ```python
-async def _handle_message(phone, text, ...):
-    # Phase A: embed + save (paralelo)
-    query_embedding, _ = await asyncio.gather(
-        ollama_client.embed(text),           # Embed query
-        repository.save_message(conv_id, "user", text),
-    )
+# app/webhook/router.py — dentro de _run_normal_flow()
+async def _run_normal_flow(trace_ctx):
+    # Kick off classify_intent en paralelo (LLM call, 1-3s)
+    classify_task = asyncio.create_task(classify_intent(user_text, ollama_client))
 
-    # Phase B: search (paralelo)
-    memories, notes, summary, history = await asyncio.gather(
-        repository.search_similar_memories_with_distance(
-            phone, query_embedding, top_k=10, threshold=1.0
+    # Phase A+B: ConversationContext.build() || save user message
+    ctx, _ = await asyncio.gather(
+        ConversationContext.build(
+            phone_number=msg.user_id,
+            user_text=user_text,
+            repository=repository,
+            conversation_manager=conversation,
+            ollama_client=ollama_client,
+            settings=settings,
+            daily_log=daily_log,
+            vec_available=vec_available,
+            entity_registry=entity_registry,
         ),
-        repository.search_similar_notes(phone, query_embedding, top_k=5),
-        repository.get_latest_summary(conv_id),
-        repository.get_recent_messages(conv_id, limit=8),
+        repository.save_message(conv_id, "user", user_text, msg.message_id),
     )
 
-    # Inject: construir contexto
-    context = _build_context(
-        memories=memories,
-        notes=notes,
-        summary=summary,
+    # Unpack context fields
+    query_embedding = ctx.query_embedding
+    memories = ctx.memories
+    relevant_notes = ctx.relevant_notes
+    daily_logs = ctx.daily_logs
+    history = ctx.history
+    # ... más campos ...
+```
+
+<Callout variant="info" title="ConversationContext centraliza todo">
+En vez de hacer 8 queries separadas en el router, `ConversationContext.build()` encapsula toda la recolección de datos. Internamente ejecuta las búsquedas en paralelo y retorna un objeto con todos los campos listos.
+</Callout>
+
+## Dentro de ConversationContext.build()
+
+El factory method ejecuta las fases de búsqueda internamente:
+
+```python
+# app/context/conversation_context.py — simplificado
+@classmethod
+async def build(cls, phone_number, user_text, repository, ollama_client,
+                settings, daily_log, vec_available, ...) -> ConversationContext:
+    # Step 1: embed el query (necesario para búsquedas semánticas)
+    query_embedding = await _get_query_embedding()
+
+    # Step 2: parallel fetches (todo independiente, embedding ya listo)
+    (
+        memories_and_stats,
+        windowed,
+        sticky,
+        logs,
+        relevant_notes,
+    ) = await asyncio.gather(
+        _get_memories_with_threshold(query_embedding),
+        conversation_manager.get_windowed_history(phone_number, verbatim_count=8),
+        repository.get_sticky_categories(conv_id),
+        _get_daily_logs(),
+        _get_relevant_notes(query_embedding),
+    )
+    project_notes = await _get_project_notes(query_embedding, active_projects)
+
+    # Extract user facts from memories (regex, no LLM)
+    user_facts = extract_facts(memories_raw)
+
+    return cls(
+        memories=memories_raw,
         history=history,
-    )
-
-    # Generate: LLM con contexto
-    response = await execute_tool_loop(
-        messages=[{"role": "system", "content": context}] + history,
+        summary=summary,
+        relevant_notes=relevant_notes,
+        query_embedding=query_embedding,
+        user_facts=user_facts,
+        # ... más campos ...
     )
 ```
 
-## El System Prompt con RAG
+## El Contexto Ensamblado: _build_context()
+
+Los datos de `ConversationContext` se formatean en un system prompt con XML tags:
+
+```python
+# app/webhook/router.py
+def _build_context(
+    system_prompt, memories, relevant_notes, daily_logs,
+    skills_summary, summary, history, projects_summary, project_notes,
+) -> list[ChatMessage]:
+    builder = ContextBuilder(system_prompt)
+    builder.add_section("user_memories", _format_memories(memories))
+    builder.add_section("active_projects", projects_summary)
+    builder.add_section("project_notes", _format_project_notes(project_notes or []))
+    builder.add_section("relevant_notes", _format_notes(relevant_notes))
+    builder.add_section("recent_activity", daily_logs)
+    builder.add_section("capabilities", skills_summary)
+    if summary:
+        builder.add_section("conversation_summary",
+                            f"Previous conversation summary:\n{summary}")
+
+    context = [ChatMessage(role="system", content=builder.build_system_message())]
+    context.extend(history)
+    return context
+```
+
+## El System Prompt Resultante
+
+Esto es lo que el LLM ve (ejemplo con datos reales):
 
 ```xml
-<system_prompt>Sos un asistente personal...</system_prompt>
+You are a helpful personal assistant on WhatsApp...
 
 <user_memories>
-- Es desarrollador Python senior
-- Trabaja en fintech, Buenos Aires
-- Prefiere respuestas técnicas
+Important user information:
+- Es desarrollador Python senior en fintech, Buenos Aires
+- Prefiere respuestas técnicas y directas
+- GitHub username: sebadp
 </user_memories>
 
+<active_projects>
+Active projects:
+  - API v2: 3/5 tasks (60%)
+</active_projects>
+
 <relevant_notes>
-- [Nota: API v2] Endpoints: /users, /payments, /auth
-- [Nota: Deploy] Usar Docker Compose en producción
+Relevant notes:
+- [42] Deploy Guide: Usar Docker Compose en producción con nginx reverse proxy
+- [38] API Endpoints: /users, /payments, /auth — todos con JWT
 </relevant_notes>
 
+<recent_activity>
+## 2026-03-16
+- Discutió arquitectura de microservicios
+- Completó tarea "diseño de endpoints"
+</recent_activity>
+
+<capabilities>
+Available tools: get_weather, save_note, list_notes, web_search
+</capabilities>
+
 <conversation_summary>
-El usuario estuvo trabajando en la API v2, definiendo endpoints
-y discutiendo estrategias de autenticación...
+Previous conversation summary:
+El usuario viene trabajando en su API v2, discutimos autenticación JWT...
 </conversation_summary>
 ```
 
 ## Sin RAG vs Con RAG
 
 ```
-Pregunta: "¿Cómo iba lo del deploy?"
+Pregunta del usuario: "¿Cómo iba lo del deploy?"
 
-Sin RAG:
-LLM → "No tengo información sobre un deploy. ¿Podés darme más contexto?"
+─── Sin RAG ───
+LLM: "No tengo información sobre un deploy. ¿Podés darme más contexto?"
 
-Con RAG:
-memories → "Trabaja en fintech"
-notes → "[Deploy] Usar Docker Compose"
-summary → "Discutimos autenticación para la API"
-LLM → "Tu nota sobre deploy dice usar Docker Compose. Para la API v2
-        que venimos armando, recomendaría..."
+─── Con RAG ───
+memories → "Trabaja en fintech, prefiere respuestas técnicas"
+notes → "[42] Deploy Guide: Docker Compose con nginx"
+projects → "API v2: 3/5 tasks (60%)"
+summary → "Discutimos autenticación JWT para la API"
+
+LLM: "Según tu nota de deploy, la estrategia es Docker Compose con nginx como
+      reverse proxy. Para la API v2 que venimos armando (ya tenés 3 de 5 tareas
+      listas), recomendaría configurar health checks en el compose..."
 ```
 
 <Callout variant="tip" title="Personalización automática">
-Con RAG, el asistente sabe quién sos, en qué trabajás, y qué discutiste antes. Sin que lo repitas cada vez.
+Con RAG, el asistente sabe quién sos, en qué trabajás, qué discutiste antes, y qué herramientas tiene disponibles. Sin que repitas contexto cada vez. La calidad de respuesta es dramáticamente mejor.
+</Callout>
+
+## Formateo de Datos para Inyección
+
+Cada tipo de dato tiene su función de formateo:
+
+```python
+# app/webhook/router.py
+def _format_memories(memories: list[str]) -> str | None:
+    if not memories:
+        return None
+    return "Important user information:\n" + "\n".join(f"- {m}" for m in memories)
+
+def _format_notes(relevant_notes: list[Note]) -> str | None:
+    if not relevant_notes:
+        return None
+    return "Relevant notes:\n" + "\n".join(
+        f"- [{n.id}] {n.title}: {n.content[:200]}" for n in relevant_notes
+    )
+
+def _format_project_notes(project_notes: list) -> str | None:
+    if not project_notes:
+        return None
+    lines = ["Project documents and notes:"]
+    for n in project_notes:
+        header = f"[{n.id}]"
+        if n.title:
+            header += f" {n.title}"
+        lines.append(f"- {header}: {n.content[:500]}")
+    return "\n".join(lines)
+```
+
+<Callout variant="warning" title="Truncamiento de notas">
+Las notas regulares se truncan a 200 caracteres (`n.content[:200]`) y las notas de proyecto a 500 caracteres (`n.content[:500]`). Esto es intencional: evita que una nota muy larga consuma todo el presupuesto de tokens del contexto.
 </Callout>
 
 <Quiz
@@ -118,14 +247,25 @@ Con RAG, el asistente sabe quién sos, en qué trabajás, y qué discutiste ante
 />
 
 <Quiz
-  question="¿En qué fase del pipeline se buscan memorias y notas?"
+  question="¿En qué orden se ejecutan las fases del pipeline RAG?"
   options={[
-    "Phase A (embed)",
-    "Phase B (search, en paralelo)",
-    "Phase C (classify)",
-    "Phase D (generate)"
+    "Generate → Search → Inject → Embed",
+    "Search → Embed → Generate → Inject",
+    "Embed → Search → Inject → Generate",
+    "Inject → Embed → Search → Generate"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué classify_intent se lanza como asyncio.create_task ANTES de ConversationContext.build()?"
+  options={[
+    "Porque classify_intent necesita el embedding del query",
+    "Para que la clasificación corra en paralelo con las búsquedas de Phase A+B, ahorrando latencia",
+    "Porque es una operación sincrónica que no puede esperar",
+    "Para evitar race conditions con la base de datos"
   ]}
   correct={1}
 />
 
-Has completado el módulo Semantic Search & RAG. Ahora entendés el pipeline completo de recuperación y generación aumentada.
+Has completado el módulo Semantic Search & RAG. Ahora entendés el pipeline completo desde el embedding del query hasta la generación de la respuesta con contexto personalizado.

@@ -1,92 +1,221 @@
 ---
 title: "classify_intent"
-description: "Clasificación rápida de intención con LLM sin herramientas"
+description: "Clasificacion rapida de intencion con LLM sin herramientas"
 xpReward: 75
 ---
 
-## Cómo Funciona la Clasificación
+## Como Funciona la Clasificacion
 
-`classify_intent()` es una llamada LLM **rápida**: sin tools, sin chain-of-thought, solo texto. Le pedimos al modelo que clasifique el mensaje del usuario en categorías predefinidas.
+`classify_intent()` es una llamada LLM **rapida**: sin tools, sin chain-of-thought, solo texto. Le pedimos al modelo que clasifique el mensaje del usuario en categorias predefinidas.
+
+<Callout variant="info" title="Simple por diseno">
+La clasificacion usa `think=False` y no requiere JSON output. El LLM solo retorna nombres de categorias separados por comas. Esto la hace rapida (~200ms) y robusta contra errores de formato.
+</Callout>
+
+## La Firma Real
 
 ```python
 async def classify_intent(
-    messages: list[dict],
-    context: str = "",
+    user_message: str,
+    ollama_client: OllamaClient,
+    recent_messages: list[ChatMessage] | None = None,
+    sticky_categories: list[str] | None = None,
+    repository: object | None = None,
 ) -> list[str]:
-    prompt = f"""Classify the user's message into categories.
-Available categories: time, math, weather, search, news, notes,
-files, memory, github, tools, knowledge, none.
-
-Return ONLY a JSON array of category names.
-If the message is plain chat, return ["none"].
-
-Context: {context}
-"""
-    response = await ollama_client.chat(
-        messages=[{"role": "system", "content": prompt}] + messages[-3:],
-        think=False,  # Rápido, sin reasoning
-    )
-
-    return _parse_categories(response.content)
 ```
 
-<Callout variant="info" title="Solo los últimos 3 mensajes">
-Para clasificar, no necesitamos toda la conversación. Los últimos 3 mensajes dan suficiente contexto y mantienen la llamada rápida.
+Nota los parametros opcionales: `recent_messages` provee contexto conversacional, `sticky_categories` es el fallback de continuidad, y `repository` permite cargar prompts versionados desde la base de datos.
+
+## El Prompt del Clasificador
+
+El prompt esta definido como template en `app/skills/router.py` con ejemplos por categoria:
+
+```python
+_CLASSIFIER_PROMPT_TEMPLATE = (
+    "Classify this message into tool categories. "
+    'Reply with ONLY category names separated by commas, or "none".\n'
+    "Categories: {categories}, none\n\n"
+    "Examples:\n"
+    # time
+    '"what time is it" -> time\n'
+    '"recuerdame en 5 minutos" -> time\n'
+    '"set a reminder for tomorrow at 3pm" -> time\n'
+    # math
+    '"15% of 230" -> math\n'
+    # weather
+    '"clima en Buenos Aires" -> weather\n'
+    # search
+    '"busca informacion sobre Python 3.13" -> search\n'
+    # notes
+    '"remember that I like coffee" -> notes\n'
+    # selfcode
+    '"cual es tu version?" -> selfcode\n'
+    '"busca en el codigo donde se define classify_intent" -> selfcode\n'
+    # multi-category
+    '"que hora es y como esta el clima?" -> time, weather\n'
+    '"calcula 15% de 230 y busca que impuesto aplica" -> math, search\n\n'
+    "{recent_context}"
+    "Message to classify: {user_message}"
+)
+```
+
+<Concept title="Few-shot prompting bilingue">
+El prompt incluye ejemplos en ingles y espanol porque LocalForge maneja ambos idiomas. Los ejemplos cubren casos simples (una categoria) y multi-categoria. El formato `"mensaje" -> categoria` es mas facil de imitar para el LLM que un JSON schema.
+</Concept>
+
+## Contexto Conversacional
+
+Para clasificar mensajes ambiguos como "Ambos" o "Los de los ultimos meses", se incluye el contexto reciente:
+
+```python
+recent_context = ""
+if recent_messages:
+    context_lines = []
+    for msg in recent_messages[-6:]:  # Ultimos 3 turnos (6 msgs)
+        if msg.role not in ("user", "assistant"):
+            continue
+        role_label = "User" if msg.role == "user" else "Assistant"
+        content_preview = msg.content[:200].replace("\n", " ")
+        context_lines.append(f"{role_label}: {content_preview}")
+    if context_lines:
+        recent_context = (
+            "Recent conversation (for context only):\n"
+            + "\n".join(context_lines) + "\n\n"
+        )
+```
+
+<Callout variant="tip" title="Solo 6 mensajes, 200 chars cada uno">
+El contexto se limita a los ultimos 3 turnos (user + assistant = 6 mensajes) con un preview de 200 caracteres. Esto mantiene el prompt clasificador ligero (~500 tokens) y rapido.
 </Callout>
 
-## Las 12 Categorías
+## Las 20 Categorias
 
-| Categoría | Ejemplos de mensajes |
-|-----------|---------------------|
-| `time` | "¿Qué hora es?", "¿Qué día es hoy?" |
-| `math` | "Cuánto es 15% de 200", "Calculá sqrt(144)" |
-| `weather` | "¿Cómo está el clima?", "¿Va a llover?" |
-| `search` | "Buscá información sobre X" |
-| `news` | "¿Qué noticias hay?", "Novedades de tech" |
-| `notes` | "Guardá una nota", "¿Qué notas tengo?" |
-| `files` | "Leé el archivo X", "Buscá en el código" |
-| `memory` | "Recordá que soy dev", "¿Qué sabés de mí?" |
-| `tools` | "¿Qué herramientas tenés?", "Listá tus skills" |
-| `knowledge` | "¿Qué sabés sobre el proyecto?" |
-| `github` | "Creá un PR", "Buscá issues" |
-| **`none`** | "Hola", "Gracias", "Contame un chiste" |
+LocalForge tiene mas categorias de lo que parece, porque incluye herramientas de introspection, automatizacion y evaluacion:
+
+| Categoria | Tools | Ejemplos de mensajes |
+|-----------|-------|---------------------|
+| `time` | 7 | "Que hora es?", "Recuerdame en 5 min" |
+| `math` | 1 | "Cuanto es 15% de 200" |
+| `weather` | 1 | "Como esta el clima?" |
+| `search` | 1 | "Busca informacion sobre X" |
+| `news` | 2 | "Que noticias hay de tech?" |
+| `notes` | 5 | "Guarda una nota", "Que notas tengo?" |
+| `files` | 6 | "Lee el archivo config.py" |
+| `memory` | 9 | "Recorda que soy dev" |
+| `github` | 7 | "Crea un PR", "Lista issues" |
+| `selfcode` | 10 | "Cual es tu version?", "Logs de error" |
+| `expand` | 9 | "Busca servidores MCP para Slack" |
+| `projects` | 12 | "Mostra mis proyectos" |
+| `evaluation` | 9 | "Metricas de eval", "Cuantas fallas?" |
+| `debugging` | 5 | "Revisa las interacciones recientes" |
+| `shell` | 2 | "Ejecuta un comando" |
+| `tools` | 2 | "Que herramientas tenes?" |
+| `knowledge` | 1 | "Busca en el grafo de conocimiento" |
+| `provenance` | 2 | "De donde salio esa memoria?" |
+| `automation` | 3 | "Mostra las reglas de automatizacion" |
+| **`none`** | 0 | "Hola", "Gracias", "Contame un chiste" |
 
 ## El Caso Especial: ["none"]
 
-Cuando el usuario hace chat casual, no necesita herramientas:
+Cuando el usuario hace chat casual, no necesita herramientas. Pero hay matices:
 
 ```python
-if categories == ["none"]:
-    # Plain chat: ir directo al LLM sin tool loop
-    response = await ollama_client.chat(messages=full_history)
-    return response.content
+if raw == "none":
+    # Fast-path override: si hay URL, forzar fetch
+    if has_url and "fetch" in TOOL_CATEGORIES:
+        return ["fetch"]
+
+    # Sticky fallback: si el usuario esta en una conversacion con tools
+    if sticky_categories:
+        return sticky_categories
+
+    return ["none"]
+```
+
+<Callout variant="warning" title="URL detection overrides 'none'">
+Si el mensaje contiene una URL (detectada con regex), se fuerza la categoria `fetch` aunque el clasificador diga "none". Esto resuelve el caso comun de "analizame esta pagina: https://..." donde el LLM a veces no detecta que necesita herramientas.
+</Callout>
+
+## Parsing de la Respuesta
+
+La respuesta del LLM es texto plano que se parsea:
+
+```python
+# Parse comma-separated categories, keep only valid ones
+valid = set(TOOL_CATEGORIES.keys())
+categories = [c.strip() for c in raw.split(",") if c.strip() in valid]
+
+# Si hay URL y no se detecto fetch, forzarla
+if has_url and "fetch" not in categories:
+    categories.append("fetch")
+
+# Fallback si no quedo nada valido
+if not categories:
+    return DEFAULT_CATEGORIES
 ```
 
 ## Fallback: DEFAULT_CATEGORIES
 
-Si la clasificación falla (output inválido, timeout), WasAP usa un set seguro:
+Si la clasificacion falla (output invalido, timeout, excepcion), LocalForge usa un set seguro:
 
 ```python
-DEFAULT_CATEGORIES = ["time", "math", "weather", "search"]
+DEFAULT_CATEGORIES = ["time", "math", "weather", "search", "documentation"]
 ```
 
-<Callout variant="tip" title="Fail-safe">
-Las categorías default cubren los casos más comunes. El usuario puede que no obtenga la herramienta exacta, pero no se queda sin herramientas.
-</Callout>
+<Concept title="Fail-safe design">
+Las categorias default cubren los casos mas comunes (hora, calculo, clima, busqueda). El usuario puede que no obtenga la herramienta exacta, pero no se queda sin herramientas. El fallback es un `try/except` que atrapa *cualquier* excepcion.
+</Concept>
+
+## Prompts Versionados (Prompt Engineering)
+
+Si hay un repository disponible, el clasificador puede usar prompts gestionados desde la base de datos:
+
+```python
+if repository is not None:
+    try:
+        from app.eval.prompt_manager import get_active_prompt
+        classifier_template = await get_active_prompt("classifier", repository)
+    except Exception:
+        classifier_template = _CLASSIFIER_PROMPT_TEMPLATE
+else:
+    classifier_template = _CLASSIFIER_PROMPT_TEMPLATE
+```
+
+Esto permite iterar sobre el prompt del clasificador sin deploys -- se cambia en la DB y el siguiente mensaje ya usa la nueva version.
+
+## Tracing del Clasificador
+
+Cada clasificacion genera un span en Langfuse:
+
+```python
+trace = get_current_trace()
+if trace:
+    async with trace.span("llm:classify_intent", kind="generation") as span:
+        span.set_input({"user_message": user_message[:200]})
+        response = await ollama_client.chat_with_tools(
+            messages, tools=None, think=False
+        )
+        span.set_metadata({
+            "gen_ai.usage.input_tokens": response.input_tokens,
+            "gen_ai.usage.output_tokens": response.output_tokens,
+        })
+        raw = response.content.strip().lower()
+        span.set_output({"raw": raw})
+```
 
 <Quiz
-  question="¿Por qué classify_intent usa think=False?"
+  question="Por que classify_intent usa think=False?"
   options={[
-    "Para reducir costos",
-    "Porque necesita una respuesta rápida y determinística, sin chain-of-thought",
-    "Porque el modelo no soporta thinking",
-    "Para evitar errores"
+    "Para reducir costos de API",
+    "Porque necesita una respuesta rapida y deterministica, sin chain-of-thought",
+    "Porque el modelo no soporta thinking en modo clasificacion",
+    "Para evitar errores de parseo en el JSON"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Qué retorna classify_intent cuando el usuario dice 'Hola'?"
+  question="Que retorna classify_intent cuando el usuario dice 'Hola, como estas?'"
   options={[
     "['chat']",
     "['none']",
@@ -96,4 +225,15 @@ Las categorías default cubren los casos más comunes. El usuario puede que no o
   correct={1}
 />
 
-En la siguiente lección veremos cómo select_tools mapea categorías a herramientas.
+<Quiz
+  question="Si el mensaje contiene una URL pero el clasificador retorna 'none', que pasa?"
+  options={[
+    "Se respeta el 'none' y no se usan herramientas",
+    "Se fuerza la categoria 'fetch' automaticamente via URL detection",
+    "Se reintenta la clasificacion con mas contexto",
+    "Se retorna un error al usuario"
+  ]}
+  correct={1}
+/>
+
+En la siguiente leccion veremos como select_tools mapea categorias a herramientas.

@@ -240,4 +240,15 @@ class Settings(BaseSettings):
   correct={2}
 />
 
+<Quiz
+  question="¿Por qué se configura trace_retention_days para limpiar traces viejos?"
+  options={[
+    "Porque Langfuse tiene un límite de 100 traces",
+    "Para cumplir con regulaciones de privacidad",
+    "Porque los traces ocupan espacio y acumulados sin límite degradan el rendimiento de la base de datos",
+    "Porque los traces viejos contienen datos incorrectos"
+  ]}
+  correct={2}
+/>
+
 Has completado el módulo de Production Deployment y CI/CD. Con Docker, health checks, CI pipeline, evaluaciones automáticas y monitoreo con Langfuse, tu asistente de AI está listo para producción.

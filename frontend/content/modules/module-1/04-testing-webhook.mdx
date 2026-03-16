@@ -1,129 +1,349 @@
 ---
 title: "Testing del webhook"
-description: "Tests unitarios e integración para el pipeline de webhooks"
+description: "Tests unitarios e integración para el pipeline de webhooks con TestClient y mocks"
 xpReward: 100
 ---
 
-## Por qué testear el webhook primero
+## Por Qué Testear el Webhook Primero
 
-El webhook es el punto de entrada de tu sistema. Un bug aquí significa que no recibís mensajes. La cobertura de tests en `app/webhook/` es del **100%** en WasAP.
+El webhook es el **punto de entrada** de todo el sistema. Un bug aquí significa que no recibís mensajes. Si no recibís mensajes, el LLM nunca se ejecuta, la respuesta nunca se envía, y el bot está muerto. Por eso los tests del webhook son los primeros que se escriben y los más críticos.
 
-<Callout variant="tip">
-WasAP tiene 316 tests en total. Los del webhook son los más críticos porque si fallan, todo lo demás es irrelevante.
+<Callout variant="tip" title="Tests como red de seguridad">
+LocalForge tiene 316+ tests en total. Los del webhook cubren: verificación GET, firma HMAC, parsing de payloads, whitelist de números, status updates y edge cases. Si alguno falla, el deploy no avanza.
 </Callout>
 
-## Test de verificación GET
+## Arquitectura de Tests: Sync vs Async
 
-```python title="tests/test_webhook.py"
-import pytest
-from httpx import AsyncClient
+LocalForge usa dos tipos de fixtures dependiendo del tipo de test:
 
+| Tipo de test | Fixture | Herramienta | Cuándo usar |
+|-------------|---------|-------------|-------------|
+| **Integration** | `client` (sync) | `TestClient` de Starlette | Tests que envían HTTP requests completos |
+| **Unit** | `db_connection` (async) | `pytest-asyncio` | Tests de componentes individuales (repository, manager) |
 
-@pytest.mark.asyncio
-async def test_verify_webhook_success(client: AsyncClient):
-    """Meta puede verificar el webhook con el token correcto."""
-    response = await client.get(
-        "/webhook",
-        params={
-            "hub.mode": "subscribe",
-            "hub.verify_token": "test-verify-token",  # del fixture
-            "hub.challenge": "123456",
-        },
-    )
-    assert response.status_code == 200
-    assert response.text == "123456"
-
-
-@pytest.mark.asyncio
-async def test_verify_webhook_wrong_token(client: AsyncClient):
-    """Token incorrecto → 403."""
-    response = await client.get(
-        "/webhook",
-        params={
-            "hub.mode": "subscribe",
-            "hub.verify_token": "wrong-token",
-            "hub.challenge": "123456",
-        },
-    )
-    assert response.status_code == 403
-```
-
-## Test de mensaje entrante
-
-```python title="tests/test_webhook.py"
-@pytest.mark.asyncio
-async def test_receive_text_message(
-    client: AsyncClient,
-    mock_whatsapp: AsyncMock,
-    mock_llm: AsyncMock,
-):
-    """Mensaje de texto → LLM llamado → respuesta enviada."""
-    mock_llm.complete.return_value = LLMResponse(text="Hola! Puedo ayudarte.")
-
-    payload = build_whatsapp_payload(
-        from_phone="5491155556666",
-        message="Hola, ¿qué puedes hacer?",
-    )
-
-    response = await client.post(
-        "/webhook",
-        json=payload,
-        headers={"X-Hub-Signature-256": sign(payload)},
-    )
-
-    assert response.status_code == 200
-    mock_llm.complete.assert_called_once()
-    mock_whatsapp.send_text.assert_called_once_with(
-        to="5491155556666",
-        text="Hola! Puedo ayudarte.",
-    )
-
-
-@pytest.mark.asyncio
-async def test_invalid_signature_rejected(client: AsyncClient):
-    """Request sin firma válida → 403."""
-    response = await client.post(
-        "/webhook",
-        json={"object": "whatsapp_business_account"},
-        headers={"X-Hub-Signature-256": "sha256=invalid"},
-    )
-    assert response.status_code == 403
-```
-
-## El conftest.py
-
-```python title="tests/conftest.py"
+```python
+# tests/conftest.py — el client fixture para integration tests
 @pytest.fixture
-def mock_whatsapp(monkeypatch):
-    mock = AsyncMock(spec=WhatsAppClient)
-    monkeypatch.setattr("app.webhook.handler.wa_client", mock)
-    return mock
+def client(settings: Settings) -> TestClient:
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {
+        "message": {"role": "assistant", "content": "Mock reply"}
+    }
 
-@pytest.fixture
-def mock_llm(monkeypatch):
-    mock = AsyncMock(spec=LLMClient)
-    monkeypatch.setattr("app.webhook.handler.llm_client", mock)
-    return mock
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+    mock_http.get = AsyncMock()
+
+    # Create DB connection for TestClient tests
+    # ... setup de app.state con mocks ...
+
+    yield TestClient(app, raise_server_exceptions=False)
+
+    # Teardown: stop the aiosqlite worker thread
+    conn.stop()
 ```
 
-<Concept term="AsyncMock">
-`unittest.mock.AsyncMock` es un mock que soporta `await`. Lo usás cuando el código bajo test hace `await alguna_funcion()`. Sin él, el mock retornaría un coroutine sin ejecutar.
+<Concept title="TestClient de Starlette">
+`TestClient` envía requests HTTP **reales** a la app FastAPI, pero sin levantar un servidor. Usa `httpx` internamente para serializar/deserializar JSON, headers y body. Los tests son sync aunque la app sea async — `TestClient` maneja el event loop internamente.
 </Concept>
 
+## Settings de Test
+
+```python
+# tests/conftest.py
+TEST_SETTINGS = Settings(
+    whatsapp_access_token="test_token",
+    whatsapp_phone_number_id="123456",
+    whatsapp_verify_token="my_verify_token",
+    whatsapp_app_secret="test_secret",
+    allowed_phone_numbers=["5491112345678"],
+    ollama_base_url="http://localhost:11434",
+    ollama_model="test-model",
+    database_path=":memory:",
+)
+```
+
+<Callout variant="info" title="database_path=':memory:'">
+Se usa una base de datos SQLite **en memoria** para tests. Es efímera — se crea fresca para cada test y se destruye al final. Sin archivos en disco, sin cleanup, sin interferencia entre tests.
+</Callout>
+
+## Tests de Verificación (GET)
+
+La verificación del webhook es el primer handshake con Meta. Cuatro variantes cubren todos los caminos:
+
+```python
+# tests/test_webhook_verification.py
+def test_verify_webhook_success(client):
+    resp = client.get(
+        "/webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": TEST_SETTINGS.whatsapp_verify_token,
+            "hub.challenge": "challenge_code_123",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.text == "challenge_code_123"  # Eco del challenge
+
+
+def test_verify_webhook_wrong_token(client):
+    resp = client.get(
+        "/webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "wrong_token",
+            "hub.challenge": "challenge_code_123",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_verify_webhook_wrong_mode(client):
+    resp = client.get(
+        "/webhook",
+        params={
+            "hub.mode": "unsubscribe",  # Solo "subscribe" es válido
+            "hub.verify_token": TEST_SETTINGS.whatsapp_verify_token,
+            "hub.challenge": "challenge_code_123",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_verify_webhook_missing_params(client):
+    resp = client.get("/webhook")  # Sin parámetros
+    assert resp.status_code == 403
+```
+
+<Concept title="Cobertura de edge cases">
+No alcanza con testear el happy path. Los tests verifican: token correcto, token incorrecto, mode incorrecto, y parámetros faltantes. Cada uno prueba una rama diferente del código. Si alguien refactoriza el handler y rompe la validación, alguno de estos tests falla.
+</Concept>
+
+## Helper: Construir Payloads de Test
+
+En vez de copiar el JSON anidado de WhatsApp en cada test, un helper genera payloads parametrizables:
+
+```python
+# tests/conftest.py
+def make_whatsapp_payload(
+    from_number: str = "5491112345678",
+    message_id: str = "wamid.test123",
+    text: str = "Hello!",
+    msg_type: str = "text",
+    media_id: str | None = None,
+    caption: str | None = None,
+    reply_to: str | None = None,
+) -> dict:
+    msg: dict = {
+        "from": from_number,
+        "id": message_id,
+        "timestamp": "1700000000",
+        "type": msg_type,
+    }
+    if msg_type == "text":
+        msg["text"] = {"body": text}
+    elif msg_type == "audio":
+        msg["audio"] = {"id": media_id}
+    elif msg_type == "image":
+        msg["image"] = {"id": media_id}
+        if caption:
+            msg["image"]["caption"] = caption
+    if reply_to:
+        msg["context"] = {"message_id": reply_to}
+
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "BIZ_ID", "changes": [{
+            "value": {
+                "messaging_product": "whatsapp",
+                "contacts": [{"wa_id": from_number, "profile": {"name": "Test"}}],
+                "messages": [msg],
+            },
+            "field": "messages",
+        }]}],
+    }
+```
+
+<Callout variant="tip" title="Parámetros con defaults">
+Los defaults (`from_number="5491112345678"`, `text="Hello!"`) permiten escribir tests concisos: `make_whatsapp_payload()` genera un payload válido sin argumentos. Solo especificás lo que querés cambiar: `make_whatsapp_payload(from_number="9999999999")`.
+</Callout>
+
+## Helper: Firmar Payloads
+
+```python
+# tests/conftest.py
+def sign_payload(payload_bytes: bytes, secret: str = "test_secret") -> str:
+    sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+    return f"sha256={sig}"
+```
+
+Este helper replica exactamente la lógica que Meta usa para firmar los webhooks. El secret default `"test_secret"` coincide con `TEST_SETTINGS.whatsapp_app_secret`.
+
+## Tests de Mensajes Entrantes (POST)
+
+```python
+# tests/test_webhook_incoming.py
+import json
+
+def test_incoming_webhook_valid(client):
+    payload = make_whatsapp_payload()
+    body = json.dumps(payload).encode()
+    signature = sign_payload(body)
+
+    resp = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_incoming_webhook_invalid_signature(client):
+    payload = make_whatsapp_payload()
+    body = json.dumps(payload).encode()
+
+    resp = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": "sha256=invalid",
+        },
+    )
+    # Always returns 200 (Meta requirement)
+    assert resp.status_code == 200
+```
+
+<Callout variant="warning" title="¿200 con firma inválida?">
+Meta **requiere** que el webhook siempre retorne 200. Si retornás 403, Meta reintenta el delivery y eventualmente desactiva tu webhook. La validación de firma se hace internamente: si la firma es inválida, se loguea el error pero se retorna 200 sin procesar el mensaje.
+</Callout>
+
+## Tests de Whitelist y Status Updates
+
+```python
+def test_incoming_webhook_non_whitelisted_number(client):
+    payload = make_whatsapp_payload(from_number="9999999999")
+    body = json.dumps(payload).encode()
+    signature = sign_payload(body)
+
+    resp = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+    assert resp.status_code == 200  # Retorna 200, pero ignora el msg
+
+
+def test_incoming_webhook_status_update(client):
+    # Status updates (delivered, read) no tienen "messages"
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "BIZ_ID", "changes": [{
+            "value": {
+                "messaging_product": "whatsapp",
+                "statuses": [
+                    {"id": "wamid.xxx", "status": "delivered"}
+                ],
+            },
+            "field": "messages",
+        }]}],
+    }
+    body = json.dumps(payload).encode()
+    signature = sign_payload(body)
+
+    resp = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+    assert resp.status_code == 200  # Ignora status updates
+```
+
+## Tests de Firma (Unit Tests)
+
+Los tests de la función `validate_signature` son **unit tests puros** — no necesitan el client fixture:
+
+```python
+# tests/test_signature.py
+import hashlib
+import hmac
+
+from app.webhook.security import validate_signature
+
+def test_valid_signature():
+    payload = b'{"test": "data"}'
+    secret = "my_secret"
+    sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    assert validate_signature(payload, f"sha256={sig}", secret) is True
+
+def test_invalid_signature():
+    assert validate_signature(b'{"test": "data"}', "sha256=bad", "my_secret") is False
+
+def test_missing_prefix():
+    assert validate_signature(b'{"test": "data"}', "invalid_header", "my_secret") is False
+
+def test_empty_signature():
+    assert validate_signature(b'{"test": "data"}', "", "my_secret") is False
+```
+
+<Concept title="Separación integration vs unit">
+Los tests de `validate_signature` son **unit tests**: prueban una función pura sin dependencias externas. Los tests de `/webhook` son **integration tests**: prueban el pipeline completo (request → router → handler → response). Ambos tipos se complementan: unit tests son rápidos y precisos, integration tests verifican que todo encaja.
+</Concept>
+
+## Cómo Correr los Tests
+
+```bash
+# Todos los tests
+make test
+
+# Solo tests de webhook
+.venv/bin/python -m pytest tests/test_webhook_verification.py tests/test_webhook_incoming.py tests/test_signature.py -v
+
+# Un test específico
+.venv/bin/python -m pytest tests/test_signature.py::test_valid_signature -v
+```
+
 <Quiz
-  question="¿Qué ventaja tiene usar mocks (AsyncMock) para el LLM y WhatsApp en los tests?"
-  options={["Los tests son más rápidos porque no hay I/O real, y son deterministas", "Los mocks validan que la API de Meta está disponible", "Permiten testear con mensajes reales de WhatsApp", "Eliminan la necesidad de un conftest.py"]}
-  correct={0}
+  question="¿Por qué el webhook de WhatsApp retorna 200 incluso cuando la firma HMAC es inválida?"
+  options={[
+    "Porque es un bug",
+    "Porque Meta requiere siempre 200 — si retornás error, reintenta y eventualmente desactiva el webhook",
+    "Para evitar rate limiting",
+    "Porque la firma se valida después"
+  ]}
+  correct={1}
 />
 
-## Felicitaciones
+<Quiz
+  question="¿Qué ventaja tiene usar TestClient sobre levantar un servidor real para los tests?"
+  options={[
+    "Los tests son más lentos pero más precisos",
+    "TestClient envía requests HTTP reales a la app sin servidor, los tests son sync, rápidos y deterministas",
+    "Permite testear con mensajes reales de WhatsApp",
+    "No necesita fixtures ni mocks"
+  ]}
+  correct={1}
+/>
 
-Completaste el **Módulo 1: Webhook Pipeline**. Ahora entendés:
+<Quiz
+  question="¿Por qué se usa database_path=':memory:' en TEST_SETTINGS?"
+  options={[
+    "Para que los datos de test persistan entre corridas",
+    "Para crear una DB SQLite efímera en RAM — sin archivos, sin cleanup, sin interferencia entre tests",
+    "Porque SQLite no soporta archivos en tests",
+    "Para acelerar las queries SQL"
+  ]}
+  correct={1}
+/>
 
-- El patrón push de webhooks vs polling
-- Verificación de firma HMAC para seguridad
-- Cómo parsear el payload anidado de Meta con Pydantic
-- Cómo enviar respuestas via la Graph API
-- Testing completo del pipeline con mocks
-
-En el **Módulo 2** integramos el LLM para generar respuestas inteligentes.
+Has completado el **Módulo 1: Webhook Pipeline**. Ahora entendés el flujo completo: verificación GET, firma HMAC, parsing de payloads anidados, envío de respuestas via la Graph API, y testing exhaustivo del pipeline. En el **Módulo 2** integramos el LLM para generar respuestas inteligentes.

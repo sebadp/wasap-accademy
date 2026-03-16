@@ -12,52 +12,78 @@ AgentCraft es una plataforma gamificada para aprender **Inteligencia Artificial 
 No aprendas de ejemplos de juguete. Aprende entendiendo, modificando y extendiendo código de producción real.
 </Callout>
 
-El proyecto que vas a estudiar se llama **WasAP**: un asistente de WhatsApp con IA que tiene 85 archivos Python, 15 skills, 316 tests, y sistemas completos de memoria, RAG, tool-calling, agentes y trazabilidad.
+El proyecto que vas a estudiar se llama **LocalForge**: un asistente de WhatsApp y Telegram con IA que tiene 85 archivos Python, 15+ skills, 316 tests, y sistemas completos de memoria, RAG, tool-calling, agentes y trazabilidad.
+
+<Concept title="LocalForge">
+LocalForge es un asistente personal que corre en tu propia máquina. Usa **Ollama** como motor de LLM (modelo qwen3.5:9b para chat y llava:7b para visión), **SQLite** como base de datos, **FastAPI** como framework web y **faster-whisper** para transcripción de audio. Todo es local y open-source: no dependés de APIs pagadas.
+</Concept>
+
+## El stack tecnológico
+
+LocalForge no es un chatbot sencillo. Es un sistema de producción con múltiples subsistemas integrados. Este es el stack completo:
+
+| Componente | Tecnología | Para qué |
+|------------|-----------|----------|
+| Framework web | FastAPI (async) | Recibir webhooks, servir la API |
+| LLM (chat) | Ollama + qwen3.5:9b | Generar respuestas inteligentes |
+| LLM (visión) | Ollama + llava:7b | Analizar imágenes enviadas por el usuario |
+| Audio | faster-whisper | Transcribir mensajes de voz |
+| Base de datos | SQLite + aiosqlite | Conversaciones, memorias, notas |
+| Búsqueda semántica | sqlite-vec + nomic-embed-text | RAG sobre memorias y notas |
+| Embeddings | nomic-embed-text (768 dims) | Vectorizar texto para búsqueda |
+| Mensajería | WhatsApp Cloud API + Telegram Bot API | Comunicarse con los usuarios |
+| Observabilidad | Langfuse v3 | Tracing y evaluación de calidad |
+
+<Callout variant="info" title="Todo local, todo tuyo">
+A diferencia de otros asistentes que dependen de OpenAI o Anthropic, LocalForge corre 100% en tu máquina. Ollama ejecuta los modelos localmente, SQLite almacena todo en un archivo, y faster-whisper transcribe audio sin mandar nada a la nube.
+</Callout>
 
 ## Qué vas a aprender
 
-A lo largo de **23 módulos en 7 tiers** vas a pasar de cero a dominar los sistemas que hacen funcionar a WasAP:
+A lo largo de **23 módulos en 7 tiers** vas a pasar de cero a dominar los sistemas que hacen funcionar a LocalForge:
 
 <Step number={1} title="Foundation (Módulos 0-2)">
-Entorno de desarrollo, webhooks de WhatsApp e integración básica con LLMs.
+Entorno de desarrollo, webhooks de WhatsApp e integración básica con LLMs via Ollama.
 </Step>
 
 <Step number={2} title="Core (Módulos 3-6)">
-Base de datos, memoria persistente, sistema de skills y tool calling.
+Base de datos con SQLite + aiosqlite, memoria persistente, sistema de skills y tool calling con Ollama.
 </Step>
 
 <Step number={3} title="Intermediate (Módulos 7-10)">
-Tool calling loop, intent classification, búsqueda semántica (RAG) y context engineering.
+Tool calling loop, intent classification con LLM router, búsqueda semántica (RAG) con sqlite-vec y context engineering.
 </Step>
 
 <Step number={4} title="Advanced (Módulos 11-14)">
-Audio/imágenes, guardrails de calidad, trazabilidad con Langfuse y evaluación con datasets vivos.
+Audio (faster-whisper) e imágenes (llava:7b), guardrails de calidad, trazabilidad con Langfuse v3 y evaluación con datasets vivos.
 </Step>
 
 <Step number={5} title="Expert — Agent Mode (Módulos 15-17)">
-Sesiones agénticas, planner-orchestrator y seguridad con human-in-the-loop.
+Sesiones agénticas multi-step, planner-orchestrator, human-in-the-loop y política de seguridad con audit trail.
 </Step>
 
 <Step number={6} title="Specialist (Módulos 18-20)">
-Multi-plataforma (Telegram), MCP, knowledge graphs y automatización operacional.
+Multi-plataforma (Telegram), MCP (Model Context Protocol), knowledge graphs con ontología y automatización operacional.
 </Step>
 
 <Step number={7} title="Production (Módulos 21-22)">
-Optimización de performance, Docker, CI/CD y monitoreo en producción.
+Optimización de performance con asyncio.gather paralelo, Docker multi-service, CI/CD con GitHub Actions y monitoreo en producción.
 </Step>
 
 ## Cómo funciona AgentCraft
 
-Cada lección tiene:
+Cada lección tiene componentes diseñados para maximizar tu aprendizaje:
 
-- **Contenido** — explicación del concepto con código real de WasAP
+- **Contenido** — explicación del concepto con código real de LocalForge
+- **Concepts** — definiciones inline de términos técnicos clave
+- **Callouts** — tips, warnings y errores comunes a evitar
 - **Quiz** — valida que entendiste antes de continuar
-- **Challenge** — ejercicio de Python que ejecutas en el navegador (Pyodide)
+- **Challenge** — ejercicio de Python que ejecutás en el navegador (Pyodide)
 - **XP** — puntos por cada lección y challenge que completás
 
 <Quiz
   question="¿Cuál es el proyecto de producción que vas a estudiar en AgentCraft?"
-  options={["Un chatbot de Telegram", "WasAP, un asistente de WhatsApp con IA", "Un pipeline de procesamiento de datos", "Una API REST de e-commerce"]}
+  options={["Un chatbot genérico con GPT-4", "LocalForge, un asistente de WhatsApp/Telegram con IA local", "Un pipeline de procesamiento de datos con Apache Spark", "Una API REST de e-commerce"]}
   correct={1}
 />
 
@@ -74,4 +100,41 @@ Empezás en el nivel **Novice** con 0 XP. Cada lección completada suma XP. Los 
 | Quiz correcto | 25 |
 | Streak de 7 días | 150 |
 
-Estás listo. En la próxima lección exploramos la estructura completa del proyecto WasAP.
+## Lo que hace a LocalForge único
+
+No es otro tutorial que te enseña a llamar a la API de OpenAI. LocalForge tiene sistemas de producción reales:
+
+<Concept title="Tool Calling con Router de 2 etapas">
+El LLM (qwen3.5:9b) solo puede manejar ~5-6 tools de forma confiable. Pero LocalForge tiene 60+ tools. La solución es un **router de 2 etapas**: primero un LLM rápido clasifica la intención del usuario, y luego se seleccionan solo las tools relevantes (máximo 8) para esa categoría.
+</Concept>
+
+<Concept title="Memoria avanzada con consolidación">
+LocalForge no solo guarda lo que le decís. Tiene daily logs, session snapshots, flush de conversaciones a memoria permanente, deduplicación con SequenceMatcher, y consolidación periódica via LLM para eliminar memorias duplicadas o contradictorias.
+</Concept>
+
+<Quiz
+  question="¿Qué motor de LLM usa LocalForge para ejecutar modelos de forma local?"
+  options={["OpenAI API", "Hugging Face Transformers", "Ollama", "vLLM"]}
+  correct={2}
+/>
+
+## Prerequisitos
+
+Para aprovechar al máximo AgentCraft, necesitás:
+
+- **Python 3.11+** — el proyecto usa type hints modernos (`list[str]`, `X | None`)
+- **Conocimiento básico de async/await** — FastAPI es 100% async
+- **Docker Desktop o Docker Engine** — para levantar Ollama y servicios
+- **8GB+ de RAM** — los modelos de Ollama necesitan memoria
+
+<Callout variant="warning" title="No necesitás ser experto">
+Si sabés hacer un `for` loop en Python y entendés qué es una API REST, estás listo. Todo lo demás lo aprendés en el camino.
+</Callout>
+
+<Quiz
+  question="¿Cuál de estas NO es una característica de LocalForge?"
+  options={["Búsqueda semántica con embeddings", "Dependencia obligatoria de la API de OpenAI", "Transcripción de audio con faster-whisper", "Soporte multi-plataforma (WhatsApp + Telegram)"]}
+  correct={1}
+/>
+
+Estás listo. En la próxima lección exploramos la estructura completa del proyecto LocalForge.

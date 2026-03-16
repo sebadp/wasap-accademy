@@ -154,4 +154,15 @@ Exigir al menos 2 keywords reduce falsos positivos. Un texto que menciona "api" 
   correct={1}
 />
 
+<Quiz
+  question="¿Por qué detect_topics exige al menos 2 keywords del mismo topic para clasificar un texto?"
+  options={[
+    "Porque SQLite no soporta arrays de un solo elemento",
+    "Para reducir falsos positivos: una sola keyword no es suficiente evidencia",
+    "Porque el LLM necesita al menos 2 topics para funcionar",
+    "Para que la detección sea más lenta y precisa"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo traversar el grafo para enriquecer el contexto del LLM.

@@ -184,4 +184,15 @@ Esto asegura que la app no arranca hasta que Ollama esté healthy (modelo cargad
   correct={1}
 />
 
+<Quiz
+  question="¿Qué status code retorna /ready cuando algún check de dependencias falla?"
+  options={[
+    "200 OK con un campo 'warnings' en el JSON",
+    "404 Not Found",
+    "503 Service Unavailable, para que el load balancer deje de enviarle tráfico",
+    "500 Internal Server Error"
+  ]}
+  correct={2}
+/>
+
 En la siguiente lección veremos cómo configurar el pipeline de CI/CD con GitHub Actions.

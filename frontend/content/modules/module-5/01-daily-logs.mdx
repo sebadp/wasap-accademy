@@ -7,12 +7,14 @@ xpReward: 75
 ## Memoria Episódica vs Semántica
 
 <Concept title="Dos tipos de memoria">
-**Semántica**: hechos permanentes ("Es desarrollador Python"). **Episódica**: eventos temporales ("Hoy discutimos la migración de la API"). Los daily logs son memoria episódica.
+**Semántica**: hechos permanentes sobre el usuario ("Es desarrollador Python"). **Episódica**: eventos temporales ligados a un momento ("Hoy discutimos la migración de la API"). Los daily logs implementan memoria episódica.
 </Concept>
+
+La diferencia es clave para el diseño: las memorias semánticas se almacenan en SQLite con búsqueda vectorial. Los daily logs se almacenan como archivos Markdown planos, uno por día, append-only.
 
 ## Daily Logs: Archivos Markdown Append-Only
 
-WasAP mantiene un archivo por día en `data/memory/`:
+LocalForge mantiene un archivo por día en `data/memory/`:
 
 <FileTree>
   data/memory/
@@ -23,73 +25,155 @@ WasAP mantiene un archivo por día en `data/memory/`:
       └── 2026-03-15-migracion-api.md
 </FileTree>
 
+## La Clase DailyLog
+
+El código real en `app/memory/daily_log.py` implementa tres operaciones: append, load, y save snapshot:
+
 ```python
+# app/memory/daily_log.py
 class DailyLog:
-    def __init__(self, memory_dir: str):
-        self.memory_dir = Path(memory_dir)
+    def __init__(self, memory_dir: str = "data/memory"):
+        self._dir = Path(memory_dir)
 
-    async def append_event(self, phone_number: str, event: str):
-        today = date.today().isoformat()
-        path = self.memory_dir / f"{today}.md"
+    async def append(self, entry: str) -> None:
+        """Append an entry to today's daily log with timestamp."""
+        now = datetime.now(UTC)
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M")
+        file_path = self._dir / f"{date_str}.md"
+        parent_dir = self._dir
 
-        line = f"- [{phone_number}] {event}\n"
-        # asyncio.to_thread para I/O bloqueante de filesystem
-        await asyncio.to_thread(self._append_to_file, path, line)
+        def _do_append() -> None:
+            parent_dir.mkdir(parents=True, exist_ok=True)
+            if not file_path.exists():
+                file_path.write_text(f"# {date_str}\n\n", encoding="utf-8")
+            with file_path.open("a", encoding="utf-8") as f:
+                f.write(f"- {time_str} — {entry}\n")
 
-    def _append_to_file(self, path: Path, content: str):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
-            f.write(content)
+        await asyncio.to_thread(_do_append)
 ```
 
-<Callout variant="warning" title="asyncio.to_thread">
-Escribir archivos es I/O bloqueante. `asyncio.to_thread()` ejecuta la escritura en un thread del pool, sin bloquear el event loop de FastAPI.
+<Callout variant="warning" title="asyncio.to_thread para I/O bloqueante">
+Escribir archivos es I/O bloqueante. `asyncio.to_thread()` ejecuta la escritura en un thread del pool, sin bloquear el event loop de FastAPI. Este es un patron fundamental en LocalForge: todo I/O de filesystem usa `to_thread`.
 </Callout>
 
-## Inyección en el Contexto
+Cada entrada tiene formato `- HH:MM — texto`, creando un log legible:
 
-Los daily logs de hoy y ayer se inyectan en cada llamada al LLM:
+```markdown
+# 2026-03-16
 
-```python
-async def load_recent(self, days: int = 2) -> str:
-    logs = []
-    for i in range(days):
-        day = date.today() - timedelta(days=i)
-        path = self.memory_dir / f"{day.isoformat()}.md"
-        if path.exists():
-            content = await asyncio.to_thread(path.read_text)
-            logs.append(f"## {day.isoformat()}\n{content}")
-    return "\n".join(logs)
+- 09:15 — El usuario preguntó sobre la migración de la API v2
+- 09:32 — Se discutió el plan de deployment con Docker
+- 14:07 — El usuario pidió un recordatorio para la reunión de las 16:00
 ```
 
-Esto le da al LLM **contexto temporal**: qué pasó ayer, qué está pasando hoy.
+## Inyección en el Contexto del LLM
+
+Los daily logs de hoy y ayer se cargan e inyectan en cada llamada al LLM:
+
+```python
+async def load_recent(self, days: int = 2) -> str | None:
+    """Load daily logs for the last N days. Returns None if no logs exist."""
+    log_dir = self._dir
+
+    def _do_load() -> str | None:
+        if not log_dir.exists():
+            return None
+        now = datetime.now(UTC)
+        parts: list[str] = []
+        for i in range(days):
+            date = now - timedelta(days=i)
+            date_str = date.strftime("%Y-%m-%d")
+            file_path = log_dir / f"{date_str}.md"
+            if file_path.exists():
+                content = file_path.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(content)
+        return "\n\n".join(parts) if parts else None
+
+    return await asyncio.to_thread(_do_load)
+```
+
+Esto le da al LLM **contexto temporal**: qué pasó ayer y qué está pasando hoy. En el contexto del LLM aparece así:
+
+```xml
+<daily_logs>
+# 2026-03-16
+- 09:15 — El usuario preguntó sobre la migración de la API v2
+
+# 2026-03-15
+- 14:30 — Se completó el deploy a staging
+- 16:00 — Reunión de retrospectiva discutida
+</daily_logs>
+```
+
+<Concept title="Ventana temporal configurable">
+La cantidad de días se configura con `daily_log_days` en Settings (default: 2). Más días = más contexto temporal pero más tokens consumidos. El `ContextBuilder` usa XML tags `<daily_logs>` para separar esta sección.
+</Concept>
 
 ## Append-Only: Por Qué
 
 <Callout variant="tip" title="Inmutabilidad">
-Los daily logs nunca se editan ni borran. Solo se agregan líneas. Esto garantiza un registro fiel de lo que ocurrió — fundamental para auditoría y debugging.
+Los daily logs nunca se editan ni borran. Solo se agregan lineas. Esto garantiza un registro fiel de lo que ocurrió, fundamental para auditoria y debugging. Si algo salió mal, siempre podés revisar el log del día.
 </Callout>
+
+Este diseño tiene ventajas concretas:
+1. **Sin concurrencia**: no hay conflictos de escritura, solo appends
+2. **Debugging**: podés ver exactamente qué pasó y cuándo
+3. **Recovery**: si se pierde la base de datos, los logs siguen en disco
+4. **Simplicidad**: archivos de texto plano, sin schema, sin migración
 
 ## Session Snapshots
 
-Cuando el usuario ejecuta `/clear`, los últimos 15 mensajes se guardan como snapshot:
+Cuando el usuario ejecuta `/clear`, los últimos 15 mensajes se guardan como snapshot antes de borrar la conversación:
 
 ```python
-async def save_snapshot(self, phone: str, messages: list, slug: str):
-    path = self.memory_dir / "snapshots" / f"{date.today()}-{slug}.md"
-    content = format_messages_as_markdown(messages)
-    await asyncio.to_thread(self._write_file, path, content)
+async def save_snapshot(self, slug: str, content: str) -> Path:
+    """Save a session snapshot to data/memory/snapshots/."""
+    now = datetime.now(UTC)
+    date_str = now.strftime("%Y-%m-%d")
+    snapshots_dir = self._dir / "snapshots"
+    file_path = snapshots_dir / f"{date_str}-{slug}.md"
+
+    def _do_save() -> None:
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+    await asyncio.to_thread(_do_save)
+    logger.info("Saved session snapshot: %s", file_path.name)
+    return file_path
 ```
 
-El `slug` se genera por LLM (ej: "migracion-api") con fallback a timestamp.
+El `slug` se genera por LLM (`think=False`) para crear un nombre descriptivo como "migracion-api" o "debug-webhook". Si el LLM falla, se usa un fallback con timestamp.
+
+<Callout variant="info" title="¿Por qué guardar snapshots?">
+Los snapshots preservan el contexto completo de una sesión. Si el usuario borró una conversación pero después necesita recordar qué se discutió, los snapshots están disponibles como referencia sin afectar la conversación activa.
+</Callout>
+
+## Integración con el Flush
+
+Los daily logs no solo registran eventos manuales. El sistema de **flush pre-compactación** (lección 04) también escribe eventos aquí. Cuando el summarizer extrae hechos de mensajes viejos, los "events" se guardan en el daily log:
+
+```python
+# En app/conversation/summarizer.py — flush_to_memory()
+# Después de extraer facts → memorias semánticas
+# Los events van al daily log:
+for event in events:
+    if not isinstance(event, str) or not event.strip():
+        continue
+    await daily_log.append(event.strip())
+    logger.info("Auto-logged event: %s", event[:80])
+```
+
+Esto crea un registro automático de lo que ocurrió en la conversación, sin que el usuario tenga que hacer nada.
 
 <Quiz
-  question="¿Cuál es la diferencia entre memoria semántica y episódica?"
+  question="¿Cuál es la diferencia entre memoria semántica y episódica en LocalForge?"
   options={[
-    "Semántica usa SQLite, episódica usa archivos",
-    "Semántica son hechos permanentes, episódica son eventos temporales día a día",
+    "Semántica usa SQLite, episódica usa archivos. Ambas son permanentes",
+    "Semántica son hechos permanentes del usuario, episódica son eventos temporales día a día",
     "Semántica es para el LLM, episódica es para el usuario",
-    "No hay diferencia, son lo mismo"
+    "No hay diferencia, son lo mismo con distinto nombre"
   ]}
   correct={1}
 />
@@ -97,10 +181,21 @@ El `slug` se genera por LLM (ej: "migracion-api") con fallback a timestamp.
 <Quiz
   question="¿Por qué se usa asyncio.to_thread() para escribir daily logs?"
   options={[
-    "Para encriptar el contenido",
-    "Porque escribir archivos es I/O bloqueante y bloquearía el event loop",
-    "Para comprimir los archivos",
-    "Para enviar los logs a un servidor remoto"
+    "Para encriptar el contenido antes de escribirlo",
+    "Porque escribir archivos es I/O bloqueante y bloquearía el event loop de FastAPI",
+    "Para comprimir los archivos automáticamente",
+    "Para enviar los logs a un servidor remoto en paralelo"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando el usuario ejecuta /clear en LocalForge?"
+  options={[
+    "Se borran todos los mensajes sin guardar nada",
+    "Se guardan los últimos 15 mensajes como snapshot y luego se borra la conversación",
+    "Se exportan los mensajes por email y se borran",
+    "Se comprimen los mensajes en un ZIP"
   ]}
   correct={1}
 />

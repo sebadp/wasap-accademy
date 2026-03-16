@@ -1,84 +1,206 @@
 ---
-title: "Prompt Engineering para producción"
-description: "Técnicas reales usadas en WasAP: few-shot, chain-of-thought, system prompts"
+title: "Prompt Engineering para produccion"
+description: "Tecnicas reales usadas en LocalForge: system prompts, XML tags, context builder, few-shot"
 xpReward: 75
 ---
 
-## El system prompt de WasAP
+## El System Prompt de LocalForge
 
-El system prompt define el comportamiento base del asistente. En WasAP es dinámico: se construye en runtime con contexto del usuario.
-
-```python title="app/llm/prompts.py"
-SYSTEM_TEMPLATE = """Eres WasAP, un asistente de WhatsApp útil y conciso.
-
-REGLAS:
-- Responde en el idioma del usuario
-- Sé breve: WhatsApp no es un blog
-- Si no sabes algo, dilo directamente
-- Nunca inventes información
-
-CONTEXTO DEL USUARIO:
-- Nombre: {user_name}
-- Zona horaria: {timezone}
-- Fecha y hora actual: {current_datetime}
-
-HISTORIAL RECIENTE:
-{conversation_summary}
-"""
-
-
-def build_system_prompt(user: User) -> str:
-    return SYSTEM_TEMPLATE.format(
-        user_name=user.name or "Usuario",
-        timezone=user.timezone or "America/Buenos_Aires",
-        current_datetime=datetime.now(user.tz).strftime("%A %d/%m/%Y %H:%M"),
-        conversation_summary=user.conversation_summary or "Primera conversación",
-    )
-```
-
-## Few-shot prompting
-
-Para tareas específicas, WasAP incluye ejemplos en el prompt:
-
-```python title="app/skills/extraction.py"
-EXTRACTION_PROMPT = """Extrae la tarea del mensaje del usuario.
-
-Ejemplos:
-Usuario: "Recuérdame comprar leche mañana a las 9"
-Tarea: {"action": "reminder", "text": "comprar leche", "datetime": "mañana 09:00"}
-
-Usuario: "Agendá reunión con Juan el viernes a las 14"
-Tarea: {"action": "event", "text": "reunión con Juan", "datetime": "viernes 14:00"}
-
-Usuario: "{user_message}"
-Tarea:"""
-```
-
-<Concept term="Few-shot prompting">
-Incluís ejemplos input/output en el prompt para guiar al modelo hacia el formato deseado. Más efectivo que describir el formato con palabras. 2-5 ejemplos suelen ser suficientes.
-</Concept>
-
-## Structured output con XML tags
-
-Claude responde mejor cuando usás XML tags para delimitar la respuesta estructurada:
+El system prompt define el comportamiento base del asistente. En LocalForge es **configurable via env var** y se extiende dinamicamente en runtime con contexto del usuario:
 
 ```python
-prompt = """Analiza el sentimiento del mensaje y responde con:
-<sentiment>positivo|negativo|neutro</sentiment>
-<confidence>0.0-1.0</confidence>
-<reason>explicación breve</reason>
-
-Mensaje: "¡Genial, muchas gracias!"
-"""
-
-# Parsear la respuesta
-import re
-sentiment = re.search(r"<sentiment>(.*?)</sentiment>", response).group(1)
-confidence = float(re.search(r"<confidence>(.*?)</confidence>", response).group(1))
+# app/config.py
+system_prompt: str = (
+    "You are a helpful personal assistant on WhatsApp. "
+    "Be friendly. Answer in the same language the user writes in. "
+    "Adapt your response length to the user's request — "
+    "be brief for simple questions, detailed when asked for "
+    "long or thorough answers. "
+    "GROUNDING RULE: Never fabricate specific facts without "
+    "reading actual data via tools first."
+)
 ```
 
+<Callout variant="warning" title="Grounding Rules">
+El system prompt incluye una regla de grounding explicita: "Never fabricate specific facts without reading actual data via tools first". Esto es critico para un asistente con tools. Sin esta regla, el LLM inventa datos en lugar de usar las herramientas disponibles.
+</Callout>
+
+## ContextBuilder: Prompts Estructurados con XML
+
+LocalForge no concatena strings para armar el prompt. Usa un `ContextBuilder` que organiza las secciones del contexto en **XML tags** para que qwen3.5 pueda navegar eficientemente:
+
+```python
+# app/context/context_builder.py
+class ContextBuilder:
+    def __init__(self, system_prompt: str) -> None:
+        self._base_prompt = system_prompt
+        self._sections: list[tuple[str, str]] = []
+
+    def add_section(self, tag: str, content: str | None) -> ContextBuilder:
+        """Agrega una seccion. Se salta si content es vacio o None."""
+        if content:
+            self._sections.append((tag, content))
+        return self
+
+    def build_system_message(self) -> str:
+        if not self._sections:
+            return self._base_prompt
+        parts = [self._base_prompt]
+        for tag, content in self._sections:
+            parts.append(f"\n<{tag}>\n{content}\n</{tag}>")
+        return "\n".join(parts)
+```
+
+El resultado es un system prompt asi:
+
+```xml
+You are a helpful personal assistant on WhatsApp...
+
+<user_memories>
+- El usuario se llama Sebastian
+- Prefiere respuestas en espanol
+- Trabaja en desarrollo web con Python
+</user_memories>
+
+<recent_activity>
+2024-03-15: Discutimos sobre deployment con Docker
+2024-03-14: Creo 3 notas sobre arquitectura
+</recent_activity>
+
+<relevant_notes>
+Nota: "Deploy checklist" - Pasos para deploy a produccion...
+</relevant_notes>
+```
+
+<Concept title="XML tags para contexto">
+Los LLMs modernos como qwen3.5 entienden XML tags como delimitadores semanticos. Cada seccion del contexto (memorias, notas, historial) queda claramente separada, lo que reduce "confusion" del modelo y mejora la precision de las respuestas.
+</Concept>
+
+## Few-Shot Prompting
+
+Para tareas especificas como clasificacion de intent, LocalForge incluye ejemplos en el prompt:
+
+```python
+# app/skills/router.py (simplificado)
+CLASSIFY_PROMPT = """Classify the user message into categories.
+Return ONLY a JSON array of category names.
+
+Examples:
+User: "Que hora es?"
+["time"]
+
+User: "Cuanto es 15% de 230?"
+["math"]
+
+User: "Busca noticias sobre IA"
+["search", "news"]
+
+User: "Hola, como estas?"
+["none"]
+
+User: "{user_message}"
+"""
+```
+
+<Concept title="Few-shot prompting">
+Incluir ejemplos input/output en el prompt guia al modelo hacia el formato deseado. Es mas efectivo que describir el formato con palabras. 2-5 ejemplos suelen ser suficientes. En LocalForge, se usa para el intent classifier que categoriza mensajes.
+</Concept>
+
+<Callout variant="tip" title="think=False para clasificaciones">
+Todos los prompts de clasificacion y extraccion en LocalForge usan `think=False`. Esto desactiva el chain-of-thought de qwen3, haciendo la respuesta mas rapida y determinista. El modelo retorna directamente el JSON sin "razonar" primero.
+</Callout>
+
+## Structured Output: Forzar Formato
+
+Cuando necesitas que el LLM retorne datos estructurados, hay dos tecnicas:
+
+### 1. JSON directo con instrucciones explicitas
+
+```python
+# Usado en classify_intent
+prompt = (
+    "Respond with ONLY a JSON array. "
+    "No explanation, no markdown, no extra text. "
+    "Example: [\"time\", \"math\"]"
+)
+response = await ollama_client.chat(messages, think=False)
+# Parsear con json.loads() + fallback
+```
+
+### 2. Regex para extraer datos de texto libre
+
+```python
+# Usado en el stripping de reasoning blocks
+import re
+
+_RE_THINK = re.compile(r"<think>.*?</think>\n*", re.DOTALL)
+content = _RE_THINK.sub("", raw_response)
+```
+
+<Callout variant="info" title="Siempre ten un fallback">
+Los LLMs a veces no siguen instrucciones de formato perfectamente. LocalForge siempre implementa un fallback: si el JSON parsing falla, usa categorias por defecto. Nunca asumas que el output sera perfecto.
+</Callout>
+
+## El Tool Router: Prompt Engineering a Escala
+
+El problema mas interesante de prompt engineering en LocalForge es el **Tool Router**. qwen3.5:9b solo puede manejar 5-6 tools a la vez, pero LocalForge tiene 60+ tools. La solucion: un router de dos etapas basado en prompts.
+
+<Step number={1} title="Clasificar el intent">
+Un LLM call rapido (sin tools, `think=False`) clasifica el mensaje en categorias:
+
+```python
+categories = await classify_intent(ollama_client, user_message)
+# Resultado: ["time", "math"] o ["none"] para chat simple
+```
+</Step>
+
+<Step number={2} title="Seleccionar tools">
+Las categorias se mapean a tools especificas via un diccionario:
+
+```python
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "time":    ["get_current_datetime", "schedule_task", ...],
+    "math":    ["calculate"],
+    "weather": ["get_weather"],
+    "notes":   ["save_note", "list_notes", "search_notes", ...],
+    "search":  ["web_search"],
+}
+```
+</Step>
+
+<Step number={3} title="Ejecutar con tools filtradas">
+Solo las tools relevantes (max 8 por defecto) se envian al LLM principal:
+
+```python
+selected = select_tools(categories, max_tools=settings.max_tools_per_call)
+# De 60+ tools, solo pasan ~5-8 al LLM
+```
+</Step>
+
+## Errores Comunes de Prompt Engineering
+
+| Error | Consecuencia | Solucion |
+|-------|-------------|----------|
+| "Be concise" en system prompt | Rechaza pedidos largos | "Adapt response length to request" |
+| Incluir datetime en system prompt | LLM no usa tool `get_current_datetime` | Solo incluir fecha, no hora |
+| No incluir grounding rule | LLM inventa datos | "Never fabricate without reading via tools" |
+| Demasiadas tools | LLM ignora todas las tools | Router de 2 etapas con max 8 tools |
+| JSON sin fallback | App crashea si LLM no formatea bien | Siempre `try/except` + default |
+
 <Quiz
-  question="¿Cuál es la ventaja principal del few-shot prompting sobre describir el formato con instrucciones?"
-  options={["Usa menos tokens en el prompt", "Los ejemplos concretos guían al modelo más efectivamente que las instrucciones abstractas", "El modelo puede ignorar las instrucciones pero no los ejemplos", "Permite usar modelos más pequeños"]}
+  question="Cual es la ventaja principal del few-shot prompting sobre describir el formato con instrucciones?"
+  options={["Usa menos tokens en el prompt", "Los ejemplos concretos guian al modelo mas efectivamente que las instrucciones abstractas", "El modelo puede ignorar las instrucciones pero no los ejemplos", "Permite usar modelos mas pequenos"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que LocalForge usa XML tags en el system prompt en lugar de concatenar texto plano?"
+  options={["Porque XML es mas rapido de parsear para el LLM", "Porque los LLMs entienden XML tags como delimitadores semanticos, separando claramente cada seccion del contexto", "Porque FastAPI requiere XML en los prompts", "Porque permite validar el prompt con un XML parser"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que el Tool Router clasifica el intent ANTES de enviar tools al LLM?"
+  options={["Para reducir costos de API", "Porque qwen3.5:9b solo maneja 5-6 tools a la vez; enviar 60+ causa que ignore todas", "Para hacer la respuesta mas rapida", "Porque Ollama no soporta mas de 8 tools"]}
   correct={1}
 />

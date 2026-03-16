@@ -1,117 +1,208 @@
 ---
 title: "Anatomía de un Skill"
-description: "SKILL.md, ToolDefinition, y la estructura de una herramienta en WasAP"
+description: "SKILL.md, ToolDefinition, y la estructura de una herramienta en LocalForge"
 xpReward: 50
 ---
 
 ## Qué es un Skill
 
-Un **skill** en WasAP es un paquete que le da al LLM la capacidad de **hacer cosas** en el mundo real: consultar el clima, hacer cálculos, buscar en la web, guardar notas. Sin skills, el LLM solo puede generar texto.
+Un **skill** en LocalForge es un paquete que le da al LLM la capacidad de **hacer cosas** en el mundo real: consultar el clima, hacer cálculos, buscar en la web, guardar notas. Sin skills, el LLM solo puede generar texto.
 
 <Callout variant="info" title="Tool calling">
-Los skills implementan el patrón de **tool calling**: el LLM decide qué herramienta usar, con qué argumentos, y WasAP la ejecuta y le devuelve el resultado.
+Los skills implementan el patrón de **tool calling**: el LLM decide qué herramienta usar y con qué argumentos, LocalForge la ejecuta, y le devuelve el resultado al LLM para que formule la respuesta final.
 </Callout>
 
 ## Estructura de un Skill
 
-Cada skill tiene dos partes: una **definición** (SKILL.md) y un **handler** (Python):
+Cada skill tiene dos partes: una **definición** (SKILL.md) y un **handler** (Python). Viven en directorios separados:
 
 <FileTree>
-  skills/
+  skills/                        # Definiciones (SKILL.md)
   ├── calculator/
-  │   └── SKILL.md          # Definición: nombre, tools, schemas
+  │   └── SKILL.md
   ├── datetime/
   │   └── SKILL.md
   ├── weather/
   │   └── SKILL.md
-  └── notes/
+  ├── notes/
+  │   └── SKILL.md
+  ├── projects/
+  │   └── SKILL.md
+  └── search/
       └── SKILL.md
-  app/skills/tools/
-  ├── calculator_tools.py   # Handler: lógica Python
+  app/skills/tools/              # Handlers (Python)
+  ├── calculator_tools.py
   ├── datetime_tools.py
   ├── weather_tools.py
-  └── notes_tools.py
+  ├── notes_tools.py
+  ├── project_tools.py
+  └── search_tools.py
 </FileTree>
 
+<Concept title="Separación definición / implementación">
+El SKILL.md define el **contrato**: qué tools ofrece, qué parámetros acepta, y cómo el LLM debe usarlas. El handler Python implementa la **lógica**. Esta separación permite que alguien edite las instrucciones del skill sin tocar código.
+</Concept>
+
 ## SKILL.md: La Definición
+
+Un SKILL.md real de LocalForge tiene frontmatter con metadata y un body con instrucciones para el LLM:
 
 ```markdown
 ---
 name: calculator
-description: Herramientas matemáticas y de cálculo
-version: 1.0.0
+description: Evaluate mathematical expressions safely
+version: 1
 tools:
-  - name: calculate
-    description: Evalúa una expresión matemática de forma segura
-    parameters:
-      expression:
-        type: string
-        description: La expresión a evaluar (ej: "sqrt(144) + 2**3")
-        required: true
+  - calculate
 ---
+Use the `calculate` tool for any math the user asks about.
 
-## Calculator Skill
+Supported operations:
+- Arithmetic: +, -, *, /, ** (power), % (modulo), // (integer division)
+- Functions: sqrt, sin, cos, tan, log, log10, abs, round, ceil, floor
+- Constants: pi, e
 
-Evaluación segura de expresiones matemáticas usando AST.
-Soporta: +, -, *, /, **, sqrt, sin, cos, log, abs, round, min, max.
+Examples:
+- "cuánto es 15% de 340" -> calculate("340 * 0.15")
+- "raíz de 144" -> calculate("sqrt(144)")
+
+How to respond:
+- Show the expression and the result clearly
+- For multi-step problems, break them down
+- Use the user's language
 ```
+
+El body (todo después de `---`) se inyecta al LLM como instrucciones cuando el skill se usa por primera vez en una conversación.
+
+## Otro Ejemplo: Datetime
+
+```markdown
+---
+name: datetime
+description: Get current date/time and convert between timezones
+version: 1
+tools:
+  - get_current_datetime
+  - convert_timezone
+---
+When the user asks for the current time or date, use `get_current_datetime`.
+Default to the user's timezone if known from their profile.
+For timezone conversions, use `convert_timezone`.
+
+Use IANA timezone names:
+- Argentina: America/Argentina/Buenos_Aires
+- Spain: Europe/Madrid
+- Mexico City: America/Mexico_City
+```
+
+Un skill puede tener **múltiples tools**. El skill `datetime` tiene dos: `get_current_datetime` y `convert_timezone`.
 
 ## Modelos de Datos
 
+Los modelos en `app/skills/models.py` definen las estructuras de datos del sistema de skills:
+
 ```python
 # app/skills/models.py
-class ToolDefinition(BaseModel):
+@dataclass
+class ToolDefinition:
     name: str
     description: str
-    parameters: dict  # JSON Schema
+    parameters: dict[str, Any]
+    handler: Callable[..., Awaitable[str]]
+    skill_name: str | None = None
 
-class ToolCall(BaseModel):
+@dataclass
+class ToolCall:
     name: str
-    arguments: dict
+    arguments: dict[str, Any]
 
-class ToolResult(BaseModel):
+@dataclass
+class ToolResult:
     tool_name: str
     content: str
     success: bool = True
+
+@dataclass
+class SkillMetadata:
+    name: str
+    description: str
+    version: int = 1
+    tools: list[str] = field(default_factory=list)
+    instructions: str = ""  # Body del SKILL.md
 ```
 
-<Concept title="JSON Schema para parámetros">
-Los parámetros se definen con JSON Schema. Esto permite al LLM generar los argumentos correctos automáticamente. Ollama convierte estos schemas al formato que el modelo entiende.
-</Concept>
+<Callout variant="tip" title="dataclass en vez de Pydantic">
+Los modelos de skills usan `@dataclass` en lugar de `BaseModel` de Pydantic. Son estructuras internas que no necesitan validación de input externo ni serialización JSON automática. Más ligeros y rápidos.
+</Callout>
 
-## 15+ Skills Activos
+Notá que `ToolDefinition` incluye el `handler` (la función async que ejecuta la herramienta) y `skill_name` (para saber a qué skill pertenece). `SkillMetadata` incluye `instructions` que es el body del SKILL.md.
+
+## El Flujo de un Tool Call
+
+Cuando el usuario dice "cuánto es 15% de 340":
+
+```
+1. Usuario: "cuánto es 15% de 340"
+2. classify_intent() -> ["math"]
+3. select_tools(["math"]) -> [calculate]
+4. LLM recibe el mensaje + schema de calculate
+5. LLM genera: ToolCall(name="calculate", arguments={"expression": "340 * 0.15"})
+6. registry.execute_tool() -> handler(expression="340 * 0.15")
+7. safe_eval("340 * 0.15") -> 51.0
+8. ToolResult(tool_name="calculate", content="51", success=True)
+9. LLM recibe el resultado -> "15% de 340 es *51*"
+10. Respuesta enviada al usuario
+```
+
+## Skills Activos en LocalForge
 
 | Skill | Tools | Uso |
 |-------|-------|-----|
-| **calculator** | `calculate` | Matemáticas seguras (AST) |
+| **calculator** | `calculate` | Matemáticas seguras (AST eval) |
 | **datetime** | `get_current_datetime`, `convert_timezone` | Hora y zonas horarias |
 | **weather** | `get_weather` | Clima via wttr.in |
-| **notes** | `save_note`, `list_notes`, `search_notes`, `delete_note` | Notas personales |
-| **projects** | 10 tools | Gestión de proyectos y tareas |
+| **notes** | `save_note`, `list_notes`, `search_notes`, `delete_note`, `get_note` | Notas personales |
+| **projects** | 12 tools | Gestión de proyectos y tareas |
 | **search** | `web_search` | DuckDuckGo |
-| **news** | `search_news` | Noticias |
-| **scheduler** | `schedule_task`, `create_cron` | Recordatorios |
-| **shell** | `run_command` | Ejecución de comandos |
-| **eval** | 7 tools | Evaluación y datasets |
+| **news** | `search_news`, `add_news_preference` | Noticias |
+| **scheduler** | `schedule_task`, `create_cron`, `list_crons`, `delete_cron` | Recordatorios y cron jobs |
+| **selfcode** | 10 tools | Introspección del propio código |
+| **expand** | 9 tools | Instalar nuevos MCP servers y skills |
+| **eval** | 9 tools | Evaluación y datasets |
+
+<Concept title="Tool Router: limitación de qwen3.5">
+qwen3.5:9b solo maneja ~5-6 tools de forma confiable via Ollama. Con 60+ tools los ignora todos. Por eso LocalForge tiene un **router de dos etapas** que selecciona solo las tools relevantes para cada mensaje (Módulo 7).
+</Concept>
 
 <Quiz
-  question="¿Cuáles son las dos partes de un skill?"
+  question="¿Cuáles son las dos partes de un skill en LocalForge?"
   options={[
     "Frontend y backend",
-    "SKILL.md (definición) y handler Python (lógica)",
-    "API y database",
+    "SKILL.md (definición + instrucciones) y handler Python (lógica)",
+    "API REST y base de datos",
     "Tests y documentación"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Para qué sirve el JSON Schema en los parámetros de un tool?"
+  question="¿Para qué sirven las instrucciones (body) del SKILL.md?"
   options={[
-    "Para validar la respuesta del LLM",
-    "Para que el LLM sepa qué argumentos generar automáticamente",
     "Para documentar el código",
-    "Para tests automatizados"
+    "Se inyectan al LLM como contexto la primera vez que se usa el skill",
+    "Para generar tests automáticamente",
+    "Para validar los parámetros de entrada"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué los modelos de skills usan @dataclass en vez de Pydantic BaseModel?"
+  options={[
+    "Porque Pydantic no soporta async",
+    "Porque son estructuras internas que no necesitan validación de input externo",
+    "Por compatibilidad con Python 3.8",
+    "Porque Pydantic es más lento que dataclass para serializar JSON"
   ]}
   correct={1}
 />

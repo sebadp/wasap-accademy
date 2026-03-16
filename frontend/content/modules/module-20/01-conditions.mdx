@@ -202,4 +202,15 @@ Como el engine corre cada 15 minutos (por defecto), la condición schedule chequ
   correct={1}
 />
 
+<Quiz
+  question="¿Por qué la condición schedule usa una ventana de 15 minutos en vez de comparar al segundo exacto?"
+  options={[
+    "Porque croniter no soporta precisión de segundos",
+    "Porque el engine corre periódicamente y podría no ejecutarse en el segundo exacto del cron",
+    "Para que las reglas schedule se disparen más seguido",
+    "Porque UTC no tiene segundos precisos"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos los cuatro tipos de acciones que puede ejecutar el engine.

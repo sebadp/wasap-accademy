@@ -246,4 +246,15 @@ make check
   correct={1}
 />
 
+<Quiz
+  question="¿Por qué se usa ignore_missing_imports = true en la configuración de mypy?"
+  options={[
+    "Para ignorar errores en el código propio de la app",
+    "Porque varias dependencias como faster-whisper, sqlite-vec y watchdog no tienen type stubs, y sin este flag mypy reportaría errores falsos",
+    "Para que mypy corra más rápido",
+    "Porque es un requisito de GitHub Actions"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo integrar evaluaciones automáticas en el pipeline de CI.

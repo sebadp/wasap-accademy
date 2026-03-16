@@ -6,20 +6,23 @@ xpReward: 50
 
 ## Qué es una Memoria Semántica
 
-En WasAP, una **memoria semántica** es un hecho sobre el usuario que persiste entre conversaciones. A diferencia de los mensajes (que se resumen y borran), las memorias son **permanentes**.
+En LocalForge, una **memoria semántica** es un hecho sobre el usuario que persiste entre conversaciones. A diferencia de los mensajes (que se resumen y borran), las memorias son **permanentes** y forman la identidad del usuario ante el LLM.
 
 <Callout variant="info" title="Memoria vs Mensajes">
-Los mensajes son efímeros (se resumen después de ~20). Las memorias son permanentes: "El usuario es ingeniero de software", "Prefiere respuestas en español", "Trabaja en el proyecto API v2".
+Los mensajes son efímeros: se resumen después de ~20 y se eliminan. Las memorias son permanentes: "El usuario es ingeniero de software", "Prefiere respuestas en español", "Trabaja en el proyecto API v2". Cada vez que el LLM responde, consulta estas memorias.
 </Callout>
 
 ## La Tabla memories
+
+El sistema persiste memorias en SQLite con un esquema simple pero poderoso:
 
 ```sql
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     phone_number TEXT NOT NULL,
     content TEXT NOT NULL,
-    active INTEGER DEFAULT 1,  -- 1 = activa, 0 = borrada
+    category TEXT,             -- clasificación opcional (ej: "preference", "self_correction")
+    active INTEGER DEFAULT 1,  -- 1 = activa, 0 = borrada (soft delete)
     created_at TIMESTAMP DEFAULT (datetime('now'))
 );
 
@@ -28,10 +31,25 @@ CREATE INDEX IF NOT EXISTS idx_memories_active
 ```
 
 <Concept title="Soft delete con active flag">
-Las memorias nunca se borran físicamente. Se marcan como `active=0`. Esto permite auditoría y recovery, y es la base del sistema de provenance (Módulo 19).
+Las memorias nunca se borran fisicamente. Se marcan como `active=0`. Esto permite auditoria, recovery, y es la base del sistema de provenance que rastrea quién creó o modificó cada memoria y por qué.
 </Concept>
 
+El campo `category` permite clasificar memorias. Por ejemplo, `self_correction` se usa para memorias que el LLM genera cuando se autocorrige. Estas se excluyen del archivo MEMORY.md (como veremos en la leccion 02) pero se inyectan al contexto:
+
+```python
+# En app/memory/markdown.py — MemoryFile.sync()
+for m in memories:
+    if m.category == "self_correction":
+        continue  # No exportar a MEMORY.md
+    if m.category:
+        lines.append(f"- [{m.category}] {m.content}")
+    else:
+        lines.append(f"- {m.content}")
+```
+
 ## Comandos del Usuario
+
+El usuario interactua con memorias via comandos de chat:
 
 | Comando | Acción | Ejemplo |
 |---------|--------|---------|
@@ -40,20 +58,63 @@ Las memorias nunca se borran físicamente. Se marcan como `active=0`. Esto permi
 | `/memories` | Listar memorias activas | `/memories` |
 | `/memories query` | Buscar memorias | `/memories proyecto` |
 
+## El Handler de /remember
+
+Cuando el usuario ejecuta `/remember`, el sistema hace tres cosas: guardar en SQLite, indexar el embedding vectorial, y sincronizar el archivo MEMORY.md:
+
 ```python
 async def cmd_remember(ctx: CommandContext, args: str) -> str:
-    memory_id = await ctx.repository.add_memory(
-        ctx.phone_number, args
-    )
-    # Auto-indexar embedding
+    memory_id = await ctx.repository.add_memory(args)
+
+    # Auto-indexar embedding para búsqueda semántica
     if ctx.embed_model:
-        await embed_memory(ctx.repository, ctx.ollama_client, memory_id, args)
+        await embed_memory(
+            memory_id, args,
+            ctx.repository, ctx.ollama_client, ctx.embed_model,
+        )
+
+    # Sincronizar MEMORY.md
+    if ctx.memory_file:
+        memories = await ctx.repository.list_memories()
+        await ctx.memory_file.sync(memories)
+
     return f"Guardado: {args}"
 ```
 
+<Callout variant="tip" title="Embedding best-effort">
+La indexación vectorial es best-effort: si falla (por ejemplo, Ollama no está disponible), la memoria se guarda igual en SQLite. La app funciona sin embeddings, solo pierde búsqueda semántica.
+</Callout>
+
+## Embedding de Memorias
+
+El módulo `app/embeddings/indexer.py` se encarga de generar y almacenar vectores:
+
+```python
+# app/embeddings/indexer.py
+_MAX_EMBED_CHARS = 6_000  # Límite conservador para nomic-embed-text
+
+async def embed_memory(
+    memory_id: int,
+    content: str,
+    repository: Repository,
+    ollama_client: OllamaClient,
+    model: str,
+) -> None:
+    """Compute and store embedding for a single memory. Best-effort."""
+    try:
+        embeddings = await ollama_client.embed(
+            [content[:_MAX_EMBED_CHARS]], model=model
+        )
+        await repository.save_embedding(memory_id, embeddings[0])
+    except Exception:
+        logger.warning("Failed to embed memory %d", memory_id, exc_info=True)
+```
+
+Los vectores se almacenan en `vec_memories` (tabla virtual de sqlite-vec) y permiten buscar memorias por similitud semántica en lugar de keyword matching.
+
 ## Inyección al Contexto del LLM
 
-Las memorias activas se inyectan en cada llamada al LLM:
+Las memorias activas se inyectan en cada llamada al LLM dentro del system prompt usando tags XML:
 
 ```xml
 <user_memories>
@@ -64,8 +125,30 @@ Las memorias activas se inyectan en cada llamada al LLM:
 </user_memories>
 ```
 
-<Callout variant="tip" title="Personalización automática">
-Con memorias, el LLM sabe quién sos sin que lo repitas. Si guardaste "Soy vegano", el asistente nunca te recomendará restaurantes de carne.
+<Concept title="Context Engineering con XML tags">
+LocalForge usa XML tags para separar secciones del contexto (`<user_memories>`, `<daily_logs>`, `<relevant_notes>`). Esto ayuda al LLM a distinguir qué tipo de información está leyendo y le permite priorizar correctamente.
+</Concept>
+
+## Búsqueda Semántica vs Keyword
+
+Cuando hay muchas memorias, el sistema usa búsqueda vectorial para seleccionar las más relevantes al mensaje actual en lugar de inyectar todas:
+
+```python
+# Búsqueda semántica con distancia L2
+results = await repository.search_similar_memories_with_distance(
+    embedding=query_embedding,
+    top_k=settings.semantic_search_top_k,
+)
+
+# Filtrar por umbral de distancia
+relevant = [
+    content for content, distance in results
+    if distance <= settings.memory_similarity_threshold  # default: 1.0 L2
+]
+```
+
+<Callout variant="warning" title="Distancia L2">
+La distancia L2 (euclidiana) mide qué tan lejos están dos vectores. Un umbral de 1.0 significa que solo se inyectan memorias semánticamente cercanas al mensaje actual. Si ninguna pasa el umbral, se usa el fallback: `get_active_memories()` retorna todas.
 </Callout>
 
 <Quiz
@@ -85,9 +168,20 @@ Con memorias, el LLM sabe quién sos sin que lo repitas. Si guardaste "Soy vegan
     "En el user message",
     "Como tool result",
     "En el system prompt dentro de tags XML como <user_memories>",
-    "En un archivo separado"
+    "En un archivo separado que el LLM lee por tool calling"
   ]}
   correct={2}
 />
 
-En la siguiente lección veremos cómo los daily logs capturan eventos día a día.
+<Quiz
+  question="¿Qué sucede si el embedding de una memoria falla al ejecutar /remember?"
+  options={[
+    "El comando falla y la memoria no se guarda",
+    "Se reintenta 3 veces antes de fallar",
+    "La memoria se guarda en SQLite sin embedding (best-effort)",
+    "Se usa un vector de ceros como placeholder"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo los daily logs capturan eventos día a día como memoria episódica.

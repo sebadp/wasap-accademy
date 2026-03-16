@@ -4,103 +4,241 @@ description: "Factory async que centraliza la recolección de datos para el cont
 xpReward: 100
 ---
 
-## El Factory Pattern
+## El Factory Pattern Async
 
-`ConversationContext.build()` es un **async factory method** que recolecta toda la información necesaria para el contexto del LLM en un solo lugar.
+`ConversationContext.build()` es un **async factory method** que recolecta toda la información necesaria para el contexto del LLM en un solo lugar. Ejecuta las queries en paralelo y retorna un dataclass inmutable con todos los datos listos.
 
-<Callout variant="info" title="¿Por qué factory?">
-Un constructor normal (`__init__`) no puede ser async. Como necesitamos hacer queries a la DB y llamadas a Ollama, usamos un class method async que retorna la instancia construida.
+<Callout variant="info" title="¿Por qué factory y no constructor?">
+Un constructor normal (`__init__`) no puede ser `async`. Como necesitamos hacer queries a la DB, llamadas a Ollama, y cargar archivos, usamos un `@classmethod async` que retorna la instancia ya construida. El `__init__` del dataclass solo asigna campos -- toda la lógica de fetch está en `build()`.
 </Callout>
 
-## ConversationContext
+## El Dataclass ConversationContext
 
 ```python
+# app/context/conversation_context.py
 @dataclass
 class ConversationContext:
+    """State snapshot for a single user message, built before the pipeline starts."""
+
+    # Identity
+    phone_number: str
+    user_text: str
+    conv_id: int
+
+    # Pre-fetched data
+    user_facts: dict[str, str] = field(default_factory=dict)
+    memories: list[str] = field(default_factory=list)
+    history: list[ChatMessage] = field(default_factory=list)
+    summary: str | None = None
+    daily_logs: str | None = None
+    relevant_notes: list[Note] = field(default_factory=list)
+    projects_summary: str | None = None
+    project_notes: list = field(default_factory=list)
+
+    # Routing state
+    sticky_categories: list[str] = field(default_factory=list)
+    current_categories: list[str] = field(default_factory=list)
+
+    # Mutable state (only field that changes after construction)
+    scratchpad: str = ""
+
+    # Embeddings
     query_embedding: list[float] | None = None
-    relevant_memories: list[tuple[str, float]] = field(default_factory=list)
-    relevant_notes: list[str] = field(default_factory=list)
-    daily_logs: str = ""
-    projects_summary: str = ""
-    sticky_categories: list[str] | None = None
-    user_facts: list[str] = field(default_factory=list)
+
+    # Diagnostics
+    search_stats: dict = field(default_factory=dict)
+    build_timing: dict = field(default_factory=dict)
     token_estimate: int = 0
-
-    @classmethod
-    async def build(
-        cls,
-        phone_number: str,
-        user_message: str,
-        repository: Repository,
-        ollama_client: OllamaClient,
-        settings: Settings,
-        vec_available: bool = False,
-    ) -> "ConversationContext":
-        ctx = cls()
-
-        # Phase A: embed + I/O en paralelo
-        embed_task = ollama_client.embed(user_message) if vec_available else None
-        daily_task = daily_log.load_recent(settings.daily_log_days)
-
-        if embed_task:
-            ctx.query_embedding, ctx.daily_logs = await asyncio.gather(
-                embed_task, daily_task
-            )
-        else:
-            ctx.daily_logs = await daily_task
-
-        # Phase B: búsquedas en paralelo
-        tasks = [
-            repository.get_sticky_categories(phone_number),
-        ]
-        if ctx.query_embedding:
-            tasks.append(repository.search_similar_memories_with_distance(
-                phone_number, ctx.query_embedding
-            ))
-            tasks.append(repository.search_similar_notes(
-                phone_number, ctx.query_embedding
-            ))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        ctx.sticky_categories = results[0] if not isinstance(results[0], Exception) else None
-        # ... parse remaining results
-
-        ctx.token_estimate = estimate_tokens(str(ctx))
-        return ctx
+    graph_enrichment: str = ""
 ```
 
-## Parallel Fetches Visualizado
+<Concept title="Immutable after construction">
+Excepto `scratchpad` (que el agent loop modifica entre iteraciones) y `current_categories` (que se setea después de classify), todos los campos se asignan una vez durante `build()` y no cambian. Esto hace que el objeto sea predecible y fácil de debuggear.
+</Concept>
 
+## El Método build(): Paso a Paso
+
+### Paso 1: Obtener el embedding del query
+
+```python
+# app/context/conversation_context.py — dentro de build()
+async def _get_query_embedding() -> list[float] | None:
+    if (
+        ollama_client is None
+        or settings is None
+        or not settings.semantic_search_enabled
+        or not vec_available
+        or not user_text
+    ):
+        return None
+    try:
+        result = await ollama_client.embed(
+            [user_text], model=settings.embedding_model,
+        )
+        return result[0]
+    except Exception:
+        logger.warning("Failed to compute query embedding")
+        return None
+
+# Step 1: get query embedding first (needed for memories and notes)
+_t0 = time.monotonic()
+query_embedding = await _get_query_embedding()
+_embed_ms = (time.monotonic() - _t0) * 1000
 ```
-Phase A:            Phase B:
-┌─ embed(query)     ┌─ search_memories ──┐
-│                   ├─ search_notes ─────┤
-├─ load_daily_logs  ├─ get_sticky ───────┤ → ConversationContext
-│                   ├─ get_projects ─────┤
-└─ save_message     └─ get_summary ──────┘
-     (paralelo)          (paralelo)
+
+<Callout variant="tip" title="Guard clauses exhaustivos">
+La función verifica 5 condiciones antes de intentar el embed. Si cualquiera falla (Ollama no disponible, vec deshabilitado, texto vacío), retorna `None` sin error. El resto del pipeline se adapta automáticamente al path sin embeddings.
+</Callout>
+
+### Paso 2: Fetch paralelo de todos los datos
+
+```python
+# Step 2: parallel fetches (all independent now that embedding is ready)
+try:
+    active_projects = await repository.get_projects_with_progress(
+        phone_number, status="active", limit=5
+    )
+except Exception:
+    active_projects = []
+
+# Project notes search runs as separate task (depends on active_projects)
+_project_notes_task = asyncio.create_task(
+    _get_project_notes(query_embedding, active_projects)
+)
+
+# Main parallel gather: 5 operaciones simultáneas
+(
+    memories_and_stats,
+    windowed,
+    sticky,
+    logs,
+    relevant_notes,
+) = await asyncio.gather(
+    _get_memories_with_threshold(query_embedding),
+    conversation_manager.get_windowed_history(
+        phone_number, verbatim_count=verbatim_count
+    ),
+    repository.get_sticky_categories(conv_id) if conv_id else _empty_list(),
+    _get_daily_logs(),
+    _get_relevant_notes(query_embedding),
+)
+
+# Await the project notes task
+project_notes = await _project_notes_task
+projects_summary = _build_projects_summary(active_projects)
 ```
 
 <Concept title="asyncio.gather maximiza paralelismo">
-Todas las operaciones I/O-bound de cada fase corren en paralelo. La latencia total es el max() de las operaciones individuales, no la suma.
+Todas las operaciones I/O-bound (DB queries, file reads) corren en paralelo. La latencia total es el `max()` de las operaciones individuales, no la suma. Si buscar memorias tarda 50ms, notas 30ms, y historial 40ms, el total es ~50ms en vez de 120ms.
 </Concept>
 
-## Factory vs Constructor
+### Paso 3: Post-procesamiento y retorno
 
 ```python
-# ❌ No se puede: __init__ no puede ser async
+memories_raw, search_stats = memories_and_stats
+history, summary = windowed
+
+# Extract user facts from memories (regex, determinístico, <1ms)
+user_facts = extract_facts(memories_raw)
+
+# Build timing para diagnostics
+build_timing = {
+    "embed_ms": round(_embed_ms, 1),
+    "searches_ms": round(_searches_ms, 1)
+}
+
+return cls(
+    phone_number=phone_number,
+    user_text=user_text,
+    conv_id=conv_id or 0,
+    user_facts=user_facts,
+    memories=memories_raw,
+    history=history,
+    summary=summary,
+    daily_logs=logs,
+    relevant_notes=relevant_notes,
+    projects_summary=projects_summary,
+    project_notes=project_notes,
+    sticky_categories=sticky or [],
+    query_embedding=query_embedding,
+    search_stats=search_stats,
+    build_timing=build_timing,
+    graph_enrichment=graph_enrichment,
+)
+```
+
+## Visualización del Paralelismo
+
+```
+Step 1 (serial):        Step 2 (parallel):
+┌─ embed(query) ─┐     ┌─ search_memories ──┐
+│   (~100ms)      │     ├─ get_history ──────┤
+└─────────────────┘     ├─ get_sticky ───────┤
+                        ├─ get_daily_logs ───┤  → ConversationContext
+                        ├─ search_notes ─────┤
+                        └─ search_proj_notes ┘
+                              (~50-80ms)
+```
+
+El embedding se calcula primero porque es input para 3 de las 5 búsquedas paralelas. Después, todo corre simultáneamente.
+
+## Build Timing: Performance Baseline
+
+`build_timing` registra cuánto tardó cada fase, accesible para tracing:
+
+```python
+# En _run_normal_flow() del router:
+if ctx.build_timing:
+    span.set_metadata(ctx.build_timing)
+# Ejemplo: {"embed_ms": 95.3, "searches_ms": 52.7}
+```
+
+Esto permite monitorear si el embedding o las búsquedas están degradándose.
+
+## Factory vs Constructor: La Diferencia
+
+```python
+# No se puede: __init__ no puede ser async
 class ConversationContext:
     def __init__(self, phone, repo):
         self.memories = await repo.get_memories(phone)  # SyntaxError!
 
-# ✅ Factory method async
+# Solución 1: factory method async
 class ConversationContext:
     @classmethod
     async def build(cls, phone, repo):
         ctx = cls()
         ctx.memories = await repo.get_memories(phone)
         return ctx
+
+# Solución 2 (peor): __init__ sync + método init() separado
+class ConversationContext:
+    def __init__(self):
+        self.memories = []
+
+    async def init(self, phone, repo):
+        self.memories = await repo.get_memories(phone)
+        return self
+    # Problema: el caller puede olvidarse de llamar init()
 ```
+
+<Callout variant="warning" title="Factory method > two-step init">
+El factory method es superior porque el caller no puede obtener un objeto a medio construir. `build()` retorna un `ConversationContext` completo o falla. No hay estado intermedio inválido.
+</Callout>
+
+## Windowed History
+
+El historial usa una ventana configurable:
+
+```python
+# conversation_manager.get_windowed_history() retorna:
+# (last_N_messages, summary_of_older)
+history, summary = windowed
+# history: últimos 8 mensajes verbatim
+# summary: resumen LLM de los mensajes más viejos (o None si no hay)
+```
+
+Esto mantiene los mensajes recientes detallados (el usuario espera que los recuerdes) y compacta los viejos en un resumen (ahorra tokens).
 
 <Quiz
   question="¿Por qué se usa un factory method en vez de __init__?"
@@ -108,18 +246,29 @@ class ConversationContext:
     "Porque __init__ no puede retornar valores",
     "Porque __init__ no puede ser async y necesitamos hacer queries asíncronas",
     "Porque los dataclasses no soportan __init__ custom",
-    "Para soportar herencia"
+    "Para soportar herencia múltiple"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Cuál es la ventaja de ejecutar Phase A y Phase B con asyncio.gather?"
+  question="¿Cuál es la ventaja de ejecutar las búsquedas con asyncio.gather?"
   options={[
-    "Usa menos memoria",
+    "Usa menos memoria que ejecutarlas una por una",
     "La latencia total es el máximo de las operaciones individuales, no la suma",
-    "Es más fácil de debuggear",
-    "Permite cancelar operaciones"
+    "Es más fácil de debuggear que await secuencial",
+    "Permite cancelar operaciones que tardan demasiado"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el query embedding se calcula ANTES del asyncio.gather principal?"
+  options={[
+    "Porque es la operación más rápida",
+    "Porque 3 de las 5 búsquedas paralelas lo necesitan como input",
+    "Porque Ollama solo puede procesar una request a la vez",
+    "Para evitar race conditions con la base de datos"
   ]}
   correct={1}
 />

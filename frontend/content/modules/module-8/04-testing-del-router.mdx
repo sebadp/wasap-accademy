@@ -1,45 +1,80 @@
 ---
 title: "Testing del Router"
-description: "Estrategias para testear clasificación, selección y edge cases"
+description: "Estrategias para testear clasificacion, seleccion y edge cases"
 xpReward: 100
 ---
 
-## Desafíos de Testear el Router
+## Desafios de Testear el Router
 
-El router depende de un LLM para classify_intent. Eso lo hace **no determinístico**. Para testing, necesitamos estrategias que aíslen cada componente.
+El router depende de un LLM para classify_intent. Eso lo hace **no determinístico**. Para testing, necesitamos estrategias que aislen cada componente.
 
 <Callout variant="info" title="3 niveles de testing">
-1. **Unit**: testear select_tools (determinístico) directamente. 2. **Integration**: mockear classify_intent, testear el flujo. 3. **Eval**: evaluar la calidad de clasificación con un dataset.
+1. **Unit**: testear `select_tools` (deterministico) directamente. 2. **Integration**: mockear `classify_intent`, testear el flujo completo. 3. **Eval**: evaluar la calidad de clasificacion con un dataset vivo.
 </Callout>
 
-## Unit Test: select_tools
+## Nivel 1: Unit Tests de select_tools
+
+`select_tools` es deterministico -- para los mismos inputs, siempre retorna los mismos outputs. Esto permite tests exactos:
 
 ```python
 def test_select_tools_basic():
-    tools = select_tools(["weather", "math"])
-    assert "get_weather" in tools
-    assert "calculate" in tools
+    """Categorias conocidas retornan sus tools."""
+    tools = select_tools(["weather", "math"], all_tools_map)
+    tool_names = [t["function"]["name"] for t in tools]
+    assert "get_weather" in tool_names
+    assert "calculate" in tool_names
 
-def test_select_tools_cap():
-    # Con muchas categorías, no supera max_tools
+def test_select_tools_budget_cap():
+    """Con muchas categorias, no supera max_tools."""
     tools = select_tools(
         ["weather", "notes", "projects", "search"],
+        all_tools_map,
         max_tools=8,
     )
     assert len(tools) <= 8
 
+def test_select_tools_proportional():
+    """Cada categoria recibe su cuota proporcional."""
+    tools = select_tools(
+        ["notes", "weather"],  # notes=5 tools, weather=1
+        all_tools_map,
+        max_tools=8,
+    )
+    tool_names = [t["function"]["name"] for t in tools]
+    # notes debe tener hasta 4 tools (8//2)
+    notes_tools = [n for n in tool_names if n in TOOL_CATEGORIES["notes"]]
+    assert len(notes_tools) <= 4
+
 def test_select_tools_unknown_category():
-    tools = select_tools(["nonexistent"])
-    assert tools == []  # Categoría desconocida → sin tools
+    """Categoria desconocida retorna lista vacia."""
+    tools = select_tools(["nonexistent"], all_tools_map)
+    assert tools == []
+
+def test_select_tools_deduplication():
+    """Tools compartidos entre categorias no se duplican."""
+    # "get_conversation_transcript" esta en debugging Y conversation
+    tools = select_tools(
+        ["debugging", "conversation"],
+        all_tools_map,
+        max_tools=8,
+    )
+    names = [t["function"]["name"] for t in tools]
+    assert len(names) == len(set(names))  # Sin duplicados
 ```
 
-## Integration Test: _bypass_router()
+<Concept title="Tests deterministicos no necesitan mocks">
+Como `select_tools` es una funcion pura (sin side effects, sin LLM), los tests son simples asserts sobre la salida. No necesitan `AsyncMock`, `patch`, ni fixtures async.
+</Concept>
+
+## Nivel 2: Integration Tests con _bypass_router
+
+Para testear el flujo completo sin depender del LLM clasificador, se mockean las funciones de routing:
 
 ```python
 from unittest.mock import patch, AsyncMock
 
 def _bypass_router(categories=None, tools=None):
-    """Parchea classify y select para tests controlados."""
+    """Parchea classify_intent y select_tools con valores controlados."""
     patches = []
     if categories is not None:
         patches.append(patch(
@@ -53,76 +88,225 @@ def _bypass_router(categories=None, tools=None):
             return_value=tools,
         ))
     return patches
+```
 
-# Uso
+<Callout variant="tip" title="Helper reutilizable">
+`_bypass_router` es un patron de testing que LocalForge usa en multiples test files. Retorna una lista de patches que se pueden aplicar con context managers.
+</Callout>
+
+### Ejemplo: Testear que "none" skipea tools
+
+```python
 async def test_none_skips_tools(mock_ollama):
+    """Cuando classify retorna ['none'], no se usa el tool loop."""
     with _bypass_router(categories=["none"]):
-        mock_ollama.chat.return_value = ChatResponse(content="Hola!")
-        result = await process_message(message)
+        mock_ollama.chat.return_value = "Hola!"
+        result = await execute_tool_loop(
+            messages=[ChatMessage(role="user", content="Hola")],
+            ollama_client=mock_ollama,
+            skill_registry=mock_registry,
+        )
         assert "Hola" in result
-        # Verificar que NO se llamó chat_with_tools
+        # Verificar que NO se llamo chat_with_tools (sin tools)
         mock_ollama.chat_with_tools.assert_not_called()
 ```
 
-## Edge Cases Críticos
+### Ejemplo: Testear seleccion de tools especifica
+
+```python
+async def test_weather_tools_selected(mock_ollama):
+    """Cuando classify retorna ['weather'], solo se ofrecen weather tools."""
+    with _bypass_router(categories=["weather"]):
+        mock_ollama.chat_with_tools.return_value = ChatResponse(
+            content="El clima en BA es 20C",
+            tool_calls=None,
+        )
+        result = await execute_tool_loop(
+            messages=[ChatMessage(role="user", content="Clima en BA")],
+            ollama_client=mock_ollama,
+            skill_registry=mock_registry,
+        )
+        # Verificar que las tools pasadas incluyen weather
+        call_args = mock_ollama.chat_with_tools.call_args
+        tools_passed = call_args.kwargs.get("tools", [])
+        tool_names = [t["function"]["name"] for t in tools_passed]
+        assert "get_weather" in tool_names
+```
+
+## Edge Cases Criticos
+
+Estos son los casos limite que todo router debe manejar:
 
 | Caso | Input | Comportamiento esperado |
 |------|-------|------------------------|
-| Categoría vacía | `[]` | Usar DEFAULT_CATEGORIES |
-| JSON inválido | `"weather"` (no array) | Fallback a defaults |
+| Categoria vacia | `[]` | `select_tools` retorna `[]` |
+| JSON invalido del LLM | `"weather"` (no array) | Fallback a `DEFAULT_CATEGORIES` |
 | Todas unknown | `["foo", "bar"]` | Sin tools, plain chat |
-| Categoría "none" | `["none"]` | Skip tool loop |
-| Mixed | `["none", "weather"]` | Ignorar "none", usar "weather" |
+| Categoria "none" | `["none"]` | Skip tool loop, chat directo |
+| Mixed none | `["none", "weather"]` | Ignorar "none", usar "weather" |
+| Categoria fantasma | `["fetch"]` sin MCP | Se filtra, no desperdicia budget |
+| URL en mensaje | `"https://..." + "none"` | Override a `["fetch"]` |
 
 ```python
 async def test_invalid_classification_uses_defaults(mock_ollama):
-    mock_ollama.chat.return_value = ChatResponse(
-        content="this is not valid json"
+    """Si el LLM retorna texto invalido, se usan defaults."""
+    mock_ollama.chat_with_tools.return_value = ChatResponse(
+        content="this is not valid categories",
+        tool_calls=None,
     )
-    categories = await classify_intent(messages)
+    categories = await classify_intent(
+        "Que hora es?", mock_ollama
+    )
     assert categories == DEFAULT_CATEGORIES
 ```
 
-## Eval: Medir Calidad de Clasificación
+## Nivel 3: Eval con Dataset Vivo
+
+Para medir la calidad del clasificador en produccion, LocalForge tiene un sistema de evaluacion:
 
 ```python
-# scripts/run_eval.py --mode classify
+# Dataset de evaluacion para el clasificador
 CLASSIFY_DATASET = [
-    ("¿Qué hora es?", ["time"]),
-    ("Calculá 15% de 200", ["math"]),
-    ("Hola", ["none"]),
-    ("Guardá una nota sobre Python", ["notes"]),
+    # (mensaje, categorias esperadas)
+    ("Que hora es?", ["time"]),
+    ("Calcula 15% de 200", ["math"]),
+    ("Hola, como estas?", ["none"]),
+    ("Guarda una nota sobre Python", ["notes"]),
+    ("Busca el clima y guardalo en notas", ["weather", "notes"]),
+    ("Mostra mis proyectos", ["projects"]),
+    ("Que herramientas tenes?", ["tools"]),
+    ("Busca en el codigo donde se define X", ["selfcode"]),
 ]
 
-def eval_classify(dataset):
+async def eval_classify(dataset, ollama_client):
     correct = 0
     for message, expected in dataset:
-        result = await classify_intent([{"role": "user", "content": message}])
+        result = await classify_intent(message, ollama_client)
         if set(result) == set(expected):
             correct += 1
-    return correct / len(dataset)
+    accuracy = correct / len(dataset)
+    return accuracy
 ```
 
+<Callout variant="warning" title="Eval != test">
+Los evals no fallan con un assert -- miden calidad con metricas. Un accuracy de 85% puede ser aceptable para produccion. Los resultados se trackean con Langfuse para detectar regresiones cuando se cambia el prompt o el modelo.
+</Callout>
+
+## Testear Sticky Categories
+
+```python
+async def test_sticky_fallback(mock_ollama):
+    """Sticky categories se usan cuando classify retorna 'none'."""
+    mock_ollama.chat_with_tools.return_value = ChatResponse(
+        content="none", tool_calls=None
+    )
+    categories = await classify_intent(
+        "Como va?",
+        mock_ollama,
+        sticky_categories=["projects"],
+    )
+    assert categories == ["projects"]
+
+async def test_sticky_not_used_when_clear_intent(mock_ollama):
+    """Stickies no se usan si el clasificador detecta intencion clara."""
+    mock_ollama.chat_with_tools.return_value = ChatResponse(
+        content="weather", tool_calls=None
+    )
+    categories = await classify_intent(
+        "Que clima hace?",
+        mock_ollama,
+        sticky_categories=["projects"],  # Sticky irrelevante
+    )
+    assert categories == ["weather"]  # Clasificacion fresca gana
+```
+
+## Testear URL Detection Override
+
+```python
+async def test_url_forces_fetch(mock_ollama):
+    """URLs en el mensaje fuerzan la categoria 'fetch'."""
+    mock_ollama.chat_with_tools.return_value = ChatResponse(
+        content="none", tool_calls=None
+    )
+    # Registrar la categoria fetch temporalmente
+    TOOL_CATEGORIES["fetch"] = ["fetch_markdown"]
+    try:
+        categories = await classify_intent(
+            "Lee esta pagina: https://example.com",
+            mock_ollama,
+        )
+        assert "fetch" in categories
+    finally:
+        del TOOL_CATEGORIES["fetch"]
+```
+
+<Concept title="Piramide de testing del router">
+**Base**: unit tests de `select_tools` (rapidos, deterministicos, muchos). **Medio**: integration tests con `_bypass_router` (mockean LLM, testean flujo). **Tope**: evals con dataset vivo (miden calidad, corren periodicamente).
+</Concept>
+
+## Patron: register_dynamic_category en Tests
+
+Para testear categorias MCP sin un server real:
+
+```python
+async def test_dynamic_category_integration():
+    """Tools de MCP se seleccionan correctamente tras registro dinamico."""
+    register_dynamic_category("custom_mcp", ["custom_tool_1", "custom_tool_2"])
+    try:
+        # Verificar que la categoria existe
+        assert "custom_mcp" in TOOL_CATEGORIES
+        assert "custom_tool_1" in TOOL_CATEGORIES["custom_mcp"]
+    finally:
+        # Limpiar
+        del TOOL_CATEGORIES["custom_mcp"]
+```
+
+## Checklist de Testing del Router
+
+Para verificar que tu router funciona correctamente, asegurate de cubrir:
+
+- [ ] `select_tools` con 0, 1, 2+ categorias
+- [ ] Budget proporcional con categorias de distinto tamano
+- [ ] Deduplicacion de tools compartidos
+- [ ] Categorias fantasma (no registradas)
+- [ ] Fallback a `DEFAULT_CATEGORIES` con input invalido
+- [ ] `["none"]` skipea el tool loop
+- [ ] Sticky categories como fallback
+- [ ] URL detection override
+- [ ] Meta-tool `request_more_tools` agrega tools al pool
+- [ ] `reset_tools_cache()` invalida el cache correctamente
+
 <Quiz
-  question="¿Qué hace _bypass_router() en los tests?"
+  question="Que hace _bypass_router() en los tests?"
   options={[
-    "Desactiva el routing completamente",
-    "Parchea classify_intent y select_tools con valores controlados",
-    "Conecta directamente al LLM",
-    "Usa un router alternativo"
+    "Desactiva el routing completamente y pasa todas las tools",
+    "Parchea classify_intent y select_tools con valores controlados via mock",
+    "Conecta directamente al LLM sin intermediarios",
+    "Usa un router alternativo basado en reglas"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Qué pasa cuando classify_intent retorna JSON inválido?"
+  question="Que pasa cuando classify_intent retorna JSON invalido?"
   options={[
-    "La app crashea",
-    "Se usa DEFAULT_CATEGORIES como fallback",
-    "Se reintenta 3 veces",
-    "Se envía un error al usuario"
+    "La app crashea con una excepcion no manejada",
+    "Se usan DEFAULT_CATEGORIES como fallback seguro",
+    "Se reintenta la clasificacion hasta 3 veces",
+    "Se envia un mensaje de error al usuario"
   ]}
   correct={1}
 />
 
-Has completado el módulo Intent Classification & Smart Routing. Ahora entendés el pipeline completo de routing de herramientas.
+<Quiz
+  question="Cual es la diferencia principal entre un unit test y un eval del clasificador?"
+  options={[
+    "Los unit tests son async y los evals son sync",
+    "Los unit tests mockean el LLM y usan asserts; los evals usan el LLM real y miden accuracy",
+    "Los evals solo corren en CI y los unit tests solo corren localmente",
+    "No hay diferencia, son lo mismo con distinto nombre"
+  ]}
+  correct={1}
+/>
+
+Has completado el modulo Intent Classification & Smart Routing. Ahora entendes el pipeline completo: desde el problema de escala, pasando por la clasificacion LLM, la seleccion deterministica, las sticky categories y las estrategias de testing.

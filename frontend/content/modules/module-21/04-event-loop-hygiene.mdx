@@ -205,4 +205,15 @@ create_task()
   correct={2}
 />
 
+<Quiz
+  question="¿Por qué graceful_shutdown usa return_exceptions=True en asyncio.gather?"
+  options={[
+    "Para que los tasks se ejecuten más rápido",
+    "Para que si un task lanza una excepción, los demás sigan ejecutándose en vez de cancelarse",
+    "Porque es un requisito de FastAPI",
+    "Para loguear las excepciones automáticamente"
+  ]}
+  correct={1}
+/>
+
 Has completado el módulo de Performance Optimization. Ahora entendés cómo LocalForge paraleliza, cachea y mantiene el event loop sano para responder en el menor tiempo posible.

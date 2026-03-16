@@ -143,4 +143,15 @@ Phase B depende de Phase A (necesita el `query_embedding`), pero las 5 operacion
   correct={1}
 />
 
+<Quiz
+  question="¿Por qué Phase B depende de Phase A pero las 5 operaciones dentro de Phase B son independientes entre sí?"
+  options={[
+    "Porque Phase B necesita el query_embedding calculado en Phase A, pero sus propias queries (memories, notes, summary, recent, projects) no dependen unas de otras",
+    "Porque Phase A es más rápida que Phase B",
+    "Porque asyncio.gather solo permite un nivel de paralelismo",
+    "Porque todas las queries de Phase B usan la misma tabla de SQLite"
+  ]}
+  correct={0}
+/>
+
 En la siguiente lección veremos las técnicas específicas de asyncio que hacen posible esta paralelización.

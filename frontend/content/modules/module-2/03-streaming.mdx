@@ -1,87 +1,185 @@
 ---
-title: "Streaming y manejo de errores"
-description: "Respuestas en tiempo real y retry robusto con exponential backoff"
+title: "Manejo de Errores y Resiliencia"
+description: "Retry robusto, manejo de errores de Ollama, y patrones best-effort para produccion"
 xpReward: 75
 ---
 
-## Por qué streaming
+## Por que no usamos Streaming
 
-Sin streaming, el usuario espera 5-10 segundos sin feedback antes de ver la respuesta completa. Con streaming, los tokens llegan en tiempo real: mejor UX, mismo costo.
+En un chat web, streaming mejora la UX: los tokens llegan en tiempo real y el usuario ve la respuesta formarse caracter por caracter. Pero en **WhatsApp y Telegram**, no podes hacer streaming visual. El mensaje se envia completo cuando esta listo.
 
-<Callout variant="info">
-En WhatsApp no podés hacer streaming visual (no es un chat web), pero en AgentCraft, cuando implementemos el playground, usaremos streaming para el editor.
+<Callout variant="info" title="stream: False">
+LocalForge siempre usa `"stream": False` en los requests a Ollama. Esto simplifica el codigo (no hay que acumular chunks) y no afecta la UX porque las plataformas de mensajeria no soportan streaming de texto.
 </Callout>
 
-## Streaming con el SDK de Anthropic
+Por eso, en lugar de streaming, LocalForge se enfoca en **resiliencia**: que pasa cuando Ollama no esta disponible, cuando el modelo no existe, o cuando el request falla.
 
-```python title="app/llm/client.py"
-async def stream(
-    self,
-    messages: list[dict],
-    system: str = "",
-) -> AsyncGenerator[str, None]:
-    """Genera tokens de respuesta en tiempo real."""
-    async with self.client.messages.stream(
-        model=self.model,
-        max_tokens=1024,
-        system=system,
-        messages=messages,
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
+## Manejo de Errores en OllamaClient
+
+El cliente maneja errores de Ollama de forma especifica, con mensajes utiles para debugging:
+
+```python
+# app/llm/client.py
+async def chat_with_tools(self, messages, tools=None, ...):
+    url = f"{self._base_url}/api/chat"
+    payload = {
+        "model": use_model,
+        "messages": self._build_message_dicts(messages),
+        "stream": False,
+    }
+
+    resp = await self._http.post(url, json=payload)
+
+    if resp.status_code == 404:
+        logger.error(
+            "Ollama model '%s' not found — download it with: "
+            "docker compose exec ollama ollama pull %s",
+            use_model, use_model,
+        )
+    resp.raise_for_status()  # Lanza httpx.HTTPStatusError
 ```
 
-## Retry con exponential backoff
-
-Las APIs de LLM fallan. La API de Anthropic tiene rate limits. WasAP implementa retry automático:
-
-```python title="app/llm/retry.py"
-import asyncio
-import anthropic
-
-
-async def complete_with_retry(
-    client: LLMClient,
-    messages: list[dict],
-    max_retries: int = 3,
-) -> str:
-    delay = 1.0  # segundos
-
-    for attempt in range(max_retries):
-        try:
-            return await client.complete(messages)
-        except anthropic.RateLimitError:
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(delay)
-            delay *= 2  # exponential backoff
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500:
-                # Error del servidor de Anthropic, reintentamos
-                await asyncio.sleep(delay)
-                delay *= 2
-            else:
-                # Error del cliente (4xx), no reintentamos
-                raise
-
-    raise RuntimeError("Max retries exceeded")
-```
-
-<Concept term="Exponential backoff">
-Estrategia de retry donde el tiempo de espera se duplica en cada intento: 1s, 2s, 4s, 8s... Evita saturar el servidor con reintentos inmediatos durante picos de carga.
+<Concept title="Error 404: modelo no encontrado">
+El error mas comun con Ollama es que el modelo no esta descargado. LocalForge detecta el 404 y loguea el comando exacto para descargarlo. Esto es especialmente util en Docker donde tenes que ejecutar `ollama pull` dentro del contenedor.
 </Concept>
 
-## Errores comunes de la API de Anthropic
+## Errores Comunes de Ollama
 
-| Error | Código | Causa | Acción |
-|-------|--------|-------|--------|
-| `RateLimitError` | 429 | Demasiadas requests | Retry con backoff |
-| `APIStatusError` 529 | 529 | Sobrecarga del servidor | Retry con backoff |
-| `InvalidRequestError` | 400 | Prompt mal formado | No retry, fix el código |
-| `AuthenticationError` | 401 | API key inválida | No retry, fix la config |
+| Error | Causa | Accion |
+|-------|-------|--------|
+| **404 Not Found** | Modelo no descargado | `ollama pull qwen3.5:9b` |
+| **Connection refused** | Ollama no esta corriendo | Iniciar el servicio Ollama |
+| **Timeout** | Modelo muy grande para el hardware | Usar modelo mas chico o aumentar timeout |
+| **OOM** | Sin memoria RAM/VRAM suficiente | Reducir `num_ctx` o usar modelo quantizado |
+
+## Health Check: Detectar Problemas Temprano
+
+Antes de procesar mensajes, LocalForge verifica que Ollama este disponible:
+
+```python
+# app/llm/client.py
+async def is_available(self) -> bool:
+    try:
+        resp = await self._http.get(
+            f"{self._base_url}/api/tags",
+            timeout=5.0,
+        )
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+```
+
+Este metodo se usa en el **readiness endpoint** de la app:
+
+```python
+# app/health/router.py (simplificado)
+@router.get("/health/ready")
+async def readiness(request: Request):
+    ollama_ok = await ollama_client.is_available()
+    db_ok = await check_db(repository)
+    return {
+        "status": "ready" if all([ollama_ok, db_ok]) else "degraded",
+        "checks": {
+            "ollama": "ok" if ollama_ok else "unavailable",
+            "db": "ok" if db_ok else "unavailable",
+        }
+    }
+```
+
+<Callout variant="tip" title="Readiness vs Liveness">
+El health check `/health/ready` verifica dependencias (Ollama, DB). El liveness check `/health/live` solo verifica que la app responde. Kubernetes usa readiness para dejar de enviar trafico cuando una dependencia falla, sin reiniciar el pod.
+</Callout>
+
+## Patron Best-Effort: Nunca Bloquear el Flujo Principal
+
+LocalForge aplica un patron de **best-effort** en operaciones no criticas. Si algo falla, se loguea el error pero la app sigue funcionando:
+
+```python
+# Embeddings: best-effort, nunca propagar errores
+try:
+    embedding = await ollama_client.embed([text], model=embed_model)
+    await repository.save_embedding("memories", memory_id, embedding[0])
+except Exception:
+    logger.warning("Failed to embed memory %d", memory_id, exc_info=True)
+    # La app funciona sin embeddings — fallback a busqueda por texto
+```
+
+<Concept title="Best-effort pattern">
+Operaciones que mejoran la experiencia pero no son esenciales (embeddings, calibracion de tokens, tracing) se envuelven en try/except y nunca propagan excepciones. Si fallan, la app funciona en modo degradado. Este patron es clave para resiliencia en produccion.
+</Concept>
+
+## Model Warmup: Evitar Cold Start
+
+Ollama necesita cargar el modelo en memoria la primera vez que se usa. Esto puede tomar 10-30 segundos. LocalForge hace **warmup** al inicio:
+
+```python
+# app/main.py (lifespan)
+try:
+    await asyncio.gather(
+        app.state.ollama_client.embed(
+            ["warmup"], model=settings.embedding_model
+        ),
+        app.state.ollama_client.chat_with_tools(
+            [ChatMessage(role="user", content="hi")],
+            think=False,
+        ),
+    )
+    logger.info("Ollama models warmed up")
+except Exception:
+    logger.warning("Model warmup failed (non-critical)", exc_info=True)
+```
+
+<Callout variant="info" title="Warmup paralelo">
+El warmup corre el modelo de chat y el de embeddings en **paralelo** con `asyncio.gather`. Esto reduce el tiempo de startup a la mitad. Y como es non-critical, un fallo no impide que la app arranque.
+</Callout>
+
+## Timeout Configuration
+
+LocalForge configura un timeout generoso para Ollama porque la inferencia local puede ser lenta:
+
+```python
+# app/main.py
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(600.0, connect=10.0)
+)
+```
+
+- **600 segundos** de timeout general: los modelos grandes pueden tardar minutos en generar respuestas largas
+- **10 segundos** de timeout de conexion: si no se puede conectar a Ollama en 10s, algo esta mal
+
+## Graceful Shutdown
+
+Cuando la app se detiene, hay que esperar a que los mensajes en vuelo terminen de procesarse:
+
+```python
+# app/main.py (lifespan, despues de yield)
+await wait_for_in_flight(timeout=30.0)
+scheduler.shutdown()
+await mcp_manager.cleanup()
+# Shield: proteger cierre de DB/HTTP de cancelaciones
+with anyio.CancelScope(shield=True):
+    await db_conn.close()
+    await http_client.aclose()
+```
+
+<Callout variant="warning" title="CancelScope shield">
+`anyio.CancelScope(shield=True)` protege el cierre de la DB y el cliente HTTP de cancelaciones de anyio. Sin esto, un restart rapido podria dejar conexiones abiertas y causar "address already in use".
+</Callout>
 
 <Quiz
-  question="¿Por qué no se hace retry cuando la API retorna un error 400?"
-  options={["Porque el error 400 indica un problema temporal del servidor", "Porque el error 400 indica un problema en el request (prompt inválido) que no se resuelve reintentando", "Porque el SDK de Anthropic hace retry automático para 400", "Porque 400 significa que se agotó el crédito de la cuenta"]}
+  question="Por que LocalForge no usa streaming con Ollama?"
+  options={["Porque Ollama no soporta streaming", "Porque WhatsApp y Telegram no soportan streaming visual de texto", "Porque streaming es mas lento", "Porque streaming consume mas tokens"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que hace el patron best-effort cuando falla una operacion como generar embeddings?"
+  options={["Reintenta 3 veces con exponential backoff", "Loguea el error y continua — la app funciona sin esa feature", "Envia una alerta al administrador", "Detiene el procesamiento del mensaje"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que se hace warmup de los modelos de Ollama al inicio de la app?"
+  options={["Para verificar que los modelos estan actualizados", "Para evitar un cold start de 10-30 segundos en el primer mensaje de un usuario", "Para calcular el token budget antes de recibir mensajes", "Porque Ollama requiere un warmup obligatorio antes de aceptar requests"]}
   correct={1}
 />

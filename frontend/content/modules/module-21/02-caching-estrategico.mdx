@@ -168,4 +168,15 @@ Si no podés definir claramente cuándo invalidar el cache, no lo implementes. U
   correct={2}
 />
 
+<Quiz
+  question="¿Qué es el patrón compute-once-per-request y cuándo se usa?"
+  options={[
+    "Un cache persistente que guarda resultados entre requests",
+    "Calcular un valor una sola vez durante el request y reutilizarlo en múltiples funciones, como el query_embedding que se usa para buscar memorias y notas",
+    "Una técnica para ejecutar una sola query por request a la base de datos",
+    "Un middleware que cachea la respuesta HTTP completa"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo optimizar SQLite con PRAGMAs y indexes.

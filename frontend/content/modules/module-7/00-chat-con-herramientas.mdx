@@ -9,89 +9,167 @@ xpReward: 50
 En un chat normal, el LLM genera texto. Con **tool calling**, el LLM puede decidir que necesita ejecutar una herramienta para responder. En vez de texto, retorna un `ToolCall` con nombre y argumentos.
 
 <Callout variant="info" title="El LLM no ejecuta nada">
-El LLM solo *decide* qué herramienta usar. WasAP la ejecuta y le devuelve el resultado. El LLM luego genera la respuesta final usando ese resultado.
+El LLM solo *decide* que herramienta usar y con que argumentos. LocalForge ejecuta la herramienta, obtiene el resultado y se lo devuelve al LLM. Recien entonces el LLM genera la respuesta final para el usuario usando ese resultado real.
 </Callout>
 
-## chat_with_tools()
+## Los Modelos de Datos
+
+Antes de ver el flujo, entendamos las estructuras involucradas. LocalForge define dataclasses simples en `app/skills/models.py`:
 
 ```python
-class OllamaClient:
-    async def chat_with_tools(
-        self,
-        messages: list[dict],
-        tools: list[dict],     # Schemas de herramientas disponibles
-        temperature: float = 0.7,
-        think: bool | None = None,
-    ) -> ChatResponse:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "stream": False,
-            "options": {"temperature": temperature},
-        }
+@dataclass
+class ToolCall:
+    name: str                    # Nombre de la herramienta
+    arguments: dict[str, Any]    # Argumentos extraidos por el LLM
 
-        if think is not None:
-            payload["think"] = think
+@dataclass
+class ToolResult:
+    tool_name: str
+    content: str                 # Resultado como string
+    success: bool = True         # False si hubo error
 
-        response = await self._post("/api/chat", payload)
-        return self._parse_response(response)
+@dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any]   # JSON Schema de los parametros
+    handler: Callable[..., Awaitable[str]]  # La funcion async que ejecuta
+    skill_name: str | None = None
 ```
+
+<Concept title="Separacion de concerns">
+`ToolCall` es lo que el LLM *pide*. `ToolResult` es lo que LocalForge *devuelve*. `ToolDefinition` es la *registracion* de la herramienta con su handler. El LLM nunca ve los handlers -- solo los schemas JSON.
+</Concept>
 
 ## ChatResponse: Texto o Tool Calls
 
-```python
-class ChatResponse(BaseModel):
-    content: str | None      # Texto de respuesta (si no hay tools)
-    tool_calls: list[ToolCall] = []  # Herramientas a ejecutar
+El cliente Ollama retorna un `ChatResponse` que puede contener texto, tool calls, o ambos. Definido en `app/llm/client.py`:
 
-# Ejemplo: respuesta con tool call
+```python
+@dataclass
+class ChatResponse:
+    content: str
+    tool_calls: list[dict] | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    model: str | None = None
+    total_duration_ms: float | None = None
+```
+
+Dos escenarios posibles:
+
+```python
+# Escenario 1: El LLM quiere usar una herramienta
 ChatResponse(
-    content=None,
-    tool_calls=[
-        ToolCall(name="get_weather", arguments={"city": "Buenos Aires"})
-    ]
+    content="",
+    tool_calls=[{
+        "function": {
+            "name": "get_weather",
+            "arguments": {"city": "Buenos Aires"}
+        }
+    }]
 )
 
-# Ejemplo: respuesta con texto (sin tools)
-ChatResponse(content="Hola, ¿en qué puedo ayudarte?", tool_calls=[])
+# Escenario 2: El LLM responde directamente (sin tools)
+ChatResponse(content="Hola, en que puedo ayudarte?", tool_calls=None)
 ```
 
-## El Parámetro think
+## chat_with_tools()
 
-<Concept title="think: True | False | None">
-`think=True`: el modelo razona paso a paso antes de responder (chain-of-thought). `think=False`: respuesta directa sin razonamiento. `think=None`: comportamiento default del modelo.
-</Concept>
+Este es el metodo central en `app/llm/client.py` que comunica con la API de Ollama:
 
 ```python
-# ⚠️ REGLA CRÍTICA: think=False cuando hay tools
-# qwen3 con tools + think=True genera outputs rotos
-response = await client.chat_with_tools(
-    messages=messages,
-    tools=tool_schemas,
-    think=False,  # OBLIGATORIO con tools en qwen3
-)
+async def chat_with_tools(
+    self,
+    messages: list[ChatMessage],
+    tools: list[dict] | None = None,
+    model: str | None = None,
+    think: bool | None = None,
+) -> ChatResponse:
+    url = f"{self._base_url}/api/chat"
+    use_model = model or self._model
+
+    payload: dict = {
+        "model": use_model,
+        "messages": self._build_message_dicts(messages),
+        "stream": False,
+    }
+
+    if tools:
+        # think: True es incompatible con tools en qwen3
+        payload["tools"] = tools
+    elif think is False:
+        # Explicit False: skip thinking (clasificacion rapida)
+        payload["think"] = False
+    elif model is None:
+        # Solo habilitar thinking para chat default sin tools
+        payload["think"] = True
+
+    resp = await self._http.post(url, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data["message"]
+    content = msg.get("content", "")
+    tool_calls = msg.get("tool_calls")
+
+    # Strip reasoning blocks: <think>...</think>
+    if content:
+        content = _RE_THINK.sub("", content)
+
+    return ChatResponse(
+        content=content,
+        tool_calls=tool_calls,
+        input_tokens=data.get("prompt_eval_count"),
+        output_tokens=data.get("eval_count"),
+        model=use_model,
+    )
 ```
 
-<Callout variant="error" title="Incompatibilidad qwen3 + tools + think">
-qwen3 con `think=True` y tools genera outputs inconsistentes. WasAP siempre usa `think=False` cuando hay tools en el payload. `think=True` solo se usa para chat puro sin herramientas.
+<Callout variant="warning" title="Logica condicional de think">
+Nota como `think` se maneja de forma condicional: si hay tools, nunca se envia `think`. Si es `False` explicito, se envia para deshabilitar reasoning. Si no se especifica modelo custom, se habilita thinking por defecto. Esta logica evita la incompatibilidad de qwen3.
 </Callout>
 
-## Cuándo Usar think
+## El Parametro think
 
-| Escenario | think | Por qué |
+<Concept title="think: True | False | None">
+`think=True`: el modelo razona paso a paso antes de responder (chain-of-thought). `think=False`: respuesta directa sin razonamiento. `think=None`: comportamiento default del modelo. Cuando hay tools en el payload, thinking se omite automaticamente.
+</Concept>
+
+| Escenario | think | Por que |
 |-----------|-------|---------|
-| Chat con tools | `False` | Incompatibilidad qwen3 |
-| Guardrails (binary) | `False` | Solo necesita sí/no |
-| Summarizer | `False` | Respuesta estructurada |
-| Chat libre sin tools | `True` o `None` | Razonamiento mejora calidad |
+| Chat con tools | *(omitido)* | Incompatibilidad qwen3 + tools + think |
+| Guardrails (binary) | `False` | Solo necesita si/no rapido |
+| Summarizer | `False` | Respuesta estructurada, no reasoning |
+| classify_intent | `False` | Clasificacion rapida sin chain-of-thought |
+| Chat libre sin tools | `True` | Razonamiento mejora calidad |
 | Problemas complejos | `True` | Chain-of-thought ayuda |
 
+<Callout variant="error" title="Incompatibilidad qwen3 + tools + think">
+qwen3 con `think=True` y tools genera outputs inconsistentes -- a veces mezcla reasoning XML con JSON de tool calls. LocalForge resuelve esto automaticamente: cuando `tools` esta presente en el payload, el parametro `think` nunca se incluye.
+</Callout>
+
+## Calibracion de Tokens en Tiempo Real
+
+Un detalle sutil: `chat_with_tools()` aprovecha cada respuesta para calibrar la estimacion de tokens:
+
+```python
+# Runtime calibration: update chars-per-token ratio
+if input_tokens and input_tokens > 0 and not tools:
+    try:
+        from app.context.token_estimator import calibrate
+        prompt_chars = sum(len(d.get("content", "") or "") for d in payload["messages"])
+        calibrate(use_model, prompt_chars, input_tokens)
+    except Exception:
+        pass  # best-effort, never block
+```
+
+Esto permite que el estimador de tokens mejore su precision con el uso real, sin agregar latencia.
+
 <Quiz
-  question="¿Qué retorna chat_with_tools cuando el LLM quiere usar una herramienta?"
+  question="Que retorna chat_with_tools cuando el LLM quiere usar una herramienta?"
   options={[
     "Un string con el nombre de la herramienta",
-    "Un ChatResponse con content=None y tool_calls con la herramienta y argumentos",
+    "Un ChatResponse con content vacio y tool_calls con la herramienta y argumentos",
     "Un error indicando que debe ejecutar el tool",
     "El resultado de la herramienta directamente"
   ]}
@@ -99,14 +177,25 @@ qwen3 con `think=True` y tools genera outputs inconsistentes. WasAP siempre usa 
 />
 
 <Quiz
-  question="¿Por qué se usa think=False cuando hay tools en el payload?"
+  question="Por que se omite el parametro think cuando hay tools en el payload?"
   options={[
-    "Para ahorrar tokens",
+    "Para ahorrar tokens de contexto",
     "Porque qwen3 con think=True y tools genera outputs inconsistentes",
-    "Porque el thinking es incompatible con JSON",
-    "Para mejorar la velocidad de respuesta"
+    "Porque el thinking es incompatible con JSON en general",
+    "Para mejorar la velocidad de respuesta unicamente"
   ]}
   correct={1}
 />
 
-En la siguiente lección veremos el loop completo de ejecución de herramientas.
+<Quiz
+  question="Que hace LocalForge con los bloques <think>...</think> que retorna el LLM?"
+  options={[
+    "Los muestra al usuario como informacion extra",
+    "Los guarda en la base de datos para debugging",
+    "Los elimina con un regex antes de retornar el contenido",
+    "Los envia como metadata al tracing system"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos el loop completo de ejecucion de herramientas.

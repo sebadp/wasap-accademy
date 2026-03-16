@@ -6,32 +6,35 @@ xpReward: 75
 
 ## Niveles de Testing para Skills
 
-Hay 3 niveles de testing para el sistema de skills:
+Hay 3 niveles de testing para el sistema de skills, de menor a mayor complejidad:
 
 <Step number={1} title="Unit: Tool handler directo">
-Llamar la función del handler sin LLM ni executor.
+Llamar la función del handler sin LLM ni executor. Verifica que la lógica de la herramienta funciona correctamente.
 </Step>
 
 <Step number={2} title="Integration: Executor loop">
-Simular el loop LLM → tool → resultado → LLM con mocks.
+Simular el loop completo (LLM -> tool -> resultado -> LLM) con mocks. Verifica que el executor orquesta correctamente.
 </Step>
 
 <Step number={3} title="E2E: Webhook completo">
-Enviar un mensaje por el webhook y verificar que la herramienta se ejecutó.
+Enviar un mensaje por el webhook y verificar que la herramienta se ejecutó y la respuesta llegó.
 </Step>
 
 ## Unit Testing: Handler Directo
 
+El test más simple: registrar el skill, obtener el handler, y llamarlo directamente:
+
 ```python
 # tests/test_calculator.py
-async def test_calculate_basic():
-    from app.skills.tools.calculator_tools import register
+from app.skills.registry import SkillRegistry
+from app.skills.tools.calculator_tools import register
 
+async def test_calculate_basic():
     registry = SkillRegistry()
     register(registry)
 
     handler = registry.get_tool("calculate")
-    result = await handler(expression="2 + 3")
+    result = await handler.handler(expression="2 + 3")
     assert result == "5"
 
 async def test_calculate_sqrt():
@@ -39,26 +42,86 @@ async def test_calculate_sqrt():
     register(registry)
 
     handler = registry.get_tool("calculate")
-    result = await handler(expression="sqrt(144)")
-    assert result == "12.0"
+    result = await handler.handler(expression="sqrt(144)")
+    assert result == "12"
 
-async def test_calculate_unsafe():
-    """Verify dangerous operations are blocked."""
+async def test_calculate_constants():
     registry = SkillRegistry()
     register(registry)
 
     handler = registry.get_tool("calculate")
-    result = await handler(expression="__import__('os').system('rm -rf /')")
-    assert "error" in result.lower()
+    result = await handler.handler(expression="pi")
+    assert "3.14159" in result
 ```
 
 <Callout variant="info" title="asyncio_mode = auto">
-Con `asyncio_mode = "auto"` en pytest.ini, no necesitás `@pytest.mark.asyncio`. Todas las funciones async se ejecutan automáticamente.
+Con `asyncio_mode = "auto"` en pytest.ini, no necesitás `@pytest.mark.asyncio`. Todas las funciones async se ejecutan automáticamente como tests async.
 </Callout>
+
+## Testing de Seguridad: Calculator
+
+El calculator usa AST parsing con whitelist estricta. Hay que verificar que operaciones peligrosas están bloqueadas:
+
+```python
+async def test_calculate_unsafe_import():
+    """Verify __import__ is blocked."""
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler.handler(
+        expression="__import__('os').system('rm -rf /')"
+    )
+    assert "error" in result.lower()
+
+async def test_calculate_unsafe_eval():
+    """Verify nested eval is blocked."""
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler.handler(expression="eval('1+1')")
+    assert "error" in result.lower()
+
+async def test_calculate_division_by_zero():
+    """Verify graceful handling of math errors."""
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler.handler(expression="1/0")
+    assert "error" in result.lower()
+```
+
+<Concept title="AST whitelist: la defensa del calculator">
+El calculator NO usa `eval()`. Usa `ast.parse()` para convertir la expresión en un árbol AST, y luego recorre el árbol evaluando solo nodos permitidos: `ast.Constant`, `ast.BinOp` con operadores en whitelist, y `ast.Call` con funciones en whitelist (sqrt, sin, cos, etc.). Cualquier otro nodo genera `ValueError`.
+</Concept>
+
+La whitelist real del calculator:
+
+```python
+# app/skills/tools/calculator_tools.py
+_ALLOWED_OPERATORS = {
+    ast.Add: operator.add,   ast.Sub: operator.sub,
+    ast.Mult: operator.mul,  ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,   ast.Pow: operator.pow,
+    ast.USub: operator.neg,  ast.UAdd: operator.pos,
+}
+
+_ALLOWED_FUNCTIONS = {
+    "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+    "tan": math.tan, "log": math.log, "log10": math.log10,
+    "abs": abs, "round": round,
+    "ceil": math.ceil, "floor": math.floor,
+}
+
+_ALLOWED_CONSTANTS = {"pi": math.pi, "e": math.e}
+```
 
 ## Integration Testing: Bypass Router
 
-Para testear el executor sin depender del clasificador LLM:
+Para testear el executor sin depender del clasificador LLM, se usa el helper `_bypass_router()`:
 
 ```python
 # tests/test_tool_executor.py
@@ -77,59 +140,151 @@ def _bypass_router(categories: list[str]):
             return_value=["calculate", "get_current_datetime"],
         ),
     ]
+```
 
+<Callout variant="warning" title="Por qué bypass el router">
+El router usa el LLM para clasificar intent. En tests, esto es lento, no determinístico, y requiere Ollama corriendo. Al parchear `classify_intent` y `select_tools`, el executor recibe directamente las categorías y tools sin llamar al LLM.
+</Callout>
+
+Uso en un test de integración:
+
+```python
 async def test_executor_with_calculator(mock_ollama):
     mock_ollama.chat_with_tools.return_value = ChatResponse(
         content=None,
-        tool_calls=[ToolCall(name="calculate", arguments={"expression": "2+2"})],
+        tool_calls=[
+            ToolCall(name="calculate", arguments={"expression": "2+2"})
+        ],
     )
 
     with _bypass_router(["math"]):
         result = await execute_tool_loop(
-            messages=[{"role": "user", "content": "cuanto es 2+2"}],
+            messages=[
+                ChatMessage(role="user", content="cuanto es 2+2")
+            ],
+            ollama_client=mock_ollama,
+            skill_registry=registry,
             pre_classified_categories=["math"],
         )
 ```
 
-<Concept title="_bypass_router()">
-Este helper parchea `classify_intent` y `select_tools` para que no hagan llamadas reales al LLM. Así podés testear la lógica del executor aislada del clasificador.
-</Concept>
-
 ## Mockear OllamaClient
+
+El fixture estándar para mockear el LLM:
 
 ```python
 @pytest.fixture
 def mock_ollama():
     client = AsyncMock(spec=OllamaClient)
-    client.chat.return_value = ChatResponse(content="Resultado: 4")
+    client.chat.return_value = "Resultado: 4"
     client.chat_with_tools.return_value = ChatResponse(
         content="La respuesta es 4",
-        tool_calls=[],
+        tool_calls=[],      # Sin tool calls = respuesta directa
+        input_tokens=100,
+        output_tokens=50,
+        model="qwen3.5:9b",
     )
     return client
 ```
 
-<Callout variant="warning" title="Siempre mockear">
-Nunca llamar a Ollama real en tests. Es lento, no determinístico, y no está disponible en CI. Siempre usar `AsyncMock(spec=OllamaClient)`.
+<Callout variant="warning" title="Siempre mockear Ollama">
+Nunca llamar a Ollama real en tests. Es lento (segundos por llamada), no determinístico (respuestas varían), y no está disponible en CI. Siempre usar `AsyncMock(spec=OllamaClient)`.
 </Callout>
 
-## Qué Testear
+## Testing del Tool Loop Completo
 
-| Aspecto | Test |
-|---------|------|
-| Happy path | Tool con inputs válidos retorna resultado esperado |
-| Input inválido | Tool maneja gracefully inputs incorrectos |
-| Seguridad | Calculator rechaza `eval()`, `import`, `exec` |
-| Edge cases | Strings vacíos, números negativos, Unicode |
-| Timeout | Tools que hacen I/O (weather, search) respetan timeout |
+El executor tiene un loop de hasta `MAX_TOOL_ITERATIONS=5` iteraciones. Un test puede simular múltiples rondas:
+
+```python
+async def test_executor_multi_iteration(mock_ollama, registry):
+    """Test that executor handles multiple tool call rounds."""
+    # Primera iteración: LLM pide un tool
+    # Segunda iteración: LLM responde con texto
+    mock_ollama.chat_with_tools.side_effect = [
+        ChatResponse(
+            content=None,
+            tool_calls=[{"function": {"name": "calculate",
+                         "arguments": {"expression": "2+2"}}}],
+        ),
+        ChatResponse(
+            content="2 + 2 = 4",
+            tool_calls=[],  # Sin más tool calls
+        ),
+    ]
+
+    result = await execute_tool_loop(
+        messages=[ChatMessage(role="user", content="2+2")],
+        ollama_client=mock_ollama,
+        skill_registry=registry,
+        pre_classified_categories=["math"],
+    )
+    assert "4" in result
+```
+
+## Qué Testear en Cada Nivel
+
+| Nivel | Aspecto | Ejemplo |
+|-------|---------|---------|
+| **Unit** | Happy path | calculate("2+3") == "5" |
+| **Unit** | Input inválido | calculate("abc") contiene "error" |
+| **Unit** | Seguridad | calculate("__import__('os')") bloqueado |
+| **Unit** | Edge cases | Strings vacíos, números negativos, Unicode |
+| **Integration** | Tool loop | LLM -> tool call -> resultado -> respuesta |
+| **Integration** | Multi-round | 2+ iteraciones del tool loop |
+| **Integration** | Error recovery | Tool falla -> LLM recibe error -> se adapta |
+| **E2E** | Webhook | POST /webhook -> procesa -> tool ejecutado |
+
+## Testing del Converter que Creamos
+
+Apliquemos lo aprendido al skill converter de la lección anterior:
+
+```python
+# tests/test_converter.py
+from app.skills.registry import SkillRegistry
+from app.skills.tools.converter_tools import register
+
+async def test_convert_km_to_miles():
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("convert_units")
+    result = await handler.handler(
+        value=100, from_unit="km", to_unit="miles"
+    )
+    assert "62.14" in result
+
+async def test_convert_unsupported():
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("convert_units")
+    result = await handler.handler(
+        value=100, from_unit="km", to_unit="parsecs"
+    )
+    assert "no soportada" in result.lower() or "soportadas" in result.lower()
+
+async def test_convert_case_insensitive():
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("convert_units")
+    result = await handler.handler(
+        value=0, from_unit="Celsius", to_unit="Fahrenheit"
+    )
+    assert "32" in result  # 0°C = 32°F
+```
+
+<Concept title="Patrón de test para skills">
+Siempre seguir el mismo patrón: crear registry -> registrar skill -> obtener handler -> llamar handler -> assert resultado. Este patrón es consistente en todo el codebase de LocalForge y facilita agregar tests para skills nuevos.
+</Concept>
 
 <Quiz
   question="¿Qué hace _bypass_router() en los tests?"
   options={[
-    "Desactiva el router completamente",
+    "Desactiva el router completamente y usa todos los tools",
     "Parchea classify_intent y select_tools para evitar llamadas reales al LLM",
-    "Conecta directamente al LLM sin pasar por el router",
-    "Simula errores del router"
+    "Conecta directamente al LLM real sin pasar por el router",
+    "Simula errores del router para testing de fallbacks"
   ]}
   correct={1}
 />
@@ -137,12 +292,23 @@ Nunca llamar a Ollama real en tests. Es lento, no determinístico, y no está di
 <Quiz
   question="¿Por qué siempre se mockea OllamaClient en tests?"
   options={[
-    "Porque Ollama es de pago",
+    "Porque Ollama es un servicio de pago",
     "Porque es lento, no determinístico, y no está disponible en CI",
-    "Porque el mock es más preciso",
-    "Porque Ollama no soporta tests"
+    "Porque el mock es más preciso que el LLM real",
+    "Porque Ollama no tiene una API de testing"
   ]}
   correct={1}
 />
 
-Has completado el módulo Skills Framework. Ahora podés crear, registrar y testear herramientas para el LLM.
+<Quiz
+  question="¿Cuántas iteraciones máximas tiene el tool calling loop del executor?"
+  options={[
+    "3 iteraciones",
+    "5 iteraciones (MAX_TOOL_ITERATIONS)",
+    "10 iteraciones",
+    "No tiene límite, itera hasta que el LLM responda con texto"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Skills Framework. Ahora podés crear, registrar y testear herramientas para el LLM siguiendo los patrones reales de LocalForge.

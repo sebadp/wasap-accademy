@@ -4,107 +4,188 @@ description: "Búsqueda por similitud semántica en sqlite-vec"
 xpReward: 100
 ---
 
-## Búsqueda Semántica
+## Búsqueda Semántica vs Keyword
 
-En vez de buscar por palabras clave (LIKE '%python%'), buscamos por **significado**. "Lenguaje de programación" encontraría memorias sobre "Python developer" aunque no compartan palabras.
+En una búsqueda tradicional por keywords (`WHERE content LIKE '%python%'`), solo encontrás textos que contengan la palabra exacta. Con búsqueda semántica, encontrás textos con **significado similar**. "¿Cómo iba el deploy?" encuentra memorias sobre "Docker Compose en producción" aunque no compartan palabras.
+
+<Concept title="MATCH en sqlite-vec">
+La cláusula `MATCH` es la sintaxis especial de sqlite-vec para búsqueda vectorial. Internamente calcula la distancia L2 entre el query vector y todos los vectores almacenados, retornando los más cercanos. El resultado incluye una columna `distance` automática.
+</Concept>
+
+## search_similar_memories_with_distance()
+
+Este es el método principal de búsqueda semántica para memorias:
 
 ```python
+# app/database/repository.py
 async def search_similar_memories_with_distance(
-    self,
-    phone_number: str,
-    query_vector: list[float],
-    top_k: int = 10,
-    threshold: float = 1.0,
+    self, embedding: list[float], top_k: int = 10
 ) -> list[tuple[str, float]]:
-    blob = struct.pack(f"{len(query_vector)}f", *query_vector)
+    """Return (content, distance) pairs sorted by distance.
 
-    cursor = await self.conn.execute("""
-        SELECT m.content, v.distance
-        FROM vec_memories v
-        JOIN memories m ON m.id = v.memory_id
-        WHERE v.embedding MATCH ?
-          AND m.phone_number = ?
-          AND m.active = 1
-          AND v.distance < ?
-        ORDER BY v.distance
-        LIMIT ?
-    """, (blob, phone_number, threshold, top_k))
-
-    return [(row[0], row[1]) for row in await cursor.fetchall()]
+    Uses L2 distance from sqlite-vec. Lower distance = more similar.
+    """
+    blob = self._serialize_vector(embedding)
+    cursor = await self._conn.execute(
+        "SELECT m.content, v.distance FROM vec_memories v "
+        "JOIN memories m ON m.id = v.memory_id "
+        "WHERE m.active = 1 AND v.embedding MATCH ? AND k = ? "
+        "ORDER BY distance",
+        (blob, top_k),
+    )
+    rows = await cursor.fetchall()
+    return [(r[0], float(r[1])) for r in rows]
 ```
 
-<Concept title="embedding MATCH ?">
-Esta es la sintaxis especial de sqlite-vec. `MATCH` busca los vectores más cercanos al query vector usando distancia L2. El resultado incluye una columna `distance`.
-</Concept>
+<Callout variant="info" title="JOIN con tabla regular">
+La query hace JOIN entre `vec_memories` (tabla virtual con vectores) y `memories` (tabla regular con el texto). Esto permite filtrar solo memorias activas (`active = 1`) mientras se busca por similitud vectorial.
+</Callout>
+
+## search_similar_notes()
+
+Para notas, la búsqueda retorna objetos `Note` completos:
+
+```python
+# app/database/repository.py
+async def search_similar_notes(
+    self, embedding: list[float], top_k: int = 5
+) -> list[Note]:
+    blob = self._serialize_vector(embedding)
+    cursor = await self._conn.execute(
+        "SELECT n.id, n.title, n.content, n.created_at FROM vec_notes v "
+        "JOIN notes n ON n.id = v.note_id "
+        "WHERE v.embedding MATCH ? AND k = ? "
+        "ORDER BY distance",
+        (blob, top_k),
+    )
+    rows = await cursor.fetchall()
+    return [Note(id=r[0], title=r[1], content=r[2], created_at=r[3]) for r in rows]
+```
 
 ## Parámetros Clave
 
 | Parámetro | Default | Significado |
 |-----------|---------|-------------|
-| `top_k` | 10 | Máximo de resultados |
-| `threshold` | 1.0 | Distancia L2 máxima |
-| `query_vector` | 768 floats | El embedding de la pregunta del usuario |
+| `embedding` | 768 floats | El embedding del query del usuario, calculado previamente |
+| `top_k` | 10 (memorias) / 5 (notas) | Máximo de resultados a retornar |
+| `k = ?` en SQL | Igual a top_k | Parámetro de sqlite-vec para limitar resultados |
+| `distance` | Columna automática | Distancia L2 calculada por sqlite-vec (menor = más similar) |
 
 ```python
-# Threshold 1.0 es un buen balance:
-# < 0.5: solo matches muy cercanos (puede perder resultados relevantes)
-# 1.0: balance entre precisión y recall
-# > 1.5: incluye matches débiles (puede traer ruido)
+# En config.py, estos valores controlan la búsqueda:
+semantic_search_top_k: int = 10        # Máximo de resultados
+memory_similarity_threshold: float = 1.0  # Distancia L2 máxima aceptada
 ```
+
+<Concept title="Threshold con fallback inteligente">
+En `ConversationContext.build()`, si ninguna memoria pasa el threshold (distancia menor a 1.0), se toman las 3 más cercanas como fallback. Esto evita que el contexto quede vacío cuando el threshold es demasiado estricto para un query particular.
+</Concept>
+
+## Threshold Filtering en ConversationContext
+
+El threshold no se aplica en la query SQL sino en Python, para poder implementar el fallback:
+
+```python
+# app/context/conversation_context.py — dentro de build()
+async def _get_memories_with_threshold(
+    embedding: list[float] | None,
+) -> tuple[list[str], dict]:
+    stats = {"search_mode": "full_fallback", "memories_retrieved": 0}
+
+    if embedding is not None and settings is not None:
+        results = await repository.search_similar_memories_with_distance(
+            embedding, top_k=settings.semantic_search_top_k,
+        )
+        stats["memories_retrieved"] = len(results)
+
+        threshold = settings.memory_similarity_threshold
+        passed = [content for content, dist in results if dist < threshold]
+
+        if not passed and results:
+            # Fallback: nada pasó el threshold → tomar las 3 más cercanas
+            passed = [content for content, _ in results[:3]]
+            stats["search_mode"] = "fallback_threshold"
+        else:
+            stats["search_mode"] = "semantic"
+
+        return passed, stats
+
+    # Sin embedding → fallback a búsqueda por recencia
+    memories = await repository.get_active_memories(limit=top_k)
+    return memories, stats
+```
+
+<Callout variant="tip" title="Tres modos de búsqueda">
+1. **semantic**: embedding disponible, memorias pasan el threshold -- el caso ideal
+2. **fallback_threshold**: embedding disponible pero ninguna memoria está suficientemente cerca -- se toman las 3 mejores
+3. **full_fallback**: sin embedding (Ollama no disponible o vec deshabilitado) -- últimas N memorias por recencia
+</Callout>
 
 ## Query Embedding: Calcular Una Vez, Usar Varias
 
+El embedding del mensaje del usuario se calcula **una sola vez** y se reutiliza para todas las búsquedas:
+
 ```python
-# En Phase A del critical path
-query_embedding = await ollama_client.embed(user_message)
+# app/context/conversation_context.py — dentro de build()
 
-# En Phase B: reusar el mismo embedding
-memories = await repository.search_similar_memories_with_distance(
-    phone, query_embedding, top_k=10
+# Step 1: get query embedding (una sola llamada a Ollama)
+query_embedding = await _get_query_embedding()
+
+# Step 2: parallel fetches usando el MISMO embedding
+memories_and_stats, windowed, sticky, logs, relevant_notes = await asyncio.gather(
+    _get_memories_with_threshold(query_embedding),   # usa query_embedding
+    conversation_manager.get_windowed_history(...),
+    repository.get_sticky_categories(conv_id),
+    _get_daily_logs(),
+    _get_relevant_notes(query_embedding),            # usa query_embedding
 )
-notes = await repository.search_similar_notes(
-    phone, query_embedding, top_k=5
-)
+# También se usa para project notes:
+project_notes = await _get_project_notes(query_embedding, active_projects)
 ```
-
-<Callout variant="tip" title="Calcular una vez">
-El embedding del mensaje del usuario se calcula en Phase A y se reutiliza en Phase B para buscar memorias Y notas. Una sola llamada a Ollama, dos búsquedas.
-</Callout>
 
 ## Fallback sin sqlite-vec
 
+Si sqlite-vec no está disponible, la app sigue funcionando con búsqueda por recencia:
+
 ```python
-if vec_available:
-    memories = await repository.search_similar_memories_with_distance(
-        phone, embedding, top_k=settings.semantic_search_top_k
-    )
-else:
-    # Fallback: todas las memorias activas, limitadas
-    memories = await repository.get_active_memories(
-        phone, limit=settings.semantic_search_top_k
-    )
+# Si vec_available es False en ConversationContext.build(), _get_query_embedding()
+# retorna None, y _get_memories_with_threshold() toma el path de full_fallback:
+if embedding is None:
+    memories = await repository.get_active_memories(limit=top_k)
+    # Retorna las últimas N memorias ordenadas por fecha
 ```
 
 <Quiz
   question="¿Qué significa un threshold de 1.0 en búsqueda vectorial?"
   options={[
     "Solo retorna resultados exactos",
-    "Solo retorna memorias con distancia L2 menor a 1.0 (similares)",
-    "Retorna todos los resultados",
-    "Busca en 100% de la base de datos"
+    "Solo retorna memorias con distancia L2 menor a 1.0 (suficientemente similares)",
+    "Retorna todos los resultados sin filtrar",
+    "Busca en el 100% de la base de datos"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Cuántas veces se calcula el embedding del mensaje del usuario?"
+  question="¿Cuántas veces se calcula el embedding del mensaje del usuario por request?"
   options={[
-    "Una vez por cada búsqueda",
-    "Una sola vez en Phase A, reutilizado en Phase B para memorias y notas",
+    "Una vez por cada búsqueda (memorias, notas, project notes)",
+    "Una sola vez, reutilizado para memorias, notas, y project notes",
     "Dos veces: una para memorias, otra para notas",
-    "No se calcula, se usa el texto directo"
+    "No se calcula, sqlite-vec lo hace internamente"
   ]}
   correct={1}
 />
 
-En la siguiente lección veremos el patrón best-effort y backfill.
+<Quiz
+  question="¿Qué pasa si ninguna memoria pasa el threshold de similitud?"
+  options={[
+    "Se retorna una lista vacía y el LLM no recibe memorias",
+    "Se baja automáticamente el threshold a 2.0",
+    "Se toman las 3 memorias más cercanas como fallback",
+    "Se buscan memorias por keyword en vez de por embedding"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos el patrón best-effort y el sistema de backfill.

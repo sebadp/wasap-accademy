@@ -1,125 +1,224 @@
 ---
-title: "Ejecución Paralela de Tools"
+title: "Ejecucion Paralela de Tools"
 description: "asyncio.gather para tool calls y caching de tool maps"
 xpReward: 75
 ---
 
-## Múltiples Tools en una Iteración
+## Multiples Tools en una Iteracion
 
-El LLM puede pedir **varias herramientas a la vez**. Por ejemplo: "¿Qué hora es en Tokyo y qué clima hace en Buenos Aires?" genera dos tool calls simultáneos.
+El LLM puede pedir **varias herramientas a la vez**. Por ejemplo: "Que hora es en Tokyo y que clima hace en Buenos Aires?" genera dos tool calls simultaneos.
 
 <Callout variant="info" title="Paralelo, no secuencial">
-Si el LLM pide 3 tools, WasAP las ejecuta en paralelo con `asyncio.gather`. Esto reduce la latencia de 3×T a ~1×T.
+Si el LLM pide 3 tools, LocalForge las ejecuta en paralelo con `asyncio.gather`. Esto reduce la latencia de 3*T a ~1*T (el maximo de las tres).
 </Callout>
 
-## _run_tool_call()
+## Separacion: Meta-tools vs Tools Regulares
+
+Dentro del loop, LocalForge primero separa los tool calls en dos grupos:
+
+```python
+# Separar meta-tool calls de tool calls regulares
+meta_indices = [
+    i for i, tc in enumerate(response.tool_calls)
+    if tc.get("function", {}).get("name") == REQUEST_MORE_TOOLS_NAME
+]
+regular_indices = [
+    i for i, tc in enumerate(response.tool_calls)
+    if tc.get("function", {}).get("name") != REQUEST_MORE_TOOLS_NAME
+]
+```
+
+<Concept title="Por que separar meta-tools?">
+`request_more_tools` no es una herramienta normal -- modifica el pool de herramientas disponibles. Se maneja inline sin pasar por el security policy engine ni el audit trail. Los tools regulares si pasan por la cadena completa de seguridad.
+</Concept>
+
+## _run_tool_call(): Ejecucion Individual
+
+Cada tool call pasa por `_run_tool_call`, que integra seguridad, tracing, compactacion y fallbacks:
 
 ```python
 async def _run_tool_call(
-    tool_call: ToolCall,
-    tools_map: dict[str, ToolHandler],
-) -> ToolResult:
-    handler = tools_map.get(tool_call.name)
-    if not handler:
-        return ToolResult(
-            tool_name=tool_call.name,
-            content=f"Unknown tool: {tool_call.name}",
-            success=False,
-        )
+    tc: dict,
+    skill_registry: SkillRegistry,
+    mcp_manager: McpManager | None,
+    ollama_client: OllamaClient,
+    user_message: str,
+    hitl_callback: Callable | None = None,
+    parent_span_id: str | None = None,
+) -> ChatMessage:
+    func = tc.get("function", {})
+    tool_name = func.get("name", "")
+    arguments = func.get("arguments", {})
 
-    try:
-        result = await handler(**tool_call.arguments)
-        return ToolResult(
-            tool_name=tool_call.name,
-            content=str(result),
-            success=True,
-        )
-    except Exception as e:
-        return ToolResult(
-            tool_name=tool_call.name,
-            content=f"Error: {e}",
-            success=False,
-        )
+    # 1. Cargar instrucciones del skill (lazy, primera vez)
+    instructions = skill_registry.get_skill_instructions(tool_name)
+
+    # 2. Evaluar politica de seguridad
+    policy = await get_policy_engine()
+    decision = policy.evaluate(tool_name, arguments)
+
+    if decision.is_blocked:
+        return ChatMessage(role="tool", content=f"POLICY BLOCK: {decision.reason}")
+
+    if decision.requires_flag:
+        # HITL: pedir aprobacion del usuario
+        if hitl_callback:
+            approved = await hitl_callback(tool_name, arguments, decision.reason)
+            if not approved:
+                return ChatMessage(role="tool", content="Execution denied by user.")
+        else:
+            return ChatMessage(role="tool", content="Flagged but no HITL provided.")
+
+    # 3. Ejecutar (local skill o MCP)
+    tool_call = ToolCall(name=tool_name, arguments=arguments)
+    if mcp_manager and mcp_manager.has_tool(tool_name):
+        result = await mcp_manager.execute_tool(tool_call)
+    else:
+        result = await skill_registry.execute_tool(tool_call)
+
+    # 4. Compactar output si es muy grande
+    final_content = await compact_tool_output(
+        tool_name=tool_name,
+        text=result.content,
+        user_request=user_message,
+        ollama_client=ollama_client,
+    )
+
+    # 5. Prepend instrucciones del skill (solo primera vez)
+    if instructions:
+        final_content = f"{instructions}\n\nResult:\n{final_content}"
+
+    return ChatMessage(role="tool", content=final_content)
 ```
 
-## Ejecución Paralela con asyncio.gather
+<Callout variant="tip" title="Pipeline de 5 pasos por tool call">
+Cada herramienta pasa por: **instrucciones** (lazy-load) -> **seguridad** (policy engine) -> **ejecucion** (local/MCP) -> **compactacion** (si es grande) -> **enriquecimiento** (instrucciones del skill).
+</Callout>
+
+## Ejecucion Paralela con asyncio.gather
+
+Los tool calls regulares se ejecutan todos en paralelo:
 
 ```python
-async def _execute_tool_calls(
-    tool_calls: list[ToolCall],
-    tools_map: dict[str, ToolHandler],
-) -> list[ToolResult]:
-    tasks = [
-        _run_tool_call(tc, tools_map)
-        for tc in tool_calls
-    ]
-    # Todas las tools corren en paralelo
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+if regular_indices:
+    regular_results = await asyncio.gather(
+        *[
+            _run_tool_call(
+                response.tool_calls[i],
+                skill_registry,
+                mcp_manager,
+                ollama_client,
+                user_message,
+                hitl_callback,
+                parent_span_id=iteration_span_id,
+            )
+            for i in regular_indices
+        ]
+    )
+    for i, msg in zip(regular_indices, regular_results, strict=True):
+        tool_result_map[i] = msg
 
-    # Convertir excepciones en ToolResults de error
-    return [
-        r if isinstance(r, ToolResult)
-        else ToolResult(tool_name="unknown", content=str(r), success=False)
-        for r in results
-    ]
+# Mantener orden original
+working_messages.extend(tool_result_map[i] for i in sorted(tool_result_map))
 ```
 
-<Concept title="asyncio.gather con return_exceptions">
-`return_exceptions=True` evita que una excepción en un tool cancele los demás. Cada resultado es independiente — un error en weather no afecta a datetime.
+<Concept title="Preservar orden original">
+Los resultados se reordenan segun el indice original del tool call. Si el LLM pidio `[weather, datetime]`, los resultados se devuelven en ese orden, sin importar cual termino primero. Esto es critico para que el LLM pueda correlacionar cada resultado con su tool call.
 </Concept>
+
+## Fallback: Puppeteer a mcp-fetch
+
+Si un tool de Puppeteer (browser automation) falla, LocalForge intenta automaticamente con mcp-fetch (HTTP plano):
+
+```python
+if not result.success and tool_name.startswith("puppeteer_") and mcp_manager:
+    mcp_fetch_tools = {
+        name for name, tool in mcp_manager.get_tools().items()
+        if tool.skill_name == "mcp::mcp-fetch"
+    }
+    if mcp_fetch_tools:
+        url = arguments.get("url") or arguments.get("name", "")
+        fallback_name = next(
+            (t for t in ("fetch_markdown", "fetch", "fetch_txt")
+             if t in mcp_fetch_tools),
+            None,
+        )
+        if fallback_name:
+            fallback_call = ToolCall(name=fallback_name, arguments={"url": url})
+            fallback_result = await mcp_manager.execute_tool(fallback_call)
+```
+
+<Callout variant="warning" title="Fallback transparente">
+El usuario no sabe que hubo un fallback. El resultado incluye un prefijo de advertencia para el LLM, pero la respuesta final es coherente. Este patron de "degradacion elegante" es comun en sistemas de produccion.
+</Callout>
 
 ## Tool Map Caching
 
-Construir el mapa de tools (nombre → handler) es costoso si hay 60+ tools. WasAP lo cachea a nivel de módulo:
+Construir el mapa de tools (nombre a schema) es costoso si hay 60+ tools. LocalForge lo cachea a nivel de modulo:
 
 ```python
-_cached_tools_map: dict[str, ToolHandler] | None = None
+_cached_tools_map: dict[str, dict] | None = None
 
-def _get_cached_tools_map(registry: SkillRegistry) -> dict[str, ToolHandler]:
+def _get_cached_tools_map(
+    skill_registry: SkillRegistry,
+    mcp_manager: McpManager | None,
+) -> dict[str, dict]:
     global _cached_tools_map
     if _cached_tools_map is None:
-        _cached_tools_map = _build_tools_map(registry)
+        _cached_tools_map = _build_tools_map(skill_registry, mcp_manager)
     return _cached_tools_map
-```
 
-<Callout variant="tip" title="Invalidación">
-El cache se invalida cuando se agrega un nuevo MCP server via hot-reload. Se setea `_cached_tools_map = None` y se reconstruye en la próxima llamada.
-</Callout>
+def reset_tools_cache() -> None:
+    """Invalidar cache tras hot-add de MCP servers o reload de skills."""
+    global _cached_tools_map
+    _cached_tools_map = None
+```
 
 ## Impacto en Latencia
 
 ```
-Sin paralelización (secuencial):
-  get_weather(Buenos Aires)  → 500ms
-  get_current_datetime()     → 50ms
-  web_search("noticias")     → 800ms
+Sin paralelizacion (secuencial):
+  get_weather(Buenos Aires)  -> 500ms
+  get_current_datetime()     -> 50ms
+  web_search("noticias")     -> 800ms
   Total: 1350ms
 
 Con asyncio.gather (paralelo):
-  get_weather + datetime + search → max(500, 50, 800) = 800ms
-  Total: 800ms  (40% más rápido)
+  get_weather + datetime + search -> max(500, 50, 800) = 800ms
+  Total: 800ms  (40% mas rapido)
 ```
 
 <Quiz
-  question="¿Qué hace return_exceptions=True en asyncio.gather?"
+  question="Que hace return_exceptions=True en asyncio.gather (que usa el SkillRegistry)?"
   options={[
-    "Ignora todas las excepciones",
-    "Retorna las excepciones como valores en vez de propagarlas, para que un error no cancele los demás",
-    "Lanza todas las excepciones al final",
-    "Reintenta las tareas que fallaron"
+    "Ignora todas las excepciones silenciosamente",
+    "Retorna las excepciones como valores en vez de propagarlas, para que un error no cancele los demas",
+    "Lanza todas las excepciones juntas al final",
+    "Reintenta las tareas que fallaron automaticamente"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Cuándo se invalida el cache de _cached_tools_map?"
+  question="Por que se separan meta-tools de tools regulares antes de ejecutar?"
   options={[
-    "Cada 5 minutos",
-    "En cada request",
-    "Cuando se agrega un nuevo MCP server via hot-reload",
-    "Nunca se invalida"
+    "Porque los meta-tools son mas lentos",
+    "Porque request_more_tools modifica el pool de herramientas y no pasa por el security policy engine",
+    "Porque los meta-tools se ejecutan en un proceso aparte",
+    "No se separan, se ejecutan todos juntos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Cuando se invalida el cache de _cached_tools_map?"
+  options={[
+    "Cada 5 minutos automaticamente",
+    "En cada request HTTP entrante",
+    "Cuando se agrega/remueve un MCP server o se hace reload de skills",
+    "Nunca se invalida, es permanente"
   ]}
   correct={2}
 />
 
-En la siguiente lección veremos cómo se limpian los resultados de tools anteriores.
+En la siguiente leccion veremos como se limpian los resultados de tools anteriores.

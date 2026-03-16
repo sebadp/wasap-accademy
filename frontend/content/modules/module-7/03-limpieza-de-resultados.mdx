@@ -6,115 +6,212 @@ xpReward: 75
 
 ## El Problema: Tool Outputs se Acumulan
 
-En cada iteración del loop, los tool results se agregan al historial de mensajes. Después de 3-4 iteraciones, el historial puede tener miles de tokens solo en tool outputs.
+En cada iteracion del loop, los tool results se agregan al historial de mensajes. Despues de 3-4 iteraciones, el historial puede tener miles de tokens solo en tool outputs.
 
 ```
-Iteración 1: web_search → 2000 chars de resultados
-Iteración 2: get_weather → 500 chars
-Iteración 3: web_search de nuevo → 2000 chars más
+Iteracion 1: web_search -> 2000 chars de resultados
+Iteracion 2: get_weather -> 500 chars
+Iteracion 3: web_search de nuevo -> 2000 chars mas
 Total tool outputs: 4500 chars (~1125 tokens)
 ```
 
 <Callout variant="warning" title="Presupuesto de contexto">
-Cada token gastado en tool outputs viejos es un token menos para historial, memorias y el system prompt. La limpieza es crítica para la calidad de las respuestas.
+Cada token gastado en tool outputs viejos es un token menos para historial, memorias y el system prompt. El modelo qwen3.5:9b tiene un contexto de 32K tokens. La limpieza es critica para la calidad de las respuestas.
 </Callout>
 
 ## _clear_old_tool_results()
 
+La implementacion real en `app/skills/executor.py` usa un patron recomendado por Anthropic -- **tool result clearing**:
+
 ```python
 def _clear_old_tool_results(
-    messages: list[dict],
-    keep_last: int = 1,
-) -> list[dict]:
-    """Reemplaza tool results de iteraciones anteriores con placeholder."""
-    tool_indices = [
-        i for i, m in enumerate(messages)
-        if m.get("role") == "tool"
-    ]
+    messages: list[ChatMessage],
+    keep_last_n: int = 2,
+) -> None:
+    """Replace old tool results with compact summaries.
 
-    # Mantener solo los últimos 'keep_last' grupos
-    to_clear = tool_indices[:-keep_last] if keep_last else tool_indices
+    Keeps the last `keep_last_n` tool messages intact (most recent).
+    Once a raw API response is processed, there's no reason to keep
+    it verbatim -- the LLM already "vio" esos resultados.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.role == "tool"]
 
-    for idx in to_clear:
-        messages[idx]["content"] = "[Previous tool result cleared]"
+    if len(tool_indices) <= keep_last_n:
+        return  # No hay suficientes resultados para limpiar
 
-    return messages
+    for idx in tool_indices[:-keep_last_n]:
+        old_content = messages[idx].content
+        first_line = old_content.split("\n")[0][:120].strip()
+        messages[idx] = ChatMessage(
+            role="tool",
+            content=f"[Previous result processed -- summary: {first_line}]",
+        )
 ```
 
-<Concept title="Solo los últimos resultados importan">
-El LLM ya "vio" los resultados de iteraciones anteriores cuando decidió pedir más tools. No necesita verlos de nuevo — solo necesita los resultados de la iteración actual.
+<Concept title="Clearing vs Truncation">
+LocalForge no simplemente trunca -- extrae la primera linea (hasta 120 chars) como *summary* del resultado viejo. Esto le da al LLM un recordatorio minimo de lo que habia, sin gastar tokens en el contenido completo.
 </Concept>
 
-## Cuándo se Ejecuta
+## Cuando se Ejecuta
+
+La limpieza ocurre **despues de cada ronda** de tool calls, antes de la siguiente llamada al LLM:
 
 ```python
-# Dentro del execute_tool_loop
-for iteration in range(max_iterations):
-    # Limpiar resultados viejos antes de la siguiente llamada al LLM
-    if iteration > 0:
-        _clear_old_tool_results(messages)
+for iteration in range(MAX_TOOL_ITERATIONS):
+    response = await ollama_client.chat_with_tools(working_messages, tools=tools)
 
-    response = await ollama_client.chat_with_tools(...)
+    if not response.tool_calls:
+        return response.content
+
+    # Ejecutar tools y agregar resultados
+    working_messages.append(ChatMessage(role="assistant", ...))
+    working_messages.extend(tool_result_map[i] for i in sorted(tool_result_map))
+
+    # Limpiar resultados viejos DESPUES de agregarlos
+    _clear_old_tool_results(working_messages, keep_last_n=2)
 ```
 
-## Compactación JSON (para outputs grandes)
+<Callout variant="tip" title="keep_last_n=2">
+Se mantienen los ultimos 2 resultados intactos, no solo 1. Esto ayuda cuando el LLM necesita correlacionar el resultado actual con el inmediatamente anterior (por ejemplo, comparar datos de dos busquedas).
+</Callout>
 
-Para outputs individuales que son JSON grandes, WasAP aplica compactación de 3 niveles:
+## Compactacion JSON (para outputs individuales grandes)
+
+Antes de que un resultado llegue al loop, cada tool output individual pasa por `compact_tool_output` en `app/formatting/compaction.py`. La estrategia tiene 4 niveles:
+
+<Step number={1} title="Verificar tamano">
+Si el output es menor al threshold (20,000 chars por defecto), no se toca:
 
 ```python
-async def _maybe_compact(result: ToolResult, budget: int = 1000) -> str:
-    content = result.content
-    if len(content) <= budget:
-        return content  # Ya es corto, no tocar
+if len(text) <= max_length:
+    return text  # Ya es corto, no tocar
+```
+</Step>
 
-    # Intentar compactar
-    return await compact_tool_output(content, budget)
+<Step number={2} title="Extraccion JSON (sin LLM)">
+Si el output es JSON parseable, se extraen solo los campos clave de forma deterministica:
+
+```python
+_JSON_KEY_FIELDS = [
+    "name", "full_name", "id", "number", "title",
+    "description", "html_url", "url", "state",
+    "created_at", "language", "body", "content", "path",
+]
+
+def _try_json_extraction(text: str, max_length: int) -> str | None:
+    data = json.loads(text)
+    # GitHub Search API: {"total_count": N, "items": [...]}
+    if isinstance(data, dict) and "items" in data:
+        return _extract_item_list(data["items"], max_length)
+    # Lista directa: [{"name": "repo1"}, ...]
+    if isinstance(data, list) and isinstance(data[0], dict):
+        return _extract_item_list(data, max_length)
+    # Objeto unico: filtrar campos clave
+    if isinstance(data, dict):
+        compact = _pick_fields(data)
+        return json.dumps(compact, indent=2)
+```
+</Step>
+
+<Step number={3} title="Compactacion LLM">
+Si la extraccion JSON no funciona (texto plano, HTML, etc.), el LLM resume el contenido:
+
+```python
+prompt = (
+    f"The tool '{tool_name}' returned {len(text)} characters.\n"
+    f"The user's request was: \"{user_request}\"\n\n"
+    "Summarize, extracting ONLY fields that answer the user's request.\n"
+    "CRITICAL RULES:\n"
+    "1. PRESERVE EXACT names, IDs, URLs -- NEVER substitute with [placeholder].\n"
+    "2. Discard metadata not useful for answering the request.\n"
+)
+summary = await ollama_client.chat(messages, think=False)
 ```
 
-## Antes y Después
+<Callout variant="error" title="Riesgo de alucinacion">
+El prompt incluye reglas estrictas para que el LLM no reemplace nombres reales con placeholders como `[repo-name]`. Esta regla se agrego despues de detectar que el LLM cambiaba "localforge-assistant" por "[repository]" durante la compactacion.
+</Callout>
+</Step>
+
+<Step number={4} title="Truncado hard (ultimo recurso)">
+Si el LLM falla o retorna vacio, se hace un corte directo:
+
+```python
+except Exception as e:
+    logger.error("LLM compaction failed: %s", e)
+    return text[:max_length] + "\n...[truncated]"
+```
+</Step>
+
+## Antes y Despues
 
 ```
-ANTES (sin limpieza, iteración 3):
+ANTES (sin limpieza, iteracion 3):
 messages = [
     {role: user, content: "busca noticias de Argentina y el clima"},
     {role: assistant, tool_calls: [search("argentina"), weather("BA")]},
-    {role: tool, content: "... 2000 chars de búsqueda ..."},        ← viejo
-    {role: tool, content: "... 500 chars de clima ..."},             ← viejo
-    {role: assistant, tool_calls: [search("argentina economía")]},
-    {role: tool, content: "... 2000 chars más ..."},                 ← actual
+    {role: tool, content: "... 2000 chars de busqueda ..."},        <-- viejo
+    {role: tool, content: "... 500 chars de clima ..."},             <-- viejo
+    {role: assistant, tool_calls: [search("argentina economia")]},
+    {role: tool, content: "... 2000 chars mas ..."},                 <-- actual
 ]
 
-DESPUÉS (con limpieza):
+DESPUES (con limpieza):
 messages = [
     {role: user, content: "busca noticias de Argentina y el clima"},
     {role: assistant, tool_calls: [search("argentina"), weather("BA")]},
-    {role: tool, content: "[Previous tool result cleared]"},          ← limpio
-    {role: tool, content: "[Previous tool result cleared]"},          ← limpio
-    {role: assistant, tool_calls: [search("argentina economía")]},
-    {role: tool, content: "... 2000 chars más ..."},                 ← intacto
+    {role: tool, content: "[Previous result processed -- summary: Results for argentina]"},
+    {role: tool, content: "[Previous result processed -- summary: Weather in Buenos Aires]"},
+    {role: assistant, tool_calls: [search("argentina economia")]},
+    {role: tool, content: "... 2000 chars mas ..."},                 <-- intacto
 ]
 ```
+
+## Metricas: Configuracion del Threshold
+
+El threshold de compactacion es configurable en `app/config.py`:
+
+```python
+class Settings(BaseSettings):
+    compaction_threshold: int = 20000  # chars
+    max_tools_per_call: int = 8
+```
+
+<Callout variant="info" title="20K chars es conservador">
+Con un ratio promedio de ~4 chars/token, 20K chars son ~5000 tokens. Esto deja ~27K tokens libres para contexto, historial, system prompt y la respuesta. El valor es tunable via env var `COMPACTION_THRESHOLD`.
+</Callout>
 
 <Quiz
-  question="¿Por qué se limpian los tool results de iteraciones anteriores?"
+  question="Por que se limpian los tool results de iteraciones anteriores?"
   options={[
-    "Para ahorrar espacio en disco",
+    "Para ahorrar espacio en disco en la base de datos",
     "Para liberar tokens del contexto que se necesitan para historial y memorias",
-    "Porque los resultados expiran",
-    "Para proteger información sensible"
+    "Porque los resultados expiran despues de cierto tiempo",
+    "Para proteger informacion sensible del usuario"
   ]}
   correct={1}
 />
 
 <Quiz
-  question="¿Con qué se reemplazan los tool results limpiados?"
+  question="Cual es el primer paso de compactacion para un tool output grande?"
   options={[
-    "String vacío",
-    "null",
-    "El placeholder '[Previous tool result cleared]'",
-    "Un resumen LLM"
+    "Enviar al LLM para que resuma",
+    "Truncar a max_length caracteres",
+    "Intentar extraccion JSON deterministica (sin LLM)",
+    "Eliminar todo y dejar un placeholder"
   ]}
   correct={2}
 />
 
-En la última lección veremos los meta-tools y el dynamic tool budget.
+<Quiz
+  question="Que contiene el placeholder que reemplaza a un tool result limpiado?"
+  options={[
+    "Un string vacio",
+    "La primera linea del resultado original (hasta 120 chars) como summary",
+    "El nombre del tool solamente",
+    "Un hash del contenido original"
+  ]}
+  correct={1}
+/>
+
+En la ultima leccion veremos los meta-tools y el dynamic tool budget.

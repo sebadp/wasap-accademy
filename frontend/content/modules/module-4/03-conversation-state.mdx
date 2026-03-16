@@ -1,102 +1,200 @@
 ---
 title: "Conversation State"
-description: "Estado persistente por conversación: sticky categories y metadata"
+description: "Estado persistente por conversacion: sticky categories y metadata"
 xpReward: 50
 ---
 
 ## Estado Entre Turnos
 
-Los LLMs son **stateless** — no recuerdan nada entre llamadas. Pero una conversación necesita continuidad. WasAP usa la tabla `conversation_state` para persistir metadata entre turnos.
+Los LLMs son **stateless** -- no recuerdan nada entre llamadas. Pero una conversacion necesita continuidad. LocalForge usa la tabla `conversation_state` para persistir metadata entre turnos.
 
 <Callout variant="info" title="Stateless + State = Stateful">
-El LLM es stateless, pero WasAP le inyecta estado relevante en cada llamada. La base de datos mantiene la memoria que el modelo no tiene.
+El LLM es stateless, pero LocalForge le inyecta estado relevante en cada llamada. La base de datos mantiene la memoria que el modelo no tiene. Este es el principio fundamental de context engineering.
 </Callout>
 
 ## La Tabla conversation_state
 
 ```sql
+-- app/database/db.py — SCHEMA
 CREATE TABLE IF NOT EXISTS conversation_state (
-    phone_number TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT (datetime('now')),
-    PRIMARY KEY (phone_number, key)
+    conversation_id   INTEGER PRIMARY KEY REFERENCES conversations(id),
+    sticky_categories TEXT NOT NULL DEFAULT '[]',
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
-Es un **key-value store** por usuario. Cualquier subsistema puede guardar y leer estado.
+A diferencia de un key-value generico, esta tabla tiene un schema especifico: `sticky_categories` es el unico campo de estado, almacenado como JSON array serializado.
 
-## Sticky Categories
-
-El caso de uso más importante: **sticky categories** para el router de herramientas.
-
-```python
-# Guardar categorías activas
-async def save_sticky_categories(
-    self, phone_number: str, categories: list[str]
-) -> None:
-    value = json.dumps(categories)
-    await self.conn.execute(
-        "INSERT OR REPLACE INTO conversation_state "
-        "(phone_number, key, value) VALUES (?, 'sticky_categories', ?)",
-        (phone_number, value),
-    )
-    await self.conn.commit()
-
-# Leer categorías activas
-async def get_sticky_categories(
-    self, phone_number: str
-) -> list[str] | None:
-    cursor = await self.conn.execute(
-        "SELECT value FROM conversation_state "
-        "WHERE phone_number = ? AND key = 'sticky_categories'",
-        (phone_number,),
-    )
-    row = await cursor.fetchone()
-    return json.loads(row["value"]) if row else None
-```
-
-<Concept title="Sticky Categories">
-Si el usuario está hablando de proyectos y envía "¿cómo va?", el classifier podría retornar "none" (no hay keywords claras). Las sticky categories recuerdan que estábamos en contexto de proyectos y mantienen las herramientas disponibles.
+<Concept title="Schema especifico vs Key-Value generico">
+LocalForge opto por un schema con columna dedicada en vez de un KV generico (phone_number + key + value). Esto es mas eficiente para el caso de uso actual: una sola query sin filtros por key, y el schema esta tipado en la definicion de la tabla.
 </Concept>
 
-## Flujo de Re-clasificación
+## Sticky Categories: El Caso de Uso Principal
+
+El **tool router** de LocalForge clasifica cada mensaje en categorias (time, math, weather, projects, etc.) para decidir que herramientas cargar. Pero cuando el usuario envia un mensaje ambiguo, el classifier puede fallar.
+
+### El Problema
 
 ```
-Usuario: "agregá una tarea al proyecto"
-  → classify_intent → ["projects"]          ← claro
-  → save_sticky_categories(["projects"])
+Usuario: "agrega una tarea al proyecto API v2"
+  -> classify_intent -> ["projects"]          <- claro, keywords obvios
 
-Usuario: "¿cómo va?"
-  → classify_intent → ["none"]              ← ambiguo
-  → get_sticky_categories() → ["projects"]  ← rescate
-  → re-classify con contexto → ["projects"] ← correcto
+Usuario: "como va?"
+  -> classify_intent -> ["none"]              <- ambiguo, sin keywords
 ```
 
-<Callout variant="tip" title="Fallback inteligente">
-Sin sticky categories, "¿cómo va?" sin contexto iría a plain chat. Con stickies, se mantiene la continuidad de la conversación sobre proyectos.
+Sin contexto, "como va?" podria ser sobre cualquier cosa. Pero si el turno anterior fue sobre proyectos, es claro que pregunta por el estado del proyecto.
+
+### La Solucion: Sticky Categories
+
+```python
+# app/database/repository.py
+async def save_sticky_categories(
+    self, conversation_id: int, categories: list[str]
+) -> None:
+    """Persist sticky categories for this conversation."""
+    await self._conn.execute(
+        "INSERT INTO conversation_state (conversation_id, sticky_categories, updated_at) "
+        "VALUES (?, ?, datetime('now')) "
+        "ON CONFLICT(conversation_id) DO UPDATE SET "
+        "sticky_categories = excluded.sticky_categories, "
+        "updated_at = excluded.updated_at",
+        (conversation_id, json.dumps(categories, ensure_ascii=False)),
+    )
+    await self._conn.commit()
+```
+
+<Callout variant="tip" title="ON CONFLICT DO UPDATE (UPSERT)">
+Este patron es un UPSERT: si no existe estado para esta conversacion, lo crea. Si ya existe, lo actualiza. Todo en una sola operacion atomica, sin necesidad de verificar existencia primero.
 </Callout>
 
+### Leer Categories
+
+```python
+async def get_sticky_categories(self, conversation_id: int) -> list[str]:
+    """Return sticky tool categories from the last tool-using turn."""
+    cursor = await self._conn.execute(
+        "SELECT sticky_categories FROM conversation_state WHERE conversation_id = ?",
+        (conversation_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return []
+    try:
+        return json.loads(row[0]) or []
+    except (json.JSONDecodeError, TypeError):
+        return []
+```
+
+<Callout variant="warning" title="Defensive JSON parsing">
+El `get_sticky_categories` envuelve `json.loads` en try/except. Si los datos estan corruptos o son invalidos, retorna una lista vacia en vez de crashear. Este patron defensivo es critico en datos persistidos que podrian haber sido escritos por versiones anteriores del codigo.
+</Callout>
+
+### Limpiar Categories
+
+```python
+async def clear_sticky_categories(self, conversation_id: int) -> None:
+    """Clear sticky categories when a turn doesn't use tools."""
+    await self.save_sticky_categories(conversation_id, [])
+```
+
+## El Flujo Completo de Re-clasificacion
+
+Asi funciona en la practica:
+
+<Step number={1} title="Mensaje con intent claro">
+El usuario dice "agrega una tarea al proyecto". `classify_intent` retorna `["projects"]`. Se guardan como sticky categories.
+</Step>
+
+<Step number={2} title="Mensaje ambiguo">
+El usuario dice "como va?". `classify_intent` retorna `["none"]`.
+</Step>
+
+<Step number={3} title="Rescate con stickies">
+Se cargan las sticky categories: `["projects"]`. Se usan como fallback para cargar las herramientas de proyectos.
+</Step>
+
+<Step number={4} title="Turno sin tools">
+Si el usuario cambia de tema completamente (ej: "que hora es?"), las stickies se actualizan a `["time"]` y el ciclo se reinicia.
+</Step>
+
+```
+Turno 1: "agrega una tarea al proyecto"
+  -> classify -> ["projects"] -> save_sticky(["projects"])
+
+Turno 2: "como va?"
+  -> classify -> ["none"] -> get_sticky -> ["projects"] -> rescate!
+
+Turno 3: "que hora es?"
+  -> classify -> ["time"] -> save_sticky(["time"]) -> stickies actualizadas
+```
+
+## Otros Usos de Estado
+
+Aunque actualmente `conversation_state` solo almacena sticky categories, el patron es extensible. Otros subsistemas que usan estado por conversacion:
+
+| Subsistema | Donde se guarda | Que persiste |
+|------------|-----------------|--------------|
+| **Sticky categories** | `conversation_state` | Categorias del ultimo turno con tools |
+| **User profile** | `user_profiles` | Onboarding state, preferences, message count |
+| **Agent sessions** | JSONL files | Sesiones agenticas append-only |
+| **Daily logs** | Markdown files | Eventos y hechos por dia |
+
+<Concept title="Estado en multiples capas">
+LocalForge no tiene un solo lugar para todo el estado. Cada subsistema elige el storage que mejor le conviene: SQLite para datos transaccionales (sticky categories, profiles), archivos JSONL para logs append-only (agent sessions), y archivos Markdown para datos que el humano puede editar directamente (daily logs, memorias).
+</Concept>
+
+## Self-Correction Cooldown
+
+Un uso interesante de estado es el cooldown de auto-correccion. Cuando el LLM se corrige a si mismo, se guarda como memoria temporal:
+
+```python
+# Repository — Self-Correction Cooldown
+async def get_recent_self_corrections(self, hours: int = 2) -> list[Memory]:
+    """Return active self_correction memories created within the last N hours."""
+    cursor = await self._conn.execute(
+        "SELECT id, content, category, active, created_at FROM memories "
+        "WHERE category = 'self_correction' AND active = 1 "
+        "AND created_at > datetime('now', ?)",
+        (f"-{hours} hours",),
+    )
+    rows = await cursor.fetchall()
+    return [Memory(id=r[0], content=r[1], category=r[2], active=bool(r[3]), created_at=r[4]) for r in rows]
+```
+
+Estas memorias se inyectan en el contexto para evitar que el LLM repita el mismo error, pero expiran automaticamente despues de 24 horas.
+
 <Quiz
-  question="¿Qué tipo de estructura es conversation_state?"
+  question="Que tipo de estructura es conversation_state?"
   options={[
-    "Tabla relacional con schema fijo",
-    "Key-value store por usuario (phone_number + key → value)",
+    "Tabla relacional con columna dedicada sticky_categories como JSON array",
+    "Key-value store generico por usuario",
     "Documento JSON anidado",
-    "Archivo de configuración"
+    "Archivo de configuracion"
   ]}
-  correct={1}
+  correct={0}
 />
 
 <Quiz
-  question="¿Cuándo se usan las sticky categories?"
+  question="Cuando se usan las sticky categories?"
   options={[
     "Siempre, en cada mensaje",
     "Como fallback cuando classify_intent retorna 'none' en un mensaje ambiguo",
     "Solo en modo agente",
-    "Para generar resúmenes"
+    "Para generar resumenes"
   ]}
   correct={1}
 />
 
-En la siguiente lección veremos cómo WasAP compacta outputs grandes de herramientas.
+<Quiz
+  question="Que patron SQL usa save_sticky_categories para crear o actualizar en una operacion?"
+  options={[
+    "SELECT + UPDATE en dos queries separadas",
+    "INSERT OR REPLACE que borra y recrea la fila",
+    "INSERT ... ON CONFLICT DO UPDATE (UPSERT atomico)",
+    "UPDATE con WHERE EXISTS subquery"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como LocalForge compacta outputs grandes de herramientas.

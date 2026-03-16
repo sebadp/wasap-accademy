@@ -6,77 +6,224 @@ xpReward: 75
 
 ## El problema de seguridad
 
-Si tu webhook es público (y tiene que serlo, Meta necesita alcanzarlo), cualquier persona puede hacer POST a tu endpoint con payloads falsos. ¿Cómo sabés que un request viene realmente de Meta?
+Tu webhook es público. Tiene que serlo: Meta necesita alcanzarlo desde internet. Pero si es público, **cualquier persona** puede hacer POST a tu endpoint con payloads falsos. Un atacante podría:
 
-Con **firmas HMAC-SHA256**.
+- Simular mensajes de usuarios legítimos
+- Inyectar comandos maliciosos al LLM
+- Consumir tus recursos de Ollama con requests basura
+- Engañar a tu bot para que envíe mensajes a números reales
 
-## Cómo funciona la firma
+¿Cómo sabés que un request viene **realmente** de Meta? Con **firmas HMAC-SHA256**.
 
-Meta firma cada request con tu `APP_SECRET`:
-
-1. Toma el body del request (raw bytes)
-2. Calcula `HMAC-SHA256(body, APP_SECRET)`
-3. Lo incluye en el header `X-Hub-Signature-256: sha256=<hex_digest>`
-
-Tu servidor hace lo mismo y compara. Si coinciden, el request es legítimo.
-
-<Callout variant="warning" title="Nunca confíes sin verificar">
-Si no verificás la firma, cualquiera puede mandarte payloads falsos que simulen mensajes de WhatsApp. Siempre verificá en producción.
+<Callout variant="warning" title="Esto no es opcional">
+Si no verificás la firma en producción, tu bot es un proxy abierto. Cualquiera con tu URL de ngrok puede controlarlo. Siempre verificá la firma.
 </Callout>
 
-## Implementación en WasAP
+## Cómo funciona HMAC-SHA256
 
-```python title="app/webhook/security.py"
+HMAC (Hash-based Message Authentication Code) es un algoritmo que combina un **mensaje** con una **clave secreta** para producir un **digest** único.
+
+<Step number={1} title="Meta firma el request">
+Meta toma el body completo del request (raw bytes) y calcula `HMAC-SHA256(body, APP_SECRET)`. Tu `APP_SECRET` lo generaste en el portal de Meta y lo tenés en tu `.env`.
+</Step>
+
+<Step number={2} title="Meta incluye la firma en el header">
+El resultado se incluye en el header `X-Hub-Signature-256: sha256=<hex_digest>`. El prefijo `sha256=` indica el algoritmo usado.
+</Step>
+
+<Step number={3} title="Tu servidor verifica">
+Tu servidor hace el mismo cálculo con el body recibido y tu `APP_SECRET`. Si el digest que calculaste coincide con el del header, el request es legítimo. Si no coincide, alguien lo falsificó.
+</Step>
+
+<Concept title="HMAC-SHA256">
+HMAC combina una función hash (SHA-256) con una clave secreta. A diferencia de un hash simple (`SHA256(body)`), HMAC es resistente a ataques de length extension. Solo alguien que conozca el `APP_SECRET` puede generar una firma válida para un body dado.
+</Concept>
+
+## La implementación real de LocalForge
+
+El archivo `app/webhook/security.py` tiene exactamente 11 líneas. Es uno de los archivos más cortos del proyecto, pero uno de los más críticos:
+
+```python
+# app/webhook/security.py — código completo real
 import hashlib
 import hmac
 
 
-def verify_signature(
+def validate_signature(
     payload: bytes,
     signature_header: str,
     app_secret: str,
 ) -> bool:
-    """Verifica la firma HMAC-SHA256 de Meta."""
+    """Validate the X-Hub-Signature-256 header from Meta webhooks."""
     if not signature_header.startswith("sha256="):
         return False
-
-    expected = signature_header[len("sha256="):]
-    computed = hmac.new(
-        key=app_secret.encode(),
-        msg=payload,
-        digestmod=hashlib.sha256,
+    expected = hmac.new(
+        app_secret.encode(), payload, hashlib.sha256
     ).hexdigest()
-
-    # Comparación en tiempo constante para evitar timing attacks
-    return hmac.compare_digest(computed, expected)
+    received = signature_header.removeprefix("sha256=")
+    return hmac.compare_digest(expected, received)
 ```
 
-<Concept term="hmac.compare_digest">
-Compara dos strings en **tiempo constante**. A diferencia de `==`, que puede terminar antes si los primeros caracteres difieren, `compare_digest` siempre tarda lo mismo. Esto previene ataques de timing donde un atacante deduce caracteres del secreto midiendo tiempos de respuesta.
+Desglosemos cada parte:
+
+### 1. Verificar el formato del header
+
+```python
+if not signature_header.startswith("sha256="):
+    return False
+```
+
+Si el header no empieza con `sha256=`, es inválido. Retornar `False` inmediatamente sin hacer ningún cálculo criptográfico.
+
+### 2. Calcular el HMAC esperado
+
+```python
+expected = hmac.new(
+    app_secret.encode(),  # Clave: string -> bytes
+    payload,              # Mensaje: raw bytes del body
+    hashlib.sha256,       # Algoritmo: SHA-256
+).hexdigest()             # Resultado como string hexadecimal
+```
+
+`hmac.new()` crea el objeto HMAC. `.hexdigest()` retorna el hash como string hex (64 caracteres).
+
+### 3. Extraer la firma recibida
+
+```python
+received = signature_header.removeprefix("sha256=")
+```
+
+`str.removeprefix()` (Python 3.9+) quita el prefijo `sha256=` del header para obtener solo el hex digest.
+
+### 4. Comparar en tiempo constante
+
+```python
+return hmac.compare_digest(expected, received)
+```
+
+<Concept title="hmac.compare_digest — timing-safe comparison">
+Compara dos strings en **tiempo constante**. A diferencia de `==`, que puede terminar antes si los primeros caracteres difieren (short-circuit), `compare_digest` siempre tarda lo mismo sin importar dónde difieren los strings. Esto previene **timing attacks** donde un atacante deduce caracteres del secreto midiendo microsegundos de diferencia en los tiempos de respuesta.
 </Concept>
-
-## Middleware de FastAPI
-
-En WasAP, la verificación de firma es un **middleware** que se ejecuta antes de cualquier handler:
-
-```python title="app/webhook/middleware.py"
-@app.middleware("http")
-async def verify_meta_signature(request: Request, call_next):
-    if request.url.path == "/webhook" and request.method == "POST":
-        body = await request.body()
-        signature = request.headers.get("X-Hub-Signature-256", "")
-
-        if not verify_signature(body, signature, settings.meta_app_secret):
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Invalid signature"},
-            )
-
-    return await call_next(request)
-```
 
 <Quiz
   question="¿Por qué se usa hmac.compare_digest en lugar del operador == para comparar firmas?"
   options={["Porque compare_digest es más rápido que ==", "Para evitar timing attacks donde un atacante deduce el secreto midiendo tiempos de respuesta", "Porque == no funciona con strings hexadecimales", "Para poder comparar firmas de distinta longitud"]}
   correct={1}
 />
+
+## Timing attacks explicados
+
+Un **timing attack** explota las diferencias de tiempo en la comparación:
+
+```python
+# MAL: comparación con == (vulnerable a timing attacks)
+def insecure_compare(a: str, b: str) -> bool:
+    return a == b
+    # Si a = "abc..." y b = "xyz...", falla en el primer char (rápido)
+    # Si a = "abc..." y b = "abd...", falla en el tercer char (más lento)
+    # Un atacante puede deducir char por char midiendo tiempos
+```
+
+```python
+# BIEN: comparación en tiempo constante
+def secure_compare(a: str, b: str) -> bool:
+    return hmac.compare_digest(a, b)
+    # Siempre tarda lo mismo, sin importar dónde difieren
+```
+
+<Callout variant="info" title="¿Es realista un timing attack contra un webhook?">
+En la práctica, las diferencias son de nanosegundos y la red agrega ruido de milisegundos. Pero es una best practice usar `compare_digest` siempre que compares secretos. El costo es cero (mismo performance) y la protección es real contra atacantes sofisticados con acceso a la misma red.
+</Callout>
+
+## Cómo se integra en el handler
+
+La verificación de firma se hace **inline** en el handler POST, no como middleware. Esta es una decisión de diseño de LocalForge:
+
+```python
+# app/webhook/router.py — dentro de incoming_webhook()
+@router.post("/webhook")
+async def incoming_webhook(request: Request, ...) -> Response:
+    settings = get_settings(request)
+    body = await request.body()
+
+    # Verificar firma ANTES de parsear el JSON
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not validate_signature(body, signature, settings.whatsapp_app_secret):
+        logger.warning("Invalid webhook signature")
+        return Response(status_code=200)  # No 403: Meta reintenta
+
+    # Solo llegamos aquí si la firma es válida
+    payload = await request.json()
+    ...
+```
+
+<Callout variant="tip" title="body antes de json">
+Notá que leemos `request.body()` (raw bytes) **antes** de `request.json()`. Esto es importante: la firma se calcula sobre los bytes originales. Si parseáramos primero a JSON y luego lo serializáramos de vuelta, los bytes podrían diferir (orden de keys, whitespace) y la firma no coincidiría.
+</Callout>
+
+## Generando firmas para tests
+
+En los tests, necesitás generar firmas válidas para simular requests de Meta:
+
+```python
+# tests/conftest.py — helper para tests
+import hashlib
+import hmac
+
+def sign_payload(payload_bytes: bytes, secret: str = "test_secret") -> str:
+    """Generate a valid X-Hub-Signature-256 header for testing."""
+    sig = hmac.new(
+        secret.encode(), payload_bytes, hashlib.sha256
+    ).hexdigest()
+    return f"sha256={sig}"
+```
+
+```python
+# Uso en un test
+def test_incoming_webhook_valid(client):
+    payload = make_whatsapp_payload()
+    body = json.dumps(payload).encode()
+    signature = sign_payload(body)
+
+    resp = client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": signature,
+        },
+    )
+    assert resp.status_code == 200
+```
+
+<Concept title="Test Settings">
+En los tests, `Settings` se inicializa con `whatsapp_app_secret="test_secret"`. El helper `sign_payload()` usa el mismo secret por defecto. Así los tests producen firmas válidas sin necesitar credenciales reales de Meta.
+</Concept>
+
+<Quiz
+  question="¿Por qué es importante leer request.body() ANTES de request.json() para la verificación de firma?"
+  options={["Porque request.json() no funciona si se lee body() después", "Porque la firma se calcula sobre los bytes originales, no sobre una re-serialización del JSON", "Porque body() y json() no pueden llamarse en el mismo request", "Porque request.body() es más rápido que request.json()"]}
+  correct={1}
+/>
+
+## Errores comunes
+
+<Callout variant="error" title="Error 1: Usar el token equivocado">
+Meta tiene dos tokens: el `verify_token` (para el GET de verificación) y el `app_secret` (para firmar los POST). No los confundas. El HMAC usa el `app_secret`.
+</Callout>
+
+<Callout variant="error" title="Error 2: Modificar el body antes de verificar">
+Si usás un middleware que modifica o parsea el body antes de tu handler, los bytes cambian y la firma no coincide. Verificá la firma sobre `await request.body()` sin procesar.
+</Callout>
+
+<Callout variant="error" title="Error 3: No verificar en producción">
+"Funciona sin verificar en desarrollo" no es excusa. En producción, tu URL de ngrok es pública. Sin verificación, cualquiera puede controlar tu bot.
+</Callout>
+
+<Quiz
+  question="¿Cuál es la diferencia entre whatsapp_verify_token y whatsapp_app_secret?"
+  options={["Son el mismo valor con nombres distintos", "verify_token se usa en el GET de verificación; app_secret firma los POST con HMAC", "app_secret se usa solo en producción; verify_token en desarrollo", "verify_token protege contra timing attacks; app_secret contra replay attacks"]}
+  correct={1}
+/>
+
+En la próxima lección parseamos el payload JSON anidado de Meta para extraer los mensajes del usuario.

@@ -6,56 +6,104 @@ xpReward: 50
 
 ## Qué es un Embedding
 
-Un **embedding** es una representación numérica del significado de un texto. Convierte palabras y frases en vectores (listas de números) donde textos similares están **cerca** en el espacio vectorial.
+Un **embedding** es una representación numérica del significado de un texto. Convierte palabras y frases en vectores (listas de números) donde textos con significado similar están **cerca** en el espacio vectorial, y textos con significado diferente están **lejos**.
 
 <Concept title="Vector = Lista de números">
-"Python es un lenguaje de programación" → `[0.12, -0.45, 0.78, ..., 0.33]` (768 números). Textos sobre programación tendrán vectores parecidos. Textos sobre cocina tendrán vectores lejanos.
+"Python es un lenguaje de programación" se convierte en `[0.12, -0.45, 0.78, ..., 0.33]` (768 números). Textos sobre programación tendrán vectores parecidos entre sí. Textos sobre cocina tendrán vectores lejanos. Esto permite **buscar por significado** en vez de por palabras exactas.
 </Concept>
+
+A diferencia de una búsqueda por keywords (`LIKE '%python%'`), los embeddings entienden que "programador backend" y "Python developer" hablan de lo mismo aunque no compartan palabras.
 
 ## nomic-embed-text via Ollama
 
-WasAP usa `nomic-embed-text` — un modelo de embeddings que corre **localmente** via Ollama:
+LocalForge usa `nomic-embed-text` — un modelo de embeddings que corre **localmente** via Ollama. No se envían datos a ningún servicio externo:
 
 ```python
+# app/llm/client.py — método embed de OllamaClient
 class OllamaClient:
-    async def embed(self, text: str) -> list[float]:
-        response = await self._post("/api/embed", {
-            "model": "nomic-embed-text",
-            "input": text,
-        })
-        return response["embeddings"][0]  # 768 floats
+    async def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+    ) -> list[list[float]]:
+        """Generate embeddings for a batch of texts via POST /api/embed."""
+        url = f"{self._base_url}/api/embed"
+        use_model = model or self._model
+        payload = {"model": use_model, "input": texts}
+        resp = await self._http.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["embeddings"]  # list of 768-float vectors
+```
+
+<Callout variant="info" title="API batch: input es una lista">
+El método recibe `texts: list[str]` — una lista de textos. Ollama genera todos los embeddings en una sola llamada HTTP. Esto es clave para el backfill eficiente que veremos en lecciones posteriores.
+</Callout>
+
+La configuración del modelo vive en `app/config.py`:
+
+```python
+# app/config.py — Settings relevantes
+class Settings(BaseSettings):
+    embedding_model: str = "nomic-embed-text"
+    embedding_dimensions: int = 768
+    semantic_search_enabled: bool = True
+    semantic_search_top_k: int = 10
+    memory_similarity_threshold: float = 1.0  # L2 distance threshold
 ```
 
 <Callout variant="tip" title="768 dimensiones">
-Cada embedding tiene exactamente 768 números. Cada número captura un aspecto del significado. Más dimensiones = más matices, pero más memoria y cómputo.
+Cada embedding tiene exactamente 768 números (floats). Cada dimensión captura un aspecto diferente del significado. Más dimensiones capturan más matices, pero consumen más memoria y cómputo. 768 es un buen balance para un modelo local.
 </Callout>
 
 ## Distancia L2 (Euclidiana)
 
-Para medir qué tan similares son dos textos, se calcula la distancia entre sus vectores:
+Para medir qué tan similares son dos textos, se calcula la **distancia L2** (euclidiana) entre sus vectores:
 
 ```python
 import math
 
 def l2_distance(a: list[float], b: list[float]) -> float:
+    """Distancia euclidiana entre dos vectores."""
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
-# Textos similares → distancia pequeña
+# Textos similares → distancia pequeña (~0.3-0.7)
 d1 = l2_distance(embed("Python dev"), embed("programador Python"))  # ~0.5
-# Textos diferentes → distancia grande
+
+# Textos diferentes → distancia grande (~1.2-2.0)
 d2 = l2_distance(embed("Python dev"), embed("receta de torta"))    # ~1.8
 ```
 
-`memory_similarity_threshold = 1.0` — si la distancia L2 es mayor que 1.0, los textos no son suficientemente similares.
+<Concept title="Threshold de similitud">
+LocalForge usa `memory_similarity_threshold = 1.0` como umbral. Si la distancia L2 entre el query y una memoria es mayor que 1.0, se considera que no son suficientemente similares. Valores menores (0.5) son más estrictos; valores mayores (1.5) son más permisivos pero pueden traer ruido.
+</Concept>
 
-## Para Qué los Usa WasAP
+En la práctica, sqlite-vec (la extensión de SQLite que veremos en la siguiente lección) calcula esta distancia de forma optimizada internamente. No necesitás calcularla manualmente.
 
-| Uso | Cómo |
-|-----|------|
-| **Buscar memorias relevantes** | Embed la pregunta → buscar memorias cercanas |
-| **Buscar notas** | Embed el query → encontrar notas similares |
-| **Dedup de memorias** | Si dos memorias tienen vectores muy cercanos, probablemente son duplicadas |
-| **RAG** | Encontrar contexto relevante para inyectar al LLM |
+## Para Qué los Usa LocalForge
+
+| Uso | Cómo | Ejemplo |
+|-----|------|---------|
+| **Buscar memorias relevantes** | Embed la pregunta del usuario y buscar memorias con vectores cercanos | "¿Cómo iba mi API?" encuentra "Trabaja en API v2 con FastAPI" |
+| **Buscar notas** | Embed el query y encontrar notas con contenido similar | "Deploy" encuentra nota titulada "Producción con Docker Compose" |
+| **Buscar notas de proyecto** | Embed el query y buscar documentos del proyecto activo | "Testing" encuentra "Plan de tests para API v2" |
+| **RAG** | Inyectar contexto relevante al prompt del LLM antes de generar | El LLM responde con información personalizada |
+| **Tool discovery** | Embed la descripción de tools para selección semántica | "Quiero crear una nota" matchea con `save_note` |
+
+<Callout variant="warning" title="Embeddings ≠ comprensión">
+Los embeddings capturan similitud semántica a nivel de texto, no razonamiento profundo. "La empresa perdió dinero" y "La empresa ganó dinero" pueden tener vectores cercanos porque comparten contexto. No uses embeddings como único criterio para decisiones críticas.
+</Callout>
+
+## Límite de Caracteres
+
+nomic-embed-text tiene un contexto de 8192 tokens. Para evitar truncamiento silencioso, LocalForge limita el texto a 6000 caracteres antes de generar el embedding:
+
+```python
+# app/embeddings/indexer.py
+_MAX_EMBED_CHARS = 6_000  # Conservative limit for mixed-language text
+
+# Uso: content[:_MAX_EMBED_CHARS] antes de llamar a ollama_client.embed()
+```
 
 <Quiz
   question="¿Cuántas dimensiones tiene un embedding de nomic-embed-text?"
@@ -74,4 +122,15 @@ d2 = l2_distance(embed("Python dev"), embed("receta de torta"))    # ~1.8
   correct={1}
 />
 
-En la siguiente lección veremos cómo se indexan los embeddings en sqlite-vec.
+<Quiz
+  question="¿Por qué el método embed() recibe una lista de textos en vez de un solo string?"
+  options={[
+    "Porque Ollama no soporta textos individuales",
+    "Para poder generar múltiples embeddings en una sola llamada HTTP (batch)",
+    "Porque cada texto se divide en párrafos",
+    "Para manejar textos multilingües"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo se indexan los embeddings en sqlite-vec para búsqueda rápida.

@@ -190,4 +190,15 @@ async def _handle_message(phone, text, settings, ...):
   correct={1}
 />
 
+<Quiz
+  question="¿Cuál es la diferencia entre asyncio.create_task y asyncio.gather?"
+  options={[
+    "create_task es para código sync y gather para async",
+    "create_task lanza una coroutine sin esperar su resultado (se hace await después), mientras que gather espera a que todas las coroutines terminen antes de continuar",
+    "gather es más rápido que create_task",
+    "No hay diferencia, son sinónimos"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo aplicar caching estratégico para evitar recalcular datos que no cambian.

@@ -1,45 +1,170 @@
 ---
-title: "Cómo funcionan los LLMs"
-description: "Tokens, context window, temperatura y los parámetros que importan"
+title: "Como funcionan los LLMs"
+description: "Tokens, context window, temperatura y los parametros que importan para tu asistente de IA"
 xpReward: 50
 ---
 
-## Qué es un LLM
+## Que es un LLM
 
-Un **Large Language Model** es un modelo de machine learning entrenado sobre texto masivo que puede predecir el siguiente token dada una secuencia de tokens de entrada.
+Un **Large Language Model** es un modelo de machine learning entrenado sobre texto masivo que puede predecir el siguiente token dada una secuencia de tokens de entrada. En LocalForge usamos **Ollama** para correr modelos open-source localmente, sin depender de APIs en la nube.
 
-<Concept term="Token">
-La unidad mínima de texto que procesa el LLM. No es una letra ni una palabra: es un fragmento de texto que el tokenizer determina. En promedio, 1 token ≈ 0.75 palabras en inglés (algo menos en español).
+<Concept title="Token">
+La unidad minima de texto que procesa el LLM. No es una letra ni una palabra: es un fragmento de texto que el tokenizer determina. En promedio, 1 token es aproximadamente 0.75 palabras en ingles (algo menos en espanol). LocalForge estima tokens con un ratio de `chars / 4` que se auto-calibra en runtime.
 </Concept>
 
-<Concept term="Context Window">
-La cantidad máxima de tokens que el modelo puede procesar de una vez (input + output). Claude 3.5 Sonnet: 200K tokens. GPT-4o: 128K tokens. Es tu "memoria de trabajo" con el LLM.
+<Concept title="Context Window">
+La cantidad maxima de tokens que el modelo puede procesar de una vez (input + output). El modelo qwen3.5:9b que usa LocalForge tiene un context window de **32K tokens**. Es tu "memoria de trabajo" con el LLM: todo lo que quieras que el modelo considere (system prompt, historial, memorias, notas) debe caber ahi.
 </Concept>
 
-## Los parámetros que usás todos los días
+## Ollama: LLMs Locales sin API Keys
+
+A diferencia de servicios como OpenAI o Anthropic, **Ollama** corre los modelos directamente en tu maquina. Esto significa:
+
+- **Sin costos por token**: podes hacer todas las llamadas que quieras
+- **Sin latencia de red**: la inferencia es local
+- **Privacidad total**: los datos nunca salen de tu servidor
+- **Sin rate limits**: no hay throttling de API
+
+<Callout variant="info" title="Modelos de LocalForge">
+LocalForge usa tres modelos via Ollama, cada uno con un proposito distinto:
+- **qwen3.5:9b** para chat principal (razonamiento general)
+- **llava:7b** para vision (analisis de imagenes)
+- **nomic-embed-text** para embeddings (busqueda semantica, 768 dimensiones)
+</Callout>
+
+## Los parametros que usas todos los dias
 
 ### Temperature
 
 Controla la aleatoriedad de las respuestas:
 
-- `temperature=0.0` → determinista, siempre la misma respuesta
-- `temperature=0.7` → balance entre creatividad y coherencia (default de WasAP)
-- `temperature=1.0` → máxima variedad
+- `temperature=0.0` — determinista, siempre la misma respuesta
+- `temperature=0.7` — balance entre creatividad y coherencia
+- `temperature=1.0` — maxima variedad
 
-<Callout variant="tip">
-Para tareas de extracción de datos, clasificación o código: `temperature=0`. Para generación creativa: `temperature=0.7-1.0`.
+En LocalForge, la temperature se controla implicitamente por el tipo de tarea:
+
+```python
+# Para clasificaciones y tareas binarias: think=False (determinista)
+response = await ollama_client.chat_with_tools(messages, think=False)
+
+# Para chat general: think=True (el modelo razona antes de responder)
+response = await ollama_client.chat_with_tools(messages)
+```
+
+<Callout variant="tip" title="Cuando usar think=False">
+Para tareas de extraccion de datos, clasificacion o respuestas JSON, siempre usa `think=False`. Esto desactiva el chain-of-thought interno de qwen3 y produce respuestas mas rapidas y deterministas. LocalForge lo usa en guardrails, summarizer, consolidator y el intent classifier.
 </Callout>
 
-### Max tokens
+### Context Window y Token Budget
 
-El límite de tokens que el modelo puede generar en la respuesta. Si lo ponés muy bajo, la respuesta se corta. WasAP usa `max_tokens=1024` para respuestas de chat.
+El context window de 32K tokens se llena rapido cuando incluyes system prompt, historial, memorias y herramientas. LocalForge implementa un **estimador de tokens** que se auto-calibra:
 
-### System prompt
+```python
+# app/context/token_estimator.py
+_CONTEXT_LIMIT = 32_000  # qwen3.5:9b context window
+_DEFAULT_RATIO = 4.0     # fallback: chars / 4
 
-El mensaje de sistema define el "personaje" y las instrucciones persistentes del asistente. En WasAP, define que sos un asistente de WhatsApp útil, conciso y en el idioma del usuario.
+def estimate_tokens(text: str, model: str = "default") -> int:
+    """Estima token count usando el ratio calibrado."""
+    ratio = _token_ratios.get(model, _DEFAULT_RATIO)
+    return max(1, int(len(text) / ratio))
+
+def log_context_budget(messages, context_limit=_CONTEXT_LIMIT, ...):
+    """Log warning si estamos >80% del limite, error si >100%."""
+    estimate = estimate_messages_tokens(messages, model)
+    if estimate > context_limit:
+        logger.error("context.budget.exceeded: %d tokens", estimate)
+    elif estimate > context_limit * 0.8:
+        logger.warning("context.budget.near_limit: %d tokens", estimate)
+```
+
+<Concept title="Auto-calibracion de tokens">
+Cada vez que Ollama responde, incluye `prompt_eval_count` (tokens reales del prompt). LocalForge usa un Exponential Moving Average para ajustar el ratio chars-per-token en runtime. Despues de unas 10 requests, el error baja a menos del 5%.
+</Concept>
+
+### System Prompt
+
+El mensaje de sistema define el "personaje" y las instrucciones persistentes del asistente. En LocalForge, el system prompt se configura via la variable de entorno `SYSTEM_PROMPT`:
+
+```python
+# app/config.py
+system_prompt: str = (
+    "You are a helpful personal assistant on WhatsApp. "
+    "Be friendly. Answer in the same language the user writes in. "
+    "Adapt your response length to the user's request..."
+)
+```
+
+<Callout variant="warning" title="No uses 'Be concise'">
+Incluir "Be concise" en el system prompt causa que el modelo rechace pedidos que requieren respuestas largas. En su lugar, LocalForge usa "Adapt your response length to the user's request" para que el modelo ajuste la longitud segun el contexto.
+</Callout>
+
+### Max Tokens
+
+El limite de tokens que el modelo puede generar en la respuesta. Si lo pones muy bajo, la respuesta se corta. En Ollama, este parametro se controla a nivel de modelo. LocalForge no lo limita explicitamente para permitir respuestas completas.
+
+## Anatomia de un Request a Ollama
+
+Cada llamada al LLM via Ollama sigue esta estructura:
+
+```python
+# POST http://localhost:11435/api/chat
+payload = {
+    "model": "qwen3.5:9b",
+    "messages": [
+        {"role": "system", "content": "Eres un asistente..."},
+        {"role": "user",   "content": "Hola, como estas?"},
+    ],
+    "stream": False,     # LocalForge no usa streaming (WhatsApp no lo soporta)
+    "think": True,       # Activa chain-of-thought en qwen3
+}
+```
+
+La respuesta incluye metricas de rendimiento que LocalForge aprovecha:
+
+```json
+{
+  "message": {"role": "assistant", "content": "Hola! Estoy bien..."},
+  "prompt_eval_count": 156,
+  "eval_count": 42,
+  "total_duration": 1234567890
+}
+```
+
+- `prompt_eval_count`: tokens en el prompt (input). Se usa para calibrar el estimador.
+- `eval_count`: tokens generados (output). Util para metricas de costo.
+- `total_duration`: nanosegundos totales. LocalForge lo convierte a ms para tracing.
+
+## Ollama vs APIs en la Nube
+
+| Caracteristica | Ollama (Local) | OpenAI / Anthropic (Cloud) |
+|---------------|----------------|---------------------------|
+| **Costo** | Hardware fijo, sin costo por token | Pago por token |
+| **Privacidad** | Datos nunca salen del servidor | Datos enviados a terceros |
+| **Latencia** | Sin red, pero depende del hardware | Red rapida, GPUs potentes |
+| **Modelos** | Open-source (qwen, llama, mistral) | Propietarios (GPT-4, Claude) |
+| **Rate limits** | Sin limites | Throttling segun plan |
+| **Setup** | Requiere GPU/CPU capaz | Solo un API key |
+
+<Callout variant="tip" title="Ollama en Docker">
+En produccion, LocalForge corre Ollama en un contenedor Docker separado. La comunicacion es via HTTP a `http://ollama:11435` dentro de la red Docker. El puerto `11435` es configurable via `OLLAMA_BASE_URL`.
+</Callout>
 
 <Quiz
-  question="¿Qué temperature usarías para un sistema que extrae campos estructurados de texto (nombre, fecha, monto)?"
-  options={["temperature=1.0 para máxima creatividad", "temperature=0.0 para resultados deterministas", "temperature=0.5 como punto medio", "No importa, el LLM siempre da el mismo resultado"]}
+  question="Que temperature usarias para un sistema que extrae campos estructurados de texto (nombre, fecha, monto)?"
+  options={["temperature=1.0 para maxima creatividad", "think=False para resultados deterministas", "temperature=0.5 como punto medio", "No importa, el LLM siempre da el mismo resultado"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que LocalForge usa Ollama en lugar de APIs como OpenAI o Anthropic?"
+  options={["Porque Ollama tiene mejores modelos", "Porque permite correr modelos localmente sin costos por token y con privacidad total", "Porque es mas rapido que GPT-4", "Porque es el unico que soporta FastAPI"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa cuando el token budget estimado supera el 80% del context window?"
+  options={["La app crashea con un error fatal", "Se loguea un WARNING para alertar que estamos cerca del limite", "Se trunca automaticamente el historial", "Se cambia a un modelo con mas contexto"]}
   correct={1}
 />

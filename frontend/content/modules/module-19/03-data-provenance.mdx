@@ -182,4 +182,15 @@ El patrón `get_audit_logger()` / `set_audit_logger()` evita parameter threading
   correct={2}
 />
 
+<Quiz
+  question="¿Qué ventaja tiene el patrón module-level accessor (get_audit_logger/set_audit_logger) sobre pasar el AuditLogger como parámetro?"
+  options={[
+    "Es más rápido en ejecución",
+    "Evita parameter threading: no hay que pasar el objeto a través de múltiples niveles de funciones",
+    "Permite tener múltiples instancias de AuditLogger simultáneamente",
+    "Es obligatorio en Python para objetos singleton"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo `memory_versions` agrega versionado inmutable para compliance total.

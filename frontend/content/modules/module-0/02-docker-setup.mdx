@@ -1,100 +1,251 @@
 ---
 title: "Docker y servicios"
-description: "Levantar PostgreSQL, Redis y la API con docker-compose"
+description: "Levantar Ollama, Langfuse y la API con docker-compose"
 xpReward: 50
 ---
 
 ## Por qué Docker
 
-WasAP depende de varios servicios: PostgreSQL para datos, Redis para caché y colas, y la API de FastAPI. Docker Compose los orquesta todos con un solo comando.
+LocalForge depende de varios servicios: **Ollama** para los modelos de IA, **ngrok** para exponer tu servidor local a internet, y opcionalmente **Langfuse** (con PostgreSQL, ClickHouse, Redis y MinIO) para observabilidad. Docker Compose los orquesta todos.
 
 <Callout variant="warning" title="Pre-requisito">
-Necesitás tener instalado Docker Desktop (Mac/Windows) o Docker Engine + Docker Compose (Linux). Si no lo tenés, instalalo antes de continuar.
+Necesitás tener instalado Docker Desktop (Mac/Windows) o Docker Engine + Docker Compose plugin (Linux). Si no lo tenés, instalalo desde https://docs.docker.com/get-docker/ antes de continuar.
 </Callout>
 
-## El docker-compose.yml
+## El docker-compose.yml real de LocalForge
+
+A diferencia de los tutoriales que usan PostgreSQL, LocalForge usa **SQLite** como base de datos principal. No necesitás un contenedor de DB. El `docker-compose.yml` tiene tres servicios principales y un stack completo de Langfuse:
 
 ```yaml
+# docker-compose.yml (servicios principales)
 services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: wasap
-      POSTGRES_USER: wasap
-      POSTGRES_PASSWORD: wasap
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  api:
+  localforge:
     build: .
-    ports:
-      - "8000:8000"
     env_file: .env
-    depends_on:
-      - db
-      - redis
     volumes:
-      - .:/app
+      - ./data:/app/data          # Persistir SQLite, logs, memorias
+      - ./app:/app/app            # Hot-reload del código
+      - ./skills:/app/skills      # Skills editables
+      - whisper_cache:/home/appuser/.cache/huggingface
+    network_mode: host
+    restart: unless-stopped
+    profiles: ["dev", "prod"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
 
-volumes:
-  pgdata:
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11435
+    network_mode: host
+    restart: unless-stopped
+    profiles: ["dev"]
+
+  ngrok:
+    image: ngrok/ngrok
+    command: http --url=${NGROK_DOMAIN} --log=stdout http://localhost:8000
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    network_mode: host
+    depends_on:
+      - localforge
+    restart: unless-stopped
+    profiles: ["dev"]
 ```
 
-<Concept term="depends_on">
-Le dice a Docker que el servicio `api` no arranca hasta que `db` y `redis` estén corriendo. Pero ojo: "corriendo" no significa "listo para aceptar conexiones". Usá health checks en producción.
+<Concept title="network_mode: host">
+En vez de crear una red Docker interna, `network_mode: host` hace que los contenedores compartan la red del host. Esto simplifica la comunicación entre Ollama (puerto 11435) y LocalForge (puerto 8000): ambos se ven como `localhost`.
 </Concept>
 
-## Comandos esenciales
+<Concept title="profiles">
+Los perfiles de Docker Compose permiten organizar servicios por entorno. `docker compose --profile dev up` levanta los servicios de desarrollo (Ollama, ngrok, Langfuse). En producción, solo levantás el perfil `prod`. Sin especificar perfil, no se levanta ningún servicio.
+</Concept>
 
-<Terminal title="Levantar todos los servicios">
-docker compose up -d
-</Terminal>
+## El Dockerfile de producción
 
-<Terminal title="Ver logs de la API">
-docker compose logs -f api
-</Terminal>
+El Dockerfile de LocalForge sigue buenas prácticas de seguridad:
 
-<Terminal title="Entrar al contenedor de la API">
-docker compose exec api bash
-</Terminal>
+```dockerfile
+FROM python:3.11-slim
 
-<Terminal title="Apagar todo">
-docker compose down
-</Terminal>
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \        # Para faster-whisper (transcripción de audio)
+    curl \          # Para healthchecks
+    nodejs npm \    # Para MCP servers (server-puppeteer, etc.)
+    && rm -rf /var/lib/apt/lists/*
 
-<Terminal title="Apagar y borrar volúmenes (reset total)">
-docker compose down -v
-</Terminal>
+WORKDIR /app
 
-## Verificar que todo funciona
+COPY pyproject.toml .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir --no-build-isolation .
 
-Una vez que corrés `docker compose up -d`, verificá:
+# Pre-instalar MCP servers para evitar cold-start timeouts
+RUN npm install -g @modelcontextprotocol/server-puppeteer \
+    @modelcontextprotocol/server-filesystem \
+    @modelcontextprotocol/server-github
 
-<Step number={1} title="PostgreSQL disponible">
-Conectate con `psql -h localhost -U wasap -d wasap` o usá un cliente como TablePlus/DBeaver.
-</Step>
+COPY app/ app/
+COPY skills/ skills/
 
-<Step number={2} title="API respondiendo">
-Abrí `http://localhost:8000/health` en el browser. Deberías ver `{"status": "ok"}`.
-</Step>
+# Crear usuario no-root (seguridad)
+ARG UID=1000
+RUN groupadd -g $UID appuser && useradd -u $UID -g $UID -m appuser \
+    && mkdir -p /app/data && chown -R appuser:appuser /app
+USER appuser
 
-<Step number={3} title="Docs de la API">
-Abrí `http://localhost:8000/docs` — FastAPI genera Swagger automáticamente.
-</Step>
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
-<Callout variant="tip">
-Guardá el comando `docker compose up -d` en un alias de bash. En WasAP lo tenemos como `make dev` en el Makefile.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+<Callout variant="info" title="Seguridad: usuario no-root">
+El contenedor corre como `appuser` (UID=1000), no como root. Esto es una best practice de seguridad: si alguien compromete la app, no tiene acceso root al contenedor.
 </Callout>
 
 <Quiz
+  question="¿Por qué LocalForge usa network_mode: host en Docker Compose?"
+  options={["Para mejorar la seguridad del contenedor", "Para que los contenedores compartan la red del host y se comuniquen via localhost", "Para exponer automáticamente todos los puertos al internet", "Porque SQLite requiere acceso directo al filesystem del host"]}
+  correct={1}
+/>
+
+## Comandos esenciales
+
+<Step number={1} title="Levantar el entorno de desarrollo">
+```bash
+# Levantar todos los servicios del perfil dev
+docker compose --profile dev up -d
+
+# Verificar que están corriendo
+docker compose ps
+```
+</Step>
+
+<Step number={2} title="Descargar modelos de Ollama">
+```bash
+# Modelo principal de chat
+docker compose exec ollama ollama pull qwen3.5:9b
+
+# Modelo de visión (para analizar imágenes)
+docker compose exec ollama ollama pull llava:7b
+
+# Modelo de embeddings (para búsqueda semántica)
+docker compose exec ollama ollama pull nomic-embed-text
+```
+</Step>
+
+<Step number={3} title="Ver logs de la API">
+```bash
+# Logs en tiempo real (JSON structured)
+docker compose logs -f localforge
+
+# Solo errores
+docker compose logs -f localforge | grep '"level":"ERROR"'
+```
+</Step>
+
+<Step number={4} title="Apagar todo">
+```bash
+# Apagar servicios (los datos persisten en volúmenes)
+docker compose --profile dev down
+
+# Reset total: borrar volúmenes (pierdes datos de Ollama y DB)
+docker compose --profile dev down -v
+```
+</Step>
+
+## El stack de Langfuse (observabilidad)
+
+LocalForge incluye un stack completo de **Langfuse v3** para tracing y evaluación. Son 6 servicios adicionales:
+
+```yaml
+# Langfuse v3 stack (incluido en docker-compose.yml)
+langfuse-web:         # Web UI en http://localhost:3000
+langfuse-worker:      # Worker para procesamiento async
+langfuse-db:          # PostgreSQL 17 para datos de Langfuse
+langfuse-clickhouse:  # ClickHouse para analytics
+langfuse-redis:       # Redis para caché y colas
+langfuse-minio:       # MinIO (S3-compatible) para blobs
+```
+
+<Callout variant="tip" title="Langfuse es opcional">
+Langfuse se levanta con el mismo perfil `dev`. Si no necesitás tracing por ahora, podés desactivarlo con `TRACING_ENABLED=false` en tu `.env`. Los servicios de Langfuse no afectan al funcionamiento de LocalForge.
+</Callout>
+
+## Verificar que todo funciona
+
+Una vez levantados los servicios:
+
+<Step number={1} title="Ollama respondiendo">
+```bash
+curl http://localhost:11435/api/tags
+# Debería listar los modelos descargados
+```
+</Step>
+
+<Step number={2} title="API respondiendo">
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+</Step>
+
+<Step number={3} title="Docs de la API">
+Abrí `http://localhost:8000/docs` en el browser. FastAPI genera documentación Swagger automáticamente.
+</Step>
+
+<Step number={4} title="Langfuse UI (opcional)">
+Abrí `http://localhost:3000`. Creá una cuenta local y un proyecto. Las keys van en tu `.env` como `LANGFUSE_PUBLIC_KEY` y `LANGFUSE_SECRET_KEY`.
+</Step>
+
+<Quiz
   question="¿Qué hace el flag -d en 'docker compose up -d'?"
-  options={["Descarga las imágenes sin levantar los servicios", "Corre los servicios en modo debug", "Corre los servicios en background (detached)", "Borra los contenedores anteriores antes de levantar"]}
+  options={["Descarga las imágenes sin levantar los servicios", "Corre los servicios en modo debug con logs verbosos", "Corre los servicios en background (detached mode)", "Borra los contenedores anteriores antes de levantar"]}
   correct={2}
 />
+
+## El Makefile de desarrollo
+
+LocalForge incluye un `Makefile` para simplificar los comandos más comunes:
+
+```makefile
+VENV := .venv/bin/
+
+dev:        # Crear virtualenv + instalar deps + pre-commit hooks
+    python3 -m venv .venv
+    $(VENV)pip install -e ".[dev]"
+    $(VENV)pre-commit install
+
+test:       # Correr 316+ tests
+    $(VENV)pytest tests/ -v
+
+lint:       # Verificar código con ruff
+    $(VENV)ruff check app tests
+
+format:     # Formatear código con ruff
+    $(VENV)ruff format app tests
+
+typecheck:  # Type checking con mypy
+    $(VENV)mypy app
+
+check: lint typecheck test  # Todo junto antes de pushear
+```
+
+<Callout variant="tip" title="Siempre antes de pushear">
+Corré `make check` antes de cualquier push. Ejecuta lint (ruff) + typecheck (mypy) + tests (pytest) en secuencia. Es lo mismo que ejecuta el CI en GitHub Actions.
+</Callout>
+
+<Quiz
+  question="¿Cuál de estos NO es un servicio definido en el docker-compose.yml de LocalForge?"
+  options={["ollama (LLM local)", "ngrok (tunnel a internet)", "PostgreSQL para datos de la app", "langfuse-web (observabilidad)"]}
+  correct={2}
+/>
+
+En la próxima lección configuramos las variables de entorno y entendemos cómo Pydantic Settings gestiona la configuración.

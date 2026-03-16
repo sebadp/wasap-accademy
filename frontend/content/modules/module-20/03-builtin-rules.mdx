@@ -194,4 +194,15 @@ COOLDOWN: 12 horas
   correct={2}
 />
 
+<Quiz
+  question="¿Por qué la regla db_large tiene un cooldown de 24 horas para ejecutar VACUUM?"
+  options={[
+    "Porque SQLite solo permite un VACUUM por día",
+    "Porque VACUUM es una operación pesada que bloquea la DB brevemente",
+    "Porque la DB no puede crecer más de 500 MB por día",
+    "Porque el cooldown mínimo permitido es 24 horas"
+  ]}
+  correct={1}
+/>
+
 En la siguiente lección veremos cómo crear reglas custom y cómo el usuario puede gestionar automatizaciones via chat.

@@ -1,122 +1,250 @@
 ---
 title: "Vector Storage con sqlite-vec"
-description: "Búsqueda vectorial nativa en SQLite para embeddings de 768 dimensiones"
+description: "Busqueda vectorial nativa en SQLite para embeddings de 768 dimensiones"
 xpReward: 75
 ---
 
-## Qué es sqlite-vec
+## Que es sqlite-vec
 
-sqlite-vec es una extensión nativa de SQLite que agrega **búsqueda de similitud vectorial**. Esto permite hacer RAG (Retrieval-Augmented Generation) sin necesitar Pinecone, Weaviate, ni ningún servicio externo.
+sqlite-vec es una extension nativa de SQLite que agrega **busqueda de similitud vectorial**. Esto permite hacer RAG (Retrieval-Augmented Generation) sin necesitar Pinecone, Weaviate, ni ningun servicio externo.
 
 <Callout variant="tip" title="Todo en un archivo">
-Con sqlite-vec, tus embeddings viven en el mismo archivo SQLite que tus datos. Sin infraestructura adicional, sin latencia de red.
+Con sqlite-vec, tus embeddings viven en el mismo archivo SQLite que tus datos. Sin infraestructura adicional, sin latencia de red, sin costos de API.
 </Callout>
 
 ## Tablas Virtuales vec0
 
-```sql
-CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories
-USING vec0(
-    memory_id INTEGER PRIMARY KEY,
-    embedding float[768]
-);
+Las tablas vectoriales se crean con schemas parametrizados por dimension:
+
+```python
+# app/database/db.py
+VEC_SCHEMA_MEMORIES = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories "
+    "USING vec0(memory_id INTEGER PRIMARY KEY, embedding float[{dims}])"
+)
+VEC_SCHEMA_NOTES = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_notes "
+    "USING vec0(note_id INTEGER PRIMARY KEY, embedding float[{dims}])"
+)
+VEC_SCHEMA_PROJECT_NOTES = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_project_notes "
+    "USING vec0(note_id INTEGER PRIMARY KEY, embedding float[{dims}])"
+)
+VEC_SCHEMA_TOOLS = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_tools "
+    "USING vec0(tool_name TEXT PRIMARY KEY, embedding float[{dims}])"
+)
 ```
 
 <Concept title="float[768]">
-Cada embedding es un vector de 768 números decimales. El modelo `nomic-embed-text` de Ollama genera vectores de exactamente 768 dimensiones. Cada dimensión captura un aspecto del significado del texto.
+Cada embedding es un vector de 768 numeros decimales. El modelo `nomic-embed-text` de Ollama genera vectores de exactamente 768 dimensiones. Cada dimension captura un aspecto del significado semantico del texto. La dimension se configura via `Settings.embedding_dimensions`.
 </Concept>
 
-## Cargar la Extensión
+## Cargar la Extension
 
-sqlite-vec es una extensión compilada en C. Hay que cargarla explícitamente:
+sqlite-vec es una extension compilada en C. Hay que cargarla explicitamente durante la inicializacion:
 
 ```python
-async def _try_load_vec(conn: aiosqlite.Connection) -> bool:
-    try:
-        # Acceder a la conexión subyacente de sqlite3
-        raw_conn = conn._connection
-        raw_conn.enable_load_extension(True)
-        raw_conn.load_extension("vec0")
-        raw_conn.enable_load_extension(False)  # Seguridad: desactivar después
-        return True
-    except Exception as e:
-        logger.warning("sqlite-vec not available: %s", e)
-        return False
+# app/database/db.py — init_db()
+vec_available = False
+try:
+    import sqlite_vec
+
+    ext_path = sqlite_vec.loadable_path()
+    # Load extension via the raw connection (safe during init — no concurrent queries)
+    conn._connection.enable_load_extension(True)
+    conn._connection.load_extension(ext_path)
+    conn._connection.enable_load_extension(False)  # Seguridad: desactivar despues
+
+    # Create vector tables
+    await conn.execute(VEC_SCHEMA_MEMORIES.format(dims=embedding_dims))
+    await conn.execute(VEC_SCHEMA_NOTES.format(dims=embedding_dims))
+    await conn.execute(VEC_SCHEMA_PROJECT_NOTES.format(dims=embedding_dims))
+    await conn.execute(VEC_SCHEMA_TOOLS.format(dims=embedding_dims))
+    await conn.commit()
+    vec_available = True
+    logger.info("sqlite-vec loaded successfully (dims=%d)", embedding_dims)
+except Exception:
+    logger.warning("sqlite-vec not available, semantic search disabled", exc_info=True)
 ```
 
 <Callout variant="warning" title="conn._connection">
-`aiosqlite` envuelve la conexión nativa de `sqlite3`. Para cargar extensiones necesitamos acceder a `conn._connection`. Esto es seguro durante la inicialización porque aún no hay queries concurrentes.
+`aiosqlite` envuelve la conexion nativa de `sqlite3`. Para cargar extensiones necesitamos acceder a `conn._connection`. Esto es seguro durante la inicializacion porque aun no hay queries concurrentes. Despues de cargar, `enable_load_extension(False)` cierra la puerta por seguridad.
 </Callout>
 
-## Serialización de Vectores
+## Serializacion de Vectores
 
-Los vectores se almacenan como blobs binarios usando `struct.pack`:
+Los vectores se almacenan como blobs binarios usando `struct.pack`. El Repository tiene un helper estatico:
 
 ```python
+# app/database/repository.py
 import struct
 
-def serialize_vector(vector: list[float]) -> bytes:
-    """Convierte lista de floats a blob binario."""
-    return struct.pack(f"{len(vector)}f", *vector)
+@staticmethod
+def _serialize_vector(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
 
-# Ejemplo: 768 floats → 3072 bytes (768 × 4 bytes por float)
-embedding = [0.1, 0.2, ..., 0.768]  # 768 dimensiones
-blob = serialize_vector(embedding)
+# Ejemplo: 768 floats -> 3072 bytes (768 x 4 bytes por float32)
 ```
 
-## Guardar y Buscar
+<Concept title="float32 binario">
+Cada float ocupa 4 bytes en formato IEEE 754. Un vector de 768 dimensiones ocupa exactamente 3072 bytes. Esto es mucho mas eficiente que almacenar floats como texto JSON, que ocuparia ~8KB por vector.
+</Concept>
+
+## Guardar Embeddings
+
+Al guardar un embedding, primero se elimina cualquier version anterior (vec0 no soporta `INSERT OR REPLACE`):
 
 ```python
-# Guardar embedding
-async def save_embedding(self, memory_id: int, vector: list[float]):
-    blob = struct.pack(f"{len(vector)}f", *vector)
-    await self.conn.execute(
+# app/database/repository.py
+async def save_embedding(
+    self, memory_id: int, embedding: list[float], *, auto_commit: bool = True
+) -> None:
+    blob = self._serialize_vector(embedding)
+    # vec0 virtual tables don't support INSERT OR REPLACE — delete first
+    await self._conn.execute(
+        "DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,)
+    )
+    await self._conn.execute(
         "INSERT INTO vec_memories (memory_id, embedding) VALUES (?, ?)",
         (memory_id, blob),
     )
-    await self.conn.commit()
-
-# Buscar similares (distancia L2)
-async def search_similar_memories(
-    self, query_vector: list[float], top_k: int = 10
-) -> list[tuple[int, float]]:
-    blob = struct.pack(f"{len(query_vector)}f", *query_vector)
-    cursor = await self.conn.execute(
-        "SELECT memory_id, distance FROM vec_memories "
-        "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-        (blob, top_k),
-    )
-    return [(row[0], row[1]) for row in await cursor.fetchall()]
+    if auto_commit:
+        await self._conn.commit()
 ```
 
-## Degradación Grácil
-
-WasAP funciona **sin** sqlite-vec. Si la extensión no se puede cargar:
-
-```python
-conn, vec_available = await init_db(database_path)
-# vec_available = False → la app usa get_active_memories() como fallback
-```
-
-<Callout variant="info" title="Best-effort">
-Este es un patrón clave de WasAP: los embeddings son "best-effort". Si fallan, se loguea un warning y la app sigue funcionando con búsqueda por recencia.
+<Callout variant="info" title="auto_commit=False para batch">
+El parametro `auto_commit` permite agrupar multiples inserciones en un solo commit durante operaciones de backfill, mejorando significativamente el rendimiento.
 </Callout>
 
+## Buscar Similares (Distancia L2)
+
+La busqueda vectorial usa la sintaxis `MATCH` de sqlite-vec con distancia L2:
+
+```python
+async def search_similar_memories_with_distance(
+    self, embedding: list[float], top_k: int = 10
+) -> list[tuple[str, float]]:
+    """Return (content, distance) pairs sorted by distance.
+    Uses L2 distance from sqlite-vec. Lower distance = more similar.
+    """
+    blob = self._serialize_vector(embedding)
+    cursor = await self._conn.execute(
+        "SELECT m.content, v.distance FROM vec_memories v "
+        "JOIN memories m ON m.id = v.memory_id "
+        "WHERE m.active = 1 AND v.embedding MATCH ? AND k = ? "
+        "ORDER BY distance",
+        (blob, top_k),
+    )
+    rows = await cursor.fetchall()
+    return [(r[0], float(r[1])) for r in rows]
+```
+
+Nota el `JOIN` con `memories` y el filtro `m.active = 1`: solo retorna memorias activas, respetando el soft delete.
+
+## El Indexer: Operaciones de Alto Nivel
+
+`app/embeddings/indexer.py` provee funciones de alto nivel que combinan Ollama + Repository:
+
+```python
+# app/embeddings/indexer.py
+BATCH_SIZE = 50
+_MAX_EMBED_CHARS = 6_000  # nomic-embed-text context: 8192 tokens
+
+async def embed_memory(
+    memory_id: int, content: str,
+    repository: Repository, ollama_client: OllamaClient, model: str,
+) -> None:
+    """Compute and store embedding for a single memory. Best-effort."""
+    try:
+        embeddings = await ollama_client.embed(
+            [content[:_MAX_EMBED_CHARS]], model=model
+        )
+        await repository.save_embedding(memory_id, embeddings[0])
+    except Exception:
+        logger.warning("Failed to embed memory %d", memory_id, exc_info=True)
+```
+
+<Callout variant="tip" title="Best-effort everywhere">
+Todas las operaciones de embedding estan envueltas en try/except. Si Ollama no esta disponible o la extension falla, se loguea un warning y la app sigue. Los embeddings **nunca** rompen el flujo principal.
+</Callout>
+
+## Backfill: Embeddings en Batch
+
+Al iniciar la app, `backfill_embeddings()` procesa todas las memorias sin embedding:
+
+```python
+async def backfill_embeddings(
+    repository: Repository, ollama_client: OllamaClient, model: str,
+) -> int:
+    unembedded = await repository.get_unembedded_memories()
+    if not unembedded:
+        return 0
+
+    count = 0
+    for i in range(0, len(unembedded), BATCH_SIZE):
+        batch = unembedded[i : i + BATCH_SIZE]
+        ids, texts = zip(*[(mid, c[:_MAX_EMBED_CHARS]) for mid, c in batch if c])
+        try:
+            embeddings = await ollama_client.embed(list(texts), model=model)
+            for mem_id, emb in zip(ids, embeddings):
+                await repository.save_embedding(mem_id, emb, auto_commit=False)
+                count += 1
+            await repository.commit()  # Un commit por batch
+        except Exception:
+            logger.warning("Failed to backfill batch %d-%d", i, i + len(batch))
+    return count
+```
+
+El query que detecta memorias sin embedding usa un `LEFT JOIN`:
+
+```python
+async def get_unembedded_memories(self) -> list[tuple[int, str]]:
+    cursor = await self._conn.execute(
+        "SELECT m.id, m.content FROM memories m "
+        "LEFT JOIN vec_memories v ON v.memory_id = m.id "
+        "WHERE m.active = 1 AND v.memory_id IS NULL",
+    )
+    return [(r[0], r[1]) for r in await cursor.fetchall()]
+```
+
+## Degradacion Gracil
+
+LocalForge funciona **sin** sqlite-vec. Si la extension no se puede cargar:
+
+```
+vec_available = False
+-> semantic search disabled
+-> fallback a get_active_memories() (busqueda por recencia)
+-> la app funciona normalmente, sin busqueda semantica
+```
+
 <Quiz
-  question="¿Cuántas dimensiones tiene cada embedding de nomic-embed-text?"
+  question="Cuantas dimensiones tiene cada embedding de nomic-embed-text?"
   options={["128", "256", "512", "768"]}
   correct={3}
 />
 
 <Quiz
-  question="¿Qué pasa si sqlite-vec no está disponible?"
+  question="Que pasa si sqlite-vec no esta disponible?"
   options={[
     "La app no inicia",
-    "Se lanza una excepción en cada búsqueda",
-    "La app funciona con búsqueda por recencia como fallback",
-    "Se descarga automáticamente"
+    "Se lanza una excepcion en cada busqueda",
+    "La app funciona con busqueda por recencia como fallback",
+    "Se descarga automaticamente"
   ]}
   correct={2}
 />
 
-Has completado el módulo de Database & Persistence. Ahora entendés cómo WasAP gestiona datos desde SQLite async hasta búsqueda vectorial.
+<Quiz
+  question="Por que save_embedding hace DELETE antes de INSERT?"
+  options={[
+    "Para liberar espacio en disco",
+    "Porque vec0 virtual tables no soportan INSERT OR REPLACE",
+    "Para invalidar el cache de queries",
+    "Porque SQLite requiere borrar antes de insertar en tablas virtuales"
+  ]}
+  correct={1}
+/>
+
+Has completado el modulo de Database & Persistence. Ahora entendes como LocalForge gestiona datos desde SQLite async hasta busqueda vectorial.
