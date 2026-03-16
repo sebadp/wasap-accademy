@@ -1,0 +1,148 @@
+---
+title: "Testing de Skills"
+description: "Estrategias de testing para tool handlers, executor y router"
+xpReward: 75
+---
+
+## Niveles de Testing para Skills
+
+Hay 3 niveles de testing para el sistema de skills:
+
+<Step number={1} title="Unit: Tool handler directo">
+Llamar la función del handler sin LLM ni executor.
+</Step>
+
+<Step number={2} title="Integration: Executor loop">
+Simular el loop LLM → tool → resultado → LLM con mocks.
+</Step>
+
+<Step number={3} title="E2E: Webhook completo">
+Enviar un mensaje por el webhook y verificar que la herramienta se ejecutó.
+</Step>
+
+## Unit Testing: Handler Directo
+
+```python
+# tests/test_calculator.py
+async def test_calculate_basic():
+    from app.skills.tools.calculator_tools import register
+
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler(expression="2 + 3")
+    assert result == "5"
+
+async def test_calculate_sqrt():
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler(expression="sqrt(144)")
+    assert result == "12.0"
+
+async def test_calculate_unsafe():
+    """Verify dangerous operations are blocked."""
+    registry = SkillRegistry()
+    register(registry)
+
+    handler = registry.get_tool("calculate")
+    result = await handler(expression="__import__('os').system('rm -rf /')")
+    assert "error" in result.lower()
+```
+
+<Callout variant="info" title="asyncio_mode = auto">
+Con `asyncio_mode = "auto"` en pytest.ini, no necesitás `@pytest.mark.asyncio`. Todas las funciones async se ejecutan automáticamente.
+</Callout>
+
+## Integration Testing: Bypass Router
+
+Para testear el executor sin depender del clasificador LLM:
+
+```python
+# tests/test_tool_executor.py
+from unittest.mock import patch, AsyncMock
+
+def _bypass_router(categories: list[str]):
+    """Helper: bypasea classify_intent y select_tools."""
+    return [
+        patch(
+            "app.skills.router.classify_intent",
+            new_callable=AsyncMock,
+            return_value=categories,
+        ),
+        patch(
+            "app.skills.router.select_tools",
+            return_value=["calculate", "get_current_datetime"],
+        ),
+    ]
+
+async def test_executor_with_calculator(mock_ollama):
+    mock_ollama.chat_with_tools.return_value = ChatResponse(
+        content=None,
+        tool_calls=[ToolCall(name="calculate", arguments={"expression": "2+2"})],
+    )
+
+    with _bypass_router(["math"]):
+        result = await execute_tool_loop(
+            messages=[{"role": "user", "content": "cuanto es 2+2"}],
+            pre_classified_categories=["math"],
+        )
+```
+
+<Concept title="_bypass_router()">
+Este helper parchea `classify_intent` y `select_tools` para que no hagan llamadas reales al LLM. Así podés testear la lógica del executor aislada del clasificador.
+</Concept>
+
+## Mockear OllamaClient
+
+```python
+@pytest.fixture
+def mock_ollama():
+    client = AsyncMock(spec=OllamaClient)
+    client.chat.return_value = ChatResponse(content="Resultado: 4")
+    client.chat_with_tools.return_value = ChatResponse(
+        content="La respuesta es 4",
+        tool_calls=[],
+    )
+    return client
+```
+
+<Callout variant="warning" title="Siempre mockear">
+Nunca llamar a Ollama real en tests. Es lento, no determinístico, y no está disponible en CI. Siempre usar `AsyncMock(spec=OllamaClient)`.
+</Callout>
+
+## Qué Testear
+
+| Aspecto | Test |
+|---------|------|
+| Happy path | Tool con inputs válidos retorna resultado esperado |
+| Input inválido | Tool maneja gracefully inputs incorrectos |
+| Seguridad | Calculator rechaza `eval()`, `import`, `exec` |
+| Edge cases | Strings vacíos, números negativos, Unicode |
+| Timeout | Tools que hacen I/O (weather, search) respetan timeout |
+
+<Quiz
+  question="¿Qué hace _bypass_router() en los tests?"
+  options={[
+    "Desactiva el router completamente",
+    "Parchea classify_intent y select_tools para evitar llamadas reales al LLM",
+    "Conecta directamente al LLM sin pasar por el router",
+    "Simula errores del router"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué siempre se mockea OllamaClient en tests?"
+  options={[
+    "Porque Ollama es de pago",
+    "Porque es lento, no determinístico, y no está disponible en CI",
+    "Porque el mock es más preciso",
+    "Porque Ollama no soporta tests"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Skills Framework. Ahora podés crear, registrar y testear herramientas para el LLM.

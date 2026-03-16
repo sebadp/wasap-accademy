@@ -1,0 +1,125 @@
+---
+title: "Ejecución Paralela de Tools"
+description: "asyncio.gather para tool calls y caching de tool maps"
+xpReward: 75
+---
+
+## Múltiples Tools en una Iteración
+
+El LLM puede pedir **varias herramientas a la vez**. Por ejemplo: "¿Qué hora es en Tokyo y qué clima hace en Buenos Aires?" genera dos tool calls simultáneos.
+
+<Callout variant="info" title="Paralelo, no secuencial">
+Si el LLM pide 3 tools, WasAP las ejecuta en paralelo con `asyncio.gather`. Esto reduce la latencia de 3×T a ~1×T.
+</Callout>
+
+## _run_tool_call()
+
+```python
+async def _run_tool_call(
+    tool_call: ToolCall,
+    tools_map: dict[str, ToolHandler],
+) -> ToolResult:
+    handler = tools_map.get(tool_call.name)
+    if not handler:
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=f"Unknown tool: {tool_call.name}",
+            success=False,
+        )
+
+    try:
+        result = await handler(**tool_call.arguments)
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=str(result),
+            success=True,
+        )
+    except Exception as e:
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=f"Error: {e}",
+            success=False,
+        )
+```
+
+## Ejecución Paralela con asyncio.gather
+
+```python
+async def _execute_tool_calls(
+    tool_calls: list[ToolCall],
+    tools_map: dict[str, ToolHandler],
+) -> list[ToolResult]:
+    tasks = [
+        _run_tool_call(tc, tools_map)
+        for tc in tool_calls
+    ]
+    # Todas las tools corren en paralelo
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Convertir excepciones en ToolResults de error
+    return [
+        r if isinstance(r, ToolResult)
+        else ToolResult(tool_name="unknown", content=str(r), success=False)
+        for r in results
+    ]
+```
+
+<Concept title="asyncio.gather con return_exceptions">
+`return_exceptions=True` evita que una excepción en un tool cancele los demás. Cada resultado es independiente — un error en weather no afecta a datetime.
+</Concept>
+
+## Tool Map Caching
+
+Construir el mapa de tools (nombre → handler) es costoso si hay 60+ tools. WasAP lo cachea a nivel de módulo:
+
+```python
+_cached_tools_map: dict[str, ToolHandler] | None = None
+
+def _get_cached_tools_map(registry: SkillRegistry) -> dict[str, ToolHandler]:
+    global _cached_tools_map
+    if _cached_tools_map is None:
+        _cached_tools_map = _build_tools_map(registry)
+    return _cached_tools_map
+```
+
+<Callout variant="tip" title="Invalidación">
+El cache se invalida cuando se agrega un nuevo MCP server via hot-reload. Se setea `_cached_tools_map = None` y se reconstruye en la próxima llamada.
+</Callout>
+
+## Impacto en Latencia
+
+```
+Sin paralelización (secuencial):
+  get_weather(Buenos Aires)  → 500ms
+  get_current_datetime()     → 50ms
+  web_search("noticias")     → 800ms
+  Total: 1350ms
+
+Con asyncio.gather (paralelo):
+  get_weather + datetime + search → max(500, 50, 800) = 800ms
+  Total: 800ms  (40% más rápido)
+```
+
+<Quiz
+  question="¿Qué hace return_exceptions=True en asyncio.gather?"
+  options={[
+    "Ignora todas las excepciones",
+    "Retorna las excepciones como valores en vez de propagarlas, para que un error no cancele los demás",
+    "Lanza todas las excepciones al final",
+    "Reintenta las tareas que fallaron"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se invalida el cache de _cached_tools_map?"
+  options={[
+    "Cada 5 minutos",
+    "En cada request",
+    "Cuando se agrega un nuevo MCP server via hot-reload",
+    "Nunca se invalida"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo se limpian los resultados de tools anteriores.

@@ -1,0 +1,124 @@
+---
+title: "Registry Pattern"
+description: "Registro dinámico de skills con SkillRegistry para discovery y ejecución"
+xpReward: 75
+---
+
+## El Problema: Descubrir Herramientas
+
+WasAP tiene 60+ herramientas de 15+ skills distintos. ¿Cómo sabe el sistema qué herramientas existen, cómo llamarlas, y qué schemas enviar al LLM?
+
+<Callout variant="info" title="Registry Pattern">
+Un **registro central** donde cada skill se inscribe al arrancar. Cualquier parte del sistema puede consultar el registro para descubrir herramientas disponibles.
+</Callout>
+
+## SkillRegistry
+
+```python
+class SkillRegistry:
+    def __init__(self):
+        self._tools: dict[str, ToolHandler] = {}
+        self._schemas: dict[str, dict] = {}
+        self._metadata: dict[str, SkillMetadata] = {}
+
+    def register_tool(
+        self,
+        name: str,
+        handler: Callable,
+        schema: dict,
+        metadata: SkillMetadata,
+    ):
+        self._tools[name] = handler
+        self._schemas[name] = schema
+        self._metadata[name] = metadata
+
+    def get_tool(self, name: str) -> ToolHandler | None:
+        return self._tools.get(name)
+
+    def get_all_schemas(self) -> list[dict]:
+        return list(self._schemas.values())
+
+    def get_tool_names(self) -> list[str]:
+        return list(self._tools.keys())
+```
+
+## Registro al Startup
+
+Cada skill tiene una función `register()` que se llama durante el lifespan:
+
+```python
+# app/skills/tools/calculator_tools.py
+def register(registry: SkillRegistry, **dependencies):
+    async def calculate(expression: str) -> str:
+        result = safe_eval(expression)
+        return str(result)
+
+    registry.register_tool(
+        name="calculate",
+        handler=calculate,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "calculate",
+                "description": "Evalúa expresión matemática",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "Expresión a evaluar"
+                        }
+                    },
+                    "required": ["expression"]
+                }
+            }
+        },
+        metadata=SkillMetadata(name="calculator", version="1.0.0"),
+    )
+```
+
+<Concept title="Dependency Injection en register()">
+La función `register()` recibe dependencias como `repository`, `ollama_client`, `settings`. Cada skill toma solo lo que necesita. Calculator no necesita nada. Notes necesita `repository`. Weather no necesita nada.
+</Concept>
+
+## Ventajas del Registry Pattern
+
+<Step number={1} title="Extensibilidad">
+Agregar un skill nuevo = crear un archivo + registrarlo. Cero cambios en el core.
+</Step>
+
+<Step number={2} title="Discovery">
+El executor puede preguntar "¿qué tools existen?" sin importar cuántos skills hay.
+</Step>
+
+<Step number={3} title="Schemas centralizados">
+Los schemas para Ollama se generan automáticamente desde el registro.
+</Step>
+
+<Step number={4} title="Hot-reload">
+MCP servers pueden agregar tools al registry en runtime sin reiniciar.
+</Step>
+
+<Quiz
+  question="¿Qué resuelve el Registry Pattern?"
+  options={[
+    "La comunicación con WhatsApp",
+    "El discovery y organización centralizada de todas las herramientas disponibles",
+    "La autenticación de usuarios",
+    "El almacenamiento de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se registran los skills?"
+  options={[
+    "Cuando el usuario envía un mensaje",
+    "Durante el lifespan startup de FastAPI",
+    "Al compilar el código",
+    "Cuando el LLM los necesita"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo se parsean los archivos SKILL.md.

@@ -1,0 +1,91 @@
+---
+title: "Historial con Ventana"
+description: "Enviar los últimos N mensajes verbatim + resumen de los anteriores al LLM"
+xpReward: 75
+---
+
+## El Problema: Contexto Limitado
+
+Los LLMs tienen una **ventana de contexto finita** (qwen3.5:9b tiene ~32K tokens). Si una conversación tiene 200 mensajes, no podés enviarlos todos. Pero si enviás solo los últimos 5, el modelo pierde contexto importante.
+
+<Callout variant="info" title="La solución">
+Enviar los últimos N mensajes **tal cual** (verbatim) + un **resumen** de todo lo anterior. Lo mejor de ambos mundos: detalle reciente + contexto histórico.
+</Callout>
+
+## get_windowed_history()
+
+```python
+async def get_windowed_history(
+    self, phone_number: str, verbatim_count: int = 8
+) -> tuple[list[dict], str | None]:
+    """Retorna (últimos_mensajes, resumen_de_anteriores)."""
+    conv_id = await self._get_conv_id(phone_number)
+
+    # Últimos N mensajes, verbatim
+    recent = await self.repository.get_recent_messages(
+        conv_id, limit=verbatim_count
+    )
+
+    # Resumen existente (de la tabla summaries)
+    summary = await self.repository.get_latest_summary(conv_id)
+
+    return recent, summary
+```
+
+<Concept title="verbatim_count=8">
+WasAP usa 8 mensajes verbatim por defecto. Esto incluye ~4 turnos (user+assistant). Suficiente para mantener el flujo conversacional inmediato, sin ocupar demasiado contexto.
+</Concept>
+
+## Zero-Latency: No se genera resumen al leer
+
+El resumen **ya existe** en la tabla `summaries`. Fue generado previamente por el Summarizer como background task. Leer el historial es solo un `SELECT` — no hay llamada a LLM.
+
+```
+Escritura (background):          Lectura (hot path):
+┌──────────────┐                 ┌──────────────────┐
+│  Summarizer  │──genera──►      │ get_windowed_    │
+│  (async job) │   resumen       │   history()      │
+└──────────────┘     │           │                  │
+                     ▼           │  SELECT recientes│
+              ┌──────────┐       │  SELECT summary  │
+              │ summaries│◄──────│                  │
+              │  (table) │       └──────────────────┘
+              └──────────┘
+```
+
+<Callout variant="tip" title="Separar escritura de lectura">
+Generar el resumen es caro (llamada a LLM). Leerlo es barato (un SELECT). Al generar en background, el hot path nunca espera por el LLM.
+</Callout>
+
+## Ejemplo del Resultado
+
+```python
+recent_messages = [
+    {"role": "user", "content": "¿Cómo va mi proyecto?"},
+    {"role": "assistant", "content": "Tu proyecto 'API v2' tiene 3 tareas..."},
+    {"role": "user", "content": "Marcá la primera como completada"},
+    {"role": "assistant", "content": "Listo, marqué 'Setup database' ✓"},
+    # ... 4 mensajes más
+]
+
+summary = "El usuario pidió ayuda para organizar su proyecto de API v2. Se creó el proyecto con 5 tareas. Discutimos la arquitectura REST..."
+```
+
+<Quiz
+  question="¿Cuántos mensajes verbatim envía WasAP al LLM por defecto?"
+  options={["4", "8", "16", "Todos"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se genera el resumen del historial?"
+  options={[
+    "Cada vez que se lee el historial",
+    "Antes de cada llamada al LLM",
+    "Como background task del Summarizer, independiente de la lectura",
+    "Al iniciar la app"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo funciona ese Summarizer que corre en background.

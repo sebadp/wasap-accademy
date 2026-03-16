@@ -1,0 +1,226 @@
+---
+title: "Replanificación"
+description: "Decisión done/continue/replan con máximo 3 intentos y fallback plan"
+xpReward: 100
+---
+
+## El Problema: Planes que No Sobreviven al Contacto con la Realidad
+
+Un plan creado antes de ejecutar puede quedar obsoleto cuando un worker descubre información inesperada. Ejemplo: el plan asume que hay un Dockerfile, pero el worker #1 descubre que no existe. Las tareas siguientes que dependen de Docker ya no tienen sentido.
+
+<Callout variant="info" title="Replanificar ≠ fallar">
+La replanificación es parte normal del flujo. Los mejores agentes son los que reconocen cuándo su plan original ya no es válido y se adaptan.
+</Callout>
+
+## Cuándo se Activa la Replanificación
+
+Después de ejecutar todas las tareas posibles (o cuando quedan tareas pendientes con dependencias fallidas), el planner revisa los resultados:
+
+```python
+# app/agent/planner.py
+async def replan(
+    objective: str,
+    plan: AgentPlan,
+    ollama_client: OllamaClient,
+) -> dict:
+    """Review results and decide: done, continue, or replan."""
+    completed = _format_completed(plan)
+    remaining = _format_remaining(plan)
+
+    prompt = _PLANNER_REPLAN_PROMPT.format(
+        objective=objective,
+        completed_steps=completed,
+        remaining_steps=remaining,
+    )
+    resp = await ollama_client.chat(
+        [ChatMessage(role="user", content=prompt)],
+        think=False,
+    )
+    return json.loads(str(resp))
+```
+
+## El Prompt de Replanificación
+
+```python
+_PLANNER_REPLAN_PROMPT = """\
+You are a task planner reviewing results from completed steps.
+
+OBJECTIVE: {objective}
+
+COMPLETED STEPS AND RESULTS:
+{completed_steps}
+
+REMAINING STEPS:
+{remaining_steps}
+
+Based on the results so far, decide:
+1. If the objective is achieved, output:
+   {{"action": "done", "summary": "brief summary of findings"}}
+2. If remaining steps are still valid, output:
+   {{"action": "continue"}}
+3. If the plan needs adjustment, output a NEW plan:
+   {{
+     "action": "replan",
+     "context_summary": "updated understanding",
+     "tasks": [... new tasks ...]
+   }}
+
+Output ONLY valid JSON, nothing else.
+"""
+```
+
+## Las 3 Decisiones
+
+<Step number={1} title="'done' — Objetivo cumplido">
+El planner determina que los resultados ya responden al objetivo, aunque queden tareas pendientes. Ejemplo: el plan tenía 4 tareas pero las primeras 2 ya dieron toda la información necesaria.
+
+```json
+{
+  "action": "done",
+  "summary": "Coverage analysis complete: 45% total, 0% on agent/ and security/ modules. Top priority: add integration tests for webhook router."
+}
+```
+</Step>
+
+<Step number={2} title="'continue' — Seguir con el plan actual">
+Las tareas restantes siguen siendo válidas. No hay necesidad de cambiar nada.
+
+```json
+{"action": "continue"}
+```
+</Step>
+
+<Step number={3} title="'replan' — Nuevo plan">
+Los resultados revelaron algo inesperado que requiere tareas diferentes.
+
+```json
+{
+  "action": "replan",
+  "context_summary": "No Dockerfile found. Need to create one from scratch instead of modifying existing.",
+  "tasks": [
+    {
+      "id": 1,
+      "description": "Research best practices for Python+FastAPI Dockerfiles",
+      "worker_type": "reader",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "description": "Create Dockerfile with multi-stage build",
+      "worker_type": "coder",
+      "depends_on": [1]
+    }
+  ]
+}
+```
+</Step>
+
+## Safety: Máximo 3 Replans
+
+```python
+# En _run_planner_session
+if decision["action"] == "replan":
+    if plan.replans >= plan.max_replans:
+        logger.warning(
+            "Max replans (%d) reached, synthesizing with partial results",
+            plan.max_replans,
+        )
+        # Forzar synthesis con lo que hay
+        break
+
+    plan.replans += 1
+    new_plan = _parse_plan_json(
+        json.dumps(decision), plan.objective
+    )
+    # Reemplazar tareas pendientes con las nuevas
+    plan.tasks = [
+        t for t in plan.tasks if t.status in ("done", "failed")
+    ] + new_plan.tasks
+    plan.context_summary = decision.get(
+        "context_summary", plan.context_summary
+    )
+```
+
+<Callout variant="warning" title="max_replans = 3">
+Sin límite, un planner podría replannear infinitamente (especialmente si los workers consistentemente fallan). Después de 3 replans, se fuerza la synthesis con resultados parciales. Mejor un resultado incompleto que un loop infinito.
+</Callout>
+
+## Formateo de Resultados
+
+```python
+def _format_completed(plan: AgentPlan) -> str:
+    """Format completed tasks with their results."""
+    parts = []
+    for t in plan.tasks:
+        if t.status in ("done", "failed"):
+            icon = "✅" if t.status == "done" else "❌"
+            parts.append(
+                f"#{t.id} [{t.worker_type}] {icon} {t.description}\n"
+                f"  Result: {t.result[:500] if t.result else '(no result)'}"
+            )
+    return "\n".join(parts) if parts else "(no steps completed yet)"
+
+
+def _format_remaining(plan: AgentPlan) -> str:
+    """Format pending tasks."""
+    parts = []
+    for t in plan.tasks:
+        if t.status == "pending":
+            deps = f" (depends on: {t.depends_on})" if t.depends_on else ""
+            parts.append(
+                f"#{t.id} [{t.worker_type}] {t.description}{deps}"
+            )
+    return "\n".join(parts) if parts else "(no remaining steps)"
+```
+
+## Flujo con Replanificación
+
+```
+Plan v1: [read repo] → [run tests] → [analyze gaps] → [report]
+                                           ↓
+                                     Worker #2 falla:
+                                  "No test runner configured"
+                                           ↓
+                          Replan: "Need to configure pytest first"
+                                           ↓
+Plan v2: [configure pytest] → [run tests] → [report]
+                                           ↓
+                                     Todos los workers ok
+                                           ↓
+                                      Synthesize
+```
+
+<Quiz
+  question="¿Cuántas veces puede replannear el planner antes de forzar la synthesis?"
+  options={[
+    "1 vez",
+    "3 veces (max_replans)",
+    "Ilimitado",
+    "5 veces"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué significa la decisión 'continue' del planner?"
+  options={[
+    "Crear un plan nuevo",
+    "Las tareas restantes siguen siendo válidas, seguir ejecutándolas sin cambios",
+    "Terminar la sesión",
+    "Esperar input del usuario"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando se replanea?"
+  options={[
+    "Se borra todo y se empieza de cero",
+    "Se mantienen las tareas completadas/falladas y se reemplazan solo las pendientes con tareas nuevas",
+    "Se duplican todas las tareas",
+    "Se pausa la sesión"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la fase de synthesis y cómo se integra con la conversación.

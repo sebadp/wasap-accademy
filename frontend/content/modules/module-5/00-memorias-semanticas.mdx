@@ -1,0 +1,93 @@
+---
+title: "Memorias Semánticas"
+description: "CRUD de memorias persistentes que definen quién es el usuario"
+xpReward: 50
+---
+
+## Qué es una Memoria Semántica
+
+En WasAP, una **memoria semántica** es un hecho sobre el usuario que persiste entre conversaciones. A diferencia de los mensajes (que se resumen y borran), las memorias son **permanentes**.
+
+<Callout variant="info" title="Memoria vs Mensajes">
+Los mensajes son efímeros (se resumen después de ~20). Las memorias son permanentes: "El usuario es ingeniero de software", "Prefiere respuestas en español", "Trabaja en el proyecto API v2".
+</Callout>
+
+## La Tabla memories
+
+```sql
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_number TEXT NOT NULL,
+    content TEXT NOT NULL,
+    active INTEGER DEFAULT 1,  -- 1 = activa, 0 = borrada
+    created_at TIMESTAMP DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_active
+    ON memories(active, id);
+```
+
+<Concept title="Soft delete con active flag">
+Las memorias nunca se borran físicamente. Se marcan como `active=0`. Esto permite auditoría y recovery, y es la base del sistema de provenance (Módulo 19).
+</Concept>
+
+## Comandos del Usuario
+
+| Comando | Acción | Ejemplo |
+|---------|--------|---------|
+| `/remember texto` | Crear memoria | `/remember Soy desarrollador Python` |
+| `/forget query` | Desactivar memoria que matchee | `/forget Python` |
+| `/memories` | Listar memorias activas | `/memories` |
+| `/memories query` | Buscar memorias | `/memories proyecto` |
+
+```python
+async def cmd_remember(ctx: CommandContext, args: str) -> str:
+    memory_id = await ctx.repository.add_memory(
+        ctx.phone_number, args
+    )
+    # Auto-indexar embedding
+    if ctx.embed_model:
+        await embed_memory(ctx.repository, ctx.ollama_client, memory_id, args)
+    return f"Guardado: {args}"
+```
+
+## Inyección al Contexto del LLM
+
+Las memorias activas se inyectan en cada llamada al LLM:
+
+```xml
+<user_memories>
+- Es ingeniero de software senior
+- Trabaja en empresa fintech
+- Prefiere respuestas técnicas y directas
+- Zona horaria: Buenos Aires (UTC-3)
+</user_memories>
+```
+
+<Callout variant="tip" title="Personalización automática">
+Con memorias, el LLM sabe quién sos sin que lo repitas. Si guardaste "Soy vegano", el asistente nunca te recomendará restaurantes de carne.
+</Callout>
+
+<Quiz
+  question="¿Qué pasa cuando un usuario ejecuta /forget?"
+  options={[
+    "La memoria se borra físicamente de la base de datos",
+    "La memoria se marca como active=0 (soft delete)",
+    "Se borra toda la conversación",
+    "Se desconecta el usuario"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Dónde se inyectan las memorias para que el LLM las use?"
+  options={[
+    "En el user message",
+    "Como tool result",
+    "En el system prompt dentro de tags XML como <user_memories>",
+    "En un archivo separado"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo los daily logs capturan eventos día a día.

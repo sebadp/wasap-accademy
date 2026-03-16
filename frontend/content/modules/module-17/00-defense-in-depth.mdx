@@ -1,0 +1,121 @@
+---
+title: "Defense in Depth"
+description: "Capas de seguridad para agentes autónomos: por qué no basta con un solo control"
+xpReward: 50
+---
+
+## El Problema: Agentes con Acceso a Tools Peligrosas
+
+Un agente con acceso a `run_command`, `apply_patch`, o `git_push` puede causar daño real: borrar archivos, pushear a main, o ejecutar comandos arbitrarios. ¿Cómo permitir autonomía sin perder control?
+
+<Callout variant="error" title="El riesgo real">
+Un LLM puede ser engañado (prompt injection), alucinar herramientas peligrosas, o simplemente malinterpretar el objetivo. Sin controles, un agente puede ejecutar `rm -rf /` o pushear secrets a un repo público.
+</Callout>
+
+## Defense in Depth: Múltiples Capas
+
+LocalForge implementa seguridad en **4 capas independientes**. Si una falla, las otras protegen:
+
+```
+┌─────────────────────────────────────────┐
+│  Capa 1: PolicyEngine (YAML regex)      │  ← Pre-ejecución
+│  ¿La tool está permitida con estos args? │
+├─────────────────────────────────────────┤
+│  Capa 2: Shell Allowlist/Denylist       │  ← Para run_command
+│  ¿El comando está en la lista blanca?    │
+├─────────────────────────────────────────┤
+│  Capa 3: Human-in-the-Loop (HITL)      │  ← Para tools flaggeadas
+│  ¿El usuario aprueba esta acción?        │
+├─────────────────────────────────────────┤
+│  Capa 4: AuditTrail (SHA-256 chain)    │  ← Post-ejecución
+│  Registro inmutable de toda acción       │
+└─────────────────────────────────────────┘
+```
+
+<Step number={1} title="PolicyEngine evalúa ANTES de ejecutar">
+Cada tool call pasa por el PolicyEngine que compara argumentos contra reglas YAML con regex. Resultado: ALLOW, BLOCK, o FLAG.
+</Step>
+
+<Step number={2} title="Shell controls para comandos">
+Si la tool es `run_command`, hay una segunda capa: allowlist de comandos seguros y denylist de patrones peligrosos.
+</Step>
+
+<Step number={3} title="HITL para acciones flaggeadas">
+Si el PolicyEngine retorna FLAG, la sesión se pausa y se le pregunta al usuario por WhatsApp/Telegram si aprueba.
+</Step>
+
+<Step number={4} title="AuditTrail registra TODO">
+Cada tool call (permitida, bloqueada o flaggeada) se registra en un log append-only con hash chain SHA-256.
+</Step>
+
+## Arquitectura de Archivos
+
+<FileTree>
+  app/security/
+  ├── models.py         # PolicyRule, PolicyDecision, AuditEntry
+  ├── policy_engine.py  # Evaluador de reglas YAML
+  ├── audit.py          # Log inmutable con hash chain
+  └── exceptions.py     # HitlRequiredException
+</FileTree>
+
+## Configuración por Defecto: Seguro
+
+```python
+# app/config.py
+agent_write_enabled: bool = False      # Escritura desactivada por defecto
+agent_max_iterations: int = 15
+agent_session_timeout: int = 300       # 5 minutos
+agent_shell_allowlist: str = (
+    "pytest,ruff,mypy,make,npm,git,"
+    "cat,head,tail,wc,ls,find,grep,"
+    "echo,python,node"
+)
+```
+
+<Callout variant="warning" title="agent_write_enabled = False">
+Por defecto, el agente no puede ejecutar herramientas de escritura (patches, shell commands). Solo lectura y análisis. Para habilitar escritura, el operador debe explícitamente setear `AGENT_WRITE_ENABLED=true` — opt-in, nunca opt-out.
+</Callout>
+
+## El Principio: Least Privilege
+
+| Contexto | Acceso |
+|----------|--------|
+| Chat normal | Solo tools de lectura, búsqueda, cálculo |
+| Agente sin write | Tools de lectura + búsqueda + análisis |
+| Agente con write | + patches, shell, git (con PolicyEngine) |
+| Agente con HITL | + tools peligrosas (con aprobación humana) |
+
+<Quiz
+  question="¿Cuántas capas de seguridad tiene el sistema de agentes?"
+  options={[
+    "1 (solo PolicyEngine)",
+    "2 (PolicyEngine + AuditTrail)",
+    "4 (PolicyEngine, Shell controls, HITL, AuditTrail)",
+    "Sin límite"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cuál es el valor por defecto de agent_write_enabled?"
+  options={[
+    "True (escritura habilitada)",
+    "False (escritura deshabilitada — el agente solo puede leer)",
+    "Depende del usuario",
+    "Auto-detect"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si el PolicyEngine retorna 'FLAG'?"
+  options={[
+    "Se bloquea la acción",
+    "Se ejecuta la acción normalmente",
+    "La sesión se pausa y se le pregunta al usuario si aprueba",
+    "Se registra en el log y continúa"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos el PolicyEngine en detalle.

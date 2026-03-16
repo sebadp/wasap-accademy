@@ -1,0 +1,107 @@
+---
+title: "El Loop de Ejecución"
+description: "execute_tool_loop: el ciclo LLM → tools → resultados → LLM"
+xpReward: 75
+---
+
+## El Ciclo de Tool Calling
+
+El LLM no ejecuta una sola herramienta y listo. Puede necesitar **múltiples rondas**: usar una herramienta, ver el resultado, decidir que necesita otra, y así. El `execute_tool_loop` orquesta este ciclo.
+
+```
+LLM ──tool_calls──► Ejecutar tools ──results──► LLM ──tool_calls──► ...
+                                                  │
+                                                  └──text──► Respuesta final
+```
+
+<Callout variant="info" title="MAX_TOOL_ITERATIONS = 5">
+El loop se ejecuta hasta 5 veces. Esto previene loops infinitos donde el LLM sigue pidiendo tools sin converger a una respuesta.
+</Callout>
+
+## execute_tool_loop()
+
+```python
+async def execute_tool_loop(
+    messages: list[dict],
+    ollama_client: OllamaClient,
+    registry: SkillRegistry,
+    max_iterations: int = 5,
+    pre_classified_categories: list[str] | None = None,
+) -> str:
+    tools_map = _get_cached_tools_map(registry)
+
+    for iteration in range(max_iterations):
+        # 1. Llamar al LLM con herramientas disponibles
+        response = await ollama_client.chat_with_tools(
+            messages=messages,
+            tools=_get_tool_schemas(tools_map),
+            think=False,
+        )
+
+        # 2. Si retorna texto → terminamos
+        if response.content and not response.tool_calls:
+            return response.content
+
+        # 3. Si retorna tool_calls → ejecutar
+        if response.tool_calls:
+            results = await _execute_tool_calls(
+                response.tool_calls, tools_map
+            )
+            # 4. Inyectar resultados en el historial
+            messages.append({"role": "assistant", "tool_calls": response.tool_calls})
+            for result in results:
+                messages.append({"role": "tool", "content": result.content})
+
+    # Si agotamos iteraciones, hacer una última llamada sin tools
+    return await _final_call_without_tools(messages, ollama_client)
+```
+
+## Condiciones de Terminación
+
+<Step number={1} title="Texto sin tool_calls">
+El LLM decidió que tiene suficiente información y genera la respuesta.
+</Step>
+
+<Step number={2} title="Max iteraciones alcanzado">
+Después de 5 rondas, se hace una llamada final SIN tools para forzar una respuesta de texto.
+</Step>
+
+<Step number={3} title="Error irrecuperable">
+Si todas las tools fallan, el error se inyecta como resultado y el LLM genera una disculpa.
+</Step>
+
+## pre_classified_categories
+
+```python
+# En router.py — las categorías ya fueron clasificadas en Phase C
+categories = await classify_intent(messages, context)
+
+# Se pasan al executor para evitar doble clasificación
+result = await execute_tool_loop(
+    messages=messages,
+    pre_classified_categories=categories,  # ← ya clasificado
+)
+```
+
+<Callout variant="tip" title="Evitar trabajo duplicado">
+Sin `pre_classified_categories`, el executor llamaría a `classify_intent` de nuevo. Con este parámetro, se reutiliza la clasificación que ya se hizo en el critical path.
+</Callout>
+
+<Quiz
+  question="¿Cuántas iteraciones máximas tiene el tool calling loop?"
+  options={["3", "5", "10", "Sin límite"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando se agotan las iteraciones?"
+  options={[
+    "Se retorna un error",
+    "Se hace una última llamada SIN tools para forzar una respuesta de texto",
+    "Se reinicia el loop",
+    "Se envía un mensaje vacío"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo se ejecutan múltiples tools en paralelo.

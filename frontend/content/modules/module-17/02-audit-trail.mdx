@@ -1,0 +1,226 @@
+---
+title: "AuditTrail"
+description: "Log append-only con SHA-256 hash chain para trazabilidad inmutable"
+xpReward: 100
+---
+
+## ¿Por Qué un Log Inmutable?
+
+Si un agente ejecuta una acción peligrosa, necesitás saber exactamente qué pasó: qué tool, qué argumentos, quién lo aprobó, y cuándo. Un log normal se puede editar. El AuditTrail usa una **hash chain** (como una mini-blockchain) para detectar cualquier modificación posterior.
+
+<Callout variant="info" title="Hash chain = integridad">
+Cada entrada incluye el hash de la entrada anterior. Si alguien modifica una línea del log, el hash ya no coincide con la siguiente entrada — la cadena se rompe y se detecta la manipulación.
+</Callout>
+
+## La Estructura de una Entrada
+
+```python
+# app/security/models.py
+@dataclass
+class AuditEntry:
+    timestamp: str           # ISO format
+    tool_name: str           # "run_command"
+    arguments: dict          # {"command": "ls -la"}
+    decision: str            # "allow" | "block" | "flag"
+    decision_reason: str     # "Read-only shell commands"
+    execution_result: str | None  # Output de la tool (opcional)
+    previous_hash: str       # SHA-256 de la entrada anterior
+    entry_hash: str          # SHA-256 de ESTA entrada
+```
+
+## El AuditTrail
+
+```python
+# app/security/audit.py
+class AuditTrail:
+    def __init__(self, log_path: Path, hmac_key: str | None = None):
+        self.log_path = log_path
+        self._hmac_key = hmac_key.encode() if hmac_key else None
+        self._lock = threading.Lock()  # Thread-safe
+        self._last_hash = self._initialize_log()
+
+    def _initialize_log(self) -> str:
+        """Initialize or resume the hash chain."""
+        if not self.log_path.exists():
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            return "0" * 64  # Genesis hash
+
+        # Resume from last entry
+        with self.log_path.open() as f:
+            last_line = ""
+            for line in f:
+                if line.strip():
+                    last_line = line
+            if last_line:
+                entry = json.loads(last_line)
+                return entry["entry_hash"]
+        return "0" * 64
+```
+
+<Concept title="Genesis hash">
+La primera entrada de la cadena tiene `previous_hash = "0" * 64` (64 ceros). Es el equivalente al bloque génesis de una blockchain. Todas las cadenas de hash necesitan un punto de partida.
+</Concept>
+
+## Calcular el Hash
+
+```python
+def _calculate_hash(self, payload: dict) -> str:
+    """Calculate SHA-256 (or HMAC-SHA-256) of the payload."""
+    payload_bytes = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+
+    if self._hmac_key:
+        # HMAC: el hash depende de una clave secreta
+        return hmac.new(
+            self._hmac_key,
+            payload_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+    else:
+        # Plain SHA-256
+        return hashlib.sha256(payload_bytes).hexdigest()
+```
+
+<Callout variant="tip" title="HMAC vs SHA-256 puro">
+Con SHA-256 puro, si alguien conoce el formato del log, puede recalcular los hashes después de modificar una entrada. Con HMAC, necesitaría la clave secreta (`audit_hmac_key` en config). HMAC es más seguro pero requiere gestionar un secret.
+</Callout>
+
+## Registrar una Entrada
+
+```python
+def record(
+    self,
+    tool_name: str,
+    arguments: dict,
+    decision: str,
+    decision_reason: str | None = None,
+    execution_result: str | None = None,
+) -> AuditEntry:
+    """Append an entry to the audit log. Thread-safe."""
+    with self._lock:
+        timestamp = datetime.utcnow().isoformat()
+
+        # Payload incluye previous_hash (vincula a la cadena)
+        payload = {
+            "timestamp": timestamp,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "decision": decision,
+            "decision_reason": decision_reason,
+            "execution_result": execution_result,
+            "previous_hash": self._last_hash,
+        }
+
+        entry_hash = self._calculate_hash(payload)
+
+        entry = AuditEntry(
+            timestamp=timestamp,
+            tool_name=tool_name,
+            arguments=arguments,
+            decision=decision,
+            decision_reason=decision_reason,
+            execution_result=execution_result,
+            previous_hash=self._last_hash,
+            entry_hash=entry_hash,
+        )
+
+        # Append atómico al archivo
+        with self.log_path.open("a") as f:
+            f.write(json.dumps(entry.__dict__) + "\n")
+
+        self._last_hash = entry_hash
+        return entry
+```
+
+## Ejemplo de Log
+
+```json
+{"timestamp":"2026-03-16T10:00:00","tool_name":"run_command","arguments":{"command":"ls -la"},"decision":"allow","decision_reason":"Read-only command","execution_result":"total 48\ndrwx...","previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"a1b2c3d4..."}
+{"timestamp":"2026-03-16T10:00:05","tool_name":"git_push","arguments":{"branch":"main"},"decision":"flag","decision_reason":"Push to main requires approval","execution_result":null,"previous_hash":"a1b2c3d4...","entry_hash":"e5f6a7b8..."}
+{"timestamp":"2026-03-16T10:00:10","tool_name":"run_command","arguments":{"command":"rm -rf /tmp/cache"},"decision":"allow","decision_reason":"Safe temp delete","execution_result":"","previous_hash":"e5f6a7b8...","entry_hash":"c9d0e1f2..."}
+```
+
+## Verificar Integridad de la Cadena
+
+```python
+def verify_chain(self) -> tuple[bool, int]:
+    """Verify the hash chain integrity."""
+    entries = []
+    with self.log_path.open() as f:
+        for line in f:
+            if line.strip():
+                entries.append(json.loads(line))
+
+    if not entries:
+        return True, 0
+
+    for i, entry in enumerate(entries):
+        # Recalcular hash
+        payload = {k: v for k, v in entry.items() if k != "entry_hash"}
+        expected_hash = self._calculate_hash(payload)
+
+        if expected_hash != entry["entry_hash"]:
+            return False, i  # Cadena rota en posición i
+
+        # Verificar encadenamiento
+        if i > 0 and entry["previous_hash"] != entries[i - 1]["entry_hash"]:
+            return False, i
+
+    return True, len(entries)
+```
+
+<Callout variant="warning" title="threading.Lock">
+El `_lock` garantiza que solo un thread escribe a la vez. Sin él, dos tool calls simultáneas podrían escribir con el mismo `previous_hash`, rompiendo la cadena. Esto es especialmente importante con asyncio.to_thread().
+</Callout>
+
+## Integración: Cuándo se Registra
+
+```python
+# En execute_tool_loop, después de evaluar la policy
+if audit_trail:
+    audit_trail.record(
+        tool_name=tool_call.name,
+        arguments=tool_call.arguments,
+        decision=decision.action.value,
+        decision_reason=decision.reason,
+        execution_result=result[:500] if result else None,
+    )
+```
+
+Se registra **SIEMPRE**: allow, block, y flag. Esto da una imagen completa de todas las decisiones tomadas.
+
+<Quiz
+  question="¿Qué es el 'genesis hash' en el AuditTrail?"
+  options={[
+    "El hash de la clave HMAC",
+    "64 ceros — el previous_hash de la primera entrada de la cadena",
+    "El hash del archivo de configuración",
+    "Un hash aleatorio generado al inicio"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo se detecta la manipulación del log?"
+  options={[
+    "Comparando con un backup",
+    "Recalculando el hash de cada entrada y verificando que coincida con entry_hash y que previous_hash encadene correctamente",
+    "Verificando timestamps",
+    "No se puede detectar"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa threading.Lock en el AuditTrail?"
+  options={[
+    "Para mejorar el rendimiento",
+    "Para evitar que dos escrituras simultáneas usen el mismo previous_hash, lo que rompería la cadena",
+    "Porque Python no soporta escritura concurrente a archivos",
+    "Para encriptar los datos"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos el sistema Human-in-the-Loop.

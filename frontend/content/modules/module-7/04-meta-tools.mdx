@@ -1,0 +1,105 @@
+---
+title: "Meta-Tools y Dynamic Tool Budget"
+description: "request_more_tools y distribución proporcional de herramientas"
+xpReward: 100
+---
+
+## El Problema: Tools Insuficientes
+
+El router clasifica el mensaje y selecciona ~8 tools. Pero a veces el LLM necesita una herramienta que no fue seleccionada. En vez de fallar, puede **pedir más tools**.
+
+<Callout variant="info" title="Meta-tool">
+`request_more_tools` es una herramienta especial que le permite al LLM pedir herramientas de categorías que no fueron seleccionadas inicialmente.
+</Callout>
+
+## request_more_tools
+
+```python
+async def request_more_tools(categories: str) -> str:
+    """El LLM llama esto cuando necesita herramientas de otras categorías."""
+    requested = [c.strip() for c in categories.split(",")]
+    new_tools = select_tools(requested, max_tools=4)
+    # Los nuevos tools se agregan al pool disponible
+    _add_tools_to_current_session(new_tools)
+    return f"Added tools from categories: {', '.join(requested)}"
+```
+
+## Dynamic Tool Budget
+
+Con 60+ herramientas y un límite de ~8 por llamada, ¿cómo se distribuyen?
+
+```python
+def select_tools(
+    categories: list[str],
+    max_tools: int = 8,
+) -> list[str]:
+    all_tools = []
+    for category in categories:
+        tools = TOOL_CATEGORIES.get(category, [])
+        all_tools.extend(tools)
+
+    if len(all_tools) <= max_tools:
+        return all_tools
+
+    # Distribución proporcional
+    per_category = max(1, max_tools // len(categories))
+    selected = []
+    for category in categories:
+        tools = TOOL_CATEGORIES.get(category, [])
+        selected.extend(tools[:per_category])
+
+    return selected[:max_tools]
+```
+
+<Concept title="Distribución proporcional">
+Si hay 3 categorías y budget de 8 tools: cada categoría recibe ~2-3 tools. Esto evita que una categoría con 20 tools consuma todo el budget.
+</Concept>
+
+## Ejemplo de Flujo
+
+```
+Usuario: "Buscá el clima en Tokyo y guardalo en mis notas"
+  → classify: ["weather", "notes"]
+  → select_tools: [get_weather, save_note, list_notes, search_notes]
+
+Iteración 1:
+  LLM → get_weather(city="Tokyo") → "Tokyo: 15°C, nublado"
+
+Iteración 2:
+  LLM → save_note(title="Clima Tokyo", content="15°C, nublado")
+
+  → Respuesta: "Busqué el clima en Tokyo (15°C, nublado) y lo guardé en tus notas."
+```
+
+## Por Qué Limitar a ~8 Tools
+
+| # Tools | Comportamiento de qwen3.5:9b |
+|---------|-------------------------------|
+| 1-5 | Excelente: selecciona correctamente |
+| 6-8 | Bueno: ocasionalmente ignora alguno |
+| 9-15 | Regular: empieza a inventar tools |
+| 15+ | Malo: ignora todos los tools |
+| 60+ | Catastrófico: output incoherente |
+
+<Callout variant="warning" title="Limitación del modelo">
+Los modelos pequeños (~9B params) no pueden manejar muchas herramientas. Esta es la razón de existir del two-stage routing que veremos en el próximo módulo.
+</Callout>
+
+<Quiz
+  question="¿Qué es request_more_tools?"
+  options={[
+    "Un comando del usuario",
+    "Una herramienta que permite al LLM pedir herramientas de categorías adicionales",
+    "Una función que descarga nuevos skills",
+    "Un endpoint de la API"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántas herramientas puede manejar bien qwen3.5:9b por llamada?"
+  options={["1-2", "5-8", "15-20", "Ilimitadas"]}
+  correct={1}
+/>
+
+Has completado el módulo Tool Calling & Execution. Ahora entendés el loop completo de herramientas.

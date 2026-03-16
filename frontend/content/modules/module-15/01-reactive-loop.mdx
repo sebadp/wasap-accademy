@@ -1,0 +1,245 @@
+---
+title: "Reactive Loop"
+description: "El loop iterativo con detección de repetición y circuit breaker"
+xpReward: 100
+---
+
+## El Loop Reactivo: Iterar hasta Completar
+
+El loop reactivo es la base de las sesiones agénticas. En cada iteración, el agente ejecuta una ronda de tool calling, evalúa el resultado, y decide si necesita más trabajo.
+
+```python
+# app/agent/loop.py — simplificado
+async def _run_reactive_session(session, ollama_client, ...):
+    for iteration in range(session.max_iterations):
+        session.iteration = iteration
+
+        # 1. Inyectar contexto persistente
+        _inject_scratchpad(session.context_messages, session.scratchpad)
+        _inject_task_plan(session.context_messages, session.task_plan)
+
+        # 2. Una ronda de tool calling
+        reply = await execute_tool_loop(
+            messages=session.context_messages,
+            ollama_client=ollama_client,
+            skill_registry=session_registry,
+            max_iterations=8,  # Max tools por ronda
+        )
+
+        # 3. Extraer scratchpad
+        new_scratchpad, clean_reply = _extract_scratchpad(reply)
+        if new_scratchpad:
+            session.scratchpad = new_scratchpad
+
+        # 4. Detectar loops
+        tool_history = _extract_tool_history(session.context_messages)
+        warning = _check_loop_detection(tool_history)
+        if warning:
+            session.context_messages.append(
+                ChatMessage(role="system", content=warning)
+            )
+
+        # 5. Agregar reply al historial
+        session.context_messages.append(
+            ChatMessage(role="assistant", content=clean_reply)
+        )
+
+        # 6. ¿Completó el objetivo?
+        if _is_session_complete(session, clean_reply):
+            session.status = AgentStatus.COMPLETED
+            break
+
+        # 7. Enviar progreso al usuario
+        await wa_client.send_message(
+            session.phone_number,
+            f"[Iteración {iteration + 1}] {clean_reply[:500]}"
+        )
+
+        # 8. Persistir ronda
+        append_to_session(session.phone_number, session.session_id, {
+            "iteration": iteration,
+            "reply": clean_reply,
+            "task_plan": session.task_plan,
+        })
+```
+
+## Detección de Completitud
+
+¿Cómo sabe el agente que terminó? Hay múltiples señales:
+
+```python
+def _is_session_complete(session, last_reply):
+    # 1. Plan estructurado: todas las tareas completadas
+    if session.plan and session.plan.all_done():
+        return True
+
+    # 2. Task plan markdown: no quedan [ ] pendientes
+    if session.task_plan:
+        if "[ ]" not in session.task_plan:
+            return True
+
+    # 3. Señales textuales en el reply (fallback)
+    completion_signals = [
+        "completad", "terminad", "listo", "done",
+        "finaliz", "cumplid",
+    ]
+    reply_lower = last_reply.lower()
+    return any(signal in reply_lower for signal in completion_signals)
+```
+
+<Callout variant="warning" title="Max iterations como safety net">
+Si el agente no detecta completitud después de 15 iteraciones, la sesión se marca como COMPLETED de todas formas. Es un safety net — mejor terminar con resultado parcial que correr infinitamente.
+</Callout>
+
+## Detección de Loops
+
+El problema más peligroso de un loop agéntico es que el LLM se quede repitiendo la misma acción sin avanzar. LocalForge implementa 3 niveles de detección:
+
+```python
+def _check_loop_detection(tool_history):
+    """Detectar patrones repetitivos en el historial de tools."""
+    if len(tool_history) < 3:
+        return None
+
+    # Nivel 1: CIRCUIT BREAKER — misma tool+params 5+ veces
+    last_entry = tool_history[-1]
+    same_count = sum(1 for t in tool_history if t == last_entry)
+    if same_count >= 5:
+        raise RuntimeError(
+            f"CIRCUIT_BREAKER: tool '{last_entry[0]}' called "
+            f"{same_count} times with same params"
+        )
+
+    # Nivel 2: WARNING — misma tool+params 3+ veces
+    if same_count >= 3:
+        return (
+            f"WARNING: You've called '{last_entry[0]}' {same_count} times "
+            f"with similar arguments. Try a different approach."
+        )
+
+    # Nivel 3: PING-PONG — patrón A→B→A→B
+    if len(tool_history) >= 4:
+        last_4 = tool_history[-4:]
+        if (last_4[0] == last_4[2]) and (last_4[1] == last_4[3]):
+            return (
+                "WARNING: Detected ping-pong pattern between tools. "
+                "Step back and try a fundamentally different approach."
+            )
+
+    return None
+```
+
+<Step number={1} title="Generic Repeat Warning (3+)">
+Si la misma tool con los mismos argumentos se llamó 3+ veces, se inyecta un warning como system message sugiriendo un enfoque diferente. El agente puede cambiar de estrategia.
+</Step>
+
+<Step number={2} title="Circuit Breaker (5+)">
+Si llega a 5+ repeticiones idénticas, se lanza `RuntimeError` que termina la sesión. Es irrecuperable — el agente está claramente atrapado en un loop.
+</Step>
+
+<Step number={3} title="Ping-Pong (A→B→A→B)">
+Detecta cuando dos tools se llaman alternadamente sin progreso. Ejemplo: `read_file` → `write_file` → `read_file` → `write_file`. Se inyecta warning.
+</Step>
+
+## Extracción del Tool History
+
+Para la detección de loops, se extrae un historial de tools ejecutadas:
+
+```python
+def _extract_tool_history(messages):
+    """Extraer (tool_name, params_hash) de los mensajes assistant."""
+    history = []
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                name = tc.get("function", {}).get("name", "")
+                # Hash de los argumentos para comparar
+                args_str = json.dumps(
+                    tc.get("function", {}).get("arguments", {}),
+                    sort_keys=True
+                )
+                params_hash = hashlib.md5(
+                    args_str.encode()
+                ).hexdigest()[:8]
+                history.append((name, params_hash))
+    return history[-20:]  # Solo últimas 20 entradas
+```
+
+<Concept title="MD5 para comparación, no seguridad">
+El hash MD5 de los argumentos se usa solo para comparar si dos llamadas son idénticas. No es para seguridad (MD5 está roto para eso) sino para deduplicación rápida. Truncado a 8 chars porque solo necesitamos detectar repetición, no unicidad criptográfica.
+</Concept>
+
+## Limpieza de Tool Results Viejos
+
+A medida que el agente acumula rondas, los mensajes crecen. Se limpian resultados de tools viejas:
+
+```python
+# Cada N rondas, limpiar tool results de iteraciones antiguas
+# Mantener solo los últimos 3 sets de tool results
+def _clean_old_tool_results(messages, keep_last=3):
+    tool_result_groups = []
+    current_group = []
+
+    for i, msg in enumerate(messages):
+        if msg.role == "tool":
+            current_group.append(i)
+        elif current_group:
+            tool_result_groups.append(current_group)
+            current_group = []
+
+    # Borrar todos excepto los últimos `keep_last` grupos
+    to_remove = tool_result_groups[:-keep_last] if len(tool_result_groups) > keep_last else []
+    for group in reversed(to_remove):
+        for idx in reversed(group):
+            messages.pop(idx)
+```
+
+## Progreso al Usuario
+
+Durante sesiones largas, el agente envía actualizaciones al usuario:
+
+```python
+# Cada iteración, enviar progreso
+progress_msg = f"🔄 Iteración {iteration + 1}/{session.max_iterations}"
+if session.task_plan:
+    done = session.task_plan.count("[x]")
+    total = done + session.task_plan.count("[ ]")
+    progress_msg += f" — {done}/{total} tareas completadas"
+
+await wa_client.send_message(session.phone_number, progress_msg)
+```
+
+<Quiz
+  question="¿Qué pasa si la misma tool se llama 5 veces con los mismos argumentos?"
+  options={[
+    "Se ignora y continúa",
+    "Se envía un warning al agente",
+    "Se lanza RuntimeError (circuit breaker) y la sesión termina",
+    "Se reinicia la sesión"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué es un patrón ping-pong en detección de loops?"
+  options={[
+    "Cuando una tool falla y se reintenta",
+    "Cuando dos tools se llaman alternadamente sin progreso (A→B→A→B)",
+    "Cuando el usuario no responde",
+    "Cuando el LLM genera texto vacío"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo detecta el agente que completó su objetivo?"
+  options={[
+    "Solo por las 15 iteraciones máximas",
+    "Por señales textuales ('completado', 'listo'), plan estructurado all_done(), o checklist sin [ ] pendientes",
+    "El usuario debe decir 'terminado'",
+    "Después de usar todas las herramientas disponibles"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la persistencia de sesiones en archivos JSONL.

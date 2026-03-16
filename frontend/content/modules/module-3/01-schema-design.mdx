@@ -1,0 +1,124 @@
+---
+title: "Schema Design"
+description: "13 grupos de tablas que sostienen memoria, conversaciones, trazas y más"
+xpReward: 75
+---
+
+## La Arquitectura de Datos de WasAP
+
+WasAP usa **más de 50 tablas** organizadas en 13 grupos lógicos. Cada grupo encapsula un subsistema del asistente.
+
+<Callout variant="info" title="Idempotencia">
+Todas las tablas se crean con `CREATE TABLE IF NOT EXISTS`. Podés ejecutar `init_db()` múltiples veces sin romper nada. Esto es fundamental para updates sin downtime.
+</Callout>
+
+## Los 13 Grupos de Schema
+
+<FileTree>
+  database/
+  ├── MAIN (4 tablas)
+  │   ├── conversations       # Una por usuario (phone_number)
+  │   ├── messages             # Historial de mensajes
+  │   ├── summaries            # Resúmenes de conversaciones
+  │   └── processed_messages   # Dedup atómico
+  ├── MEMORY (2 tablas)
+  │   ├── memories             # Memorias semánticas del usuario
+  │   └── memory_versions      # Historial de cambios (append-only)
+  ├── NOTES (2 tablas)
+  │   ├── notes                # Notas personales del usuario
+  │   └── vec_notes            # Índice vectorial (sqlite-vec)
+  ├── PROJECTS (5 tablas)
+  │   ├── projects             # Proyectos del usuario
+  │   ├── project_tasks        # Tareas por proyecto
+  │   ├── project_activity     # Log de actividad
+  │   ├── project_notes        # Notas por proyecto
+  │   └── vec_project_notes    # Índice vectorial
+  ├── TRACING (3 tablas)
+  │   ├── traces               # Trazas principales
+  │   ├── trace_spans          # Spans dentro de cada traza
+  │   └── trace_scores         # Scores de calidad
+  ├── EVAL (2 tablas)
+  │   ├── eval_dataset         # Dataset vivo de evaluación
+  │   └── eval_dataset_tags    # Tags por entrada
+  └── VECTORS (3 tablas)
+      ├── vec_memories         # sqlite-vec: float[768]
+      ├── vec_notes            # sqlite-vec: float[768]
+      └── vec_project_notes    # sqlite-vec: float[768]
+</FileTree>
+
+## Tablas Core: conversations y messages
+
+```sql
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_number TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user','assistant','system','tool')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT (datetime('now')),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+```
+
+<Concept title="phone_number como identificador">
+En WasAP, cada usuario se identifica por su número de teléfono. Para Telegram, se usa `tg_&lt;chat_id&gt;`. Esto evita una migración de schema al agregar plataformas — zero schema migration.
+</Concept>
+
+## Índices para Performance
+
+```sql
+-- Buscar memorias activas rápidamente
+CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active, id);
+
+-- Buscar resúmenes por conversación (con tiebreaker por id)
+CREATE INDEX IF NOT EXISTS idx_summaries_conversation
+    ON summaries(conversation_id, id);
+
+-- Mensajes recientes por conversación
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(conversation_id, created_at);
+```
+
+<Callout variant="warning" title="ORDER BY id DESC">
+SQLite `datetime('now')` puede producir timestamps idénticos en el mismo segundo. Siempre usá `ORDER BY id DESC` como tiebreaker para resultados determinísticos.
+</Callout>
+
+## Migration Strategy
+
+WasAP no usa un framework de migrations (como Alembic). En vez de eso:
+
+<Step number={1} title="CREATE TABLE IF NOT EXISTS">
+Todas las tablas se crean idempotentemente en `init_db()`.
+</Step>
+
+<Step number={2} title="Detección de constraints obsoletos">
+Para cambios como agregar un valor a un CHECK constraint, WasAP detecta el constraint viejo vía `sqlite_master` y recrea la tabla.
+</Step>
+
+<Step number={3} title="Nuevas columnas con ALTER TABLE">
+Columnas nuevas se agregan con `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (SQLite 3.35+).
+</Step>
+
+<Quiz
+  question="¿Por qué se usa ORDER BY id DESC en vez de ORDER BY created_at DESC?"
+  options={[
+    "Porque id es más rápido de comparar que timestamps",
+    "Porque datetime('now') puede producir timestamps idénticos en el mismo segundo",
+    "Porque created_at no tiene índice",
+    "Porque id es un UUID único"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántos grupos de schema tiene WasAP?"
+  options={["7", "10", "13", "20"]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo el Repository Pattern abstrae el acceso a todas estas tablas.

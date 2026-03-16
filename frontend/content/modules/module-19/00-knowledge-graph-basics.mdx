@@ -1,0 +1,106 @@
+---
+title: "Knowledge Graphs: Entidades y Relaciones"
+description: "Qué es un knowledge graph, cómo modela entidades y relaciones, y por qué importa para un AI assistant"
+xpReward: 50
+---
+
+## Mas Alla del Texto Libre
+
+Las memorias y notas guardan información como texto. Pero el texto no captura **relaciones estructuradas**. Si el usuario dice "Juan trabaja en el proyecto API con María", el texto libre guarda la oración completa. Un knowledge graph captura:
+
+- **Juan** (persona) --trabaja_en--> **proyecto API** (proyecto)
+- **María** (persona) --trabaja_en--> **proyecto API** (proyecto)
+- **Juan** (persona) --colabora_con--> **María** (persona)
+
+<Concept title="Knowledge Graph">
+Un grafo de conocimiento es una estructura de datos donde los **nodos** son entidades (personas, proyectos, herramientas, temas) y las **aristas** son relaciones entre ellas. Permite responder preguntas como "¿quién trabaja en qué?" o "¿qué temas están relacionados?" sin parsear texto libre.
+</Concept>
+
+## Schema en SQLite
+
+LocalForge modela el knowledge graph con dos tablas:
+
+```sql
+-- app/database/db.py (dentro de init_db)
+
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('person', 'topic', 'project', 'tool')),
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(name, type)
+);
+
+CREATE TABLE IF NOT EXISTS entity_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES entities(id),
+    target_id INTEGER NOT NULL REFERENCES entities(id),
+    relation_type TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(source_id, target_id, relation_type)
+);
+```
+
+<Callout variant="info" title="UNIQUE constraint">
+`UNIQUE(name, type)` en entities evita duplicados: puede haber un topic "Python" y un tool "Python", pero no dos topics "Python". En relations, `UNIQUE(source, target, relation_type)` previene aristas duplicadas.
+</Callout>
+
+## Tipos de Entidades
+
+| Tipo | Ejemplos | Fuente |
+|------|----------|--------|
+| `person` | Juan, María, el jefe | Memorias, conversación |
+| `topic` | Python, machine learning, cocina | Notas, memorias |
+| `project` | API v2, app mobile, tesis | Sistema de proyectos |
+| `tool` | Docker, PostgreSQL, FastAPI | Notas, conversación |
+
+## Por Qué un Knowledge Graph en un AI Assistant
+
+El LLM puede usar el grafo para:
+
+1. **Contexto enriquecido**: "El usuario pregunta sobre el proyecto API -> personas involucradas: Juan, María -> temas relacionados: REST, PostgreSQL"
+2. **Respuestas conectadas**: "¿Con quién trabajo en Python?" -> traversar el grafo en vez de buscar texto
+3. **Desambiguación**: "María" puede ser una persona o un proyecto. El grafo tiene el tipo explícito
+
+```python
+# Ejemplo conceptual de enriquecimiento
+async def enrich_context(entity_name: str, registry: EntityRegistry):
+    entity = await registry.get_entity(entity_name)
+    if not entity:
+        return ""
+
+    relations = await registry.get_relations(entity.id)
+    # "Juan: persona, trabaja en API v2, colabora con María"
+    return format_entity_context(entity, relations)
+```
+
+<Callout variant="tip" title="Complemento, no reemplazo">
+El knowledge graph complementa la búsqueda semántica. Los embeddings encuentran texto similar; el grafo encuentra relaciones estructuradas. Juntos dan contexto completo.
+</Callout>
+
+<Quiz
+  question="¿Qué ventaja tiene un knowledge graph sobre texto libre para almacenar relaciones?"
+  options={[
+    "Usa menos espacio en disco",
+    "Captura relaciones estructuradas que se pueden traversar programáticamente",
+    "Es más rápido de escribir",
+    "No necesita base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué constraint previene entidades duplicadas del mismo tipo?"
+  options={[
+    "PRIMARY KEY en id",
+    "CHECK(type IN (...))",
+    "UNIQUE(name, type)",
+    "REFERENCES entities(id)"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo EntityRegistry maneja CRUD y extracción automática de entidades.

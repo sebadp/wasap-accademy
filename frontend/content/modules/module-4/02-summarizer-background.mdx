@@ -1,0 +1,129 @@
+---
+title: "Summarizer Background"
+description: "Resumir conversaciones como tarea de fondo con FastAPI BackgroundTasks"
+xpReward: 75
+---
+
+## El Summarizer
+
+Cuando una conversación acumula muchos mensajes, el Summarizer se activa como **tarea de fondo** para generar un resumen y liberar espacio.
+
+<Callout variant="info" title="Background, no bloqueante">
+El Summarizer NUNCA bloquea la respuesta al usuario. Se ejecuta después de que el mensaje fue entregado.
+</Callout>
+
+## Cuándo se Activa
+
+```python
+async def maybe_summarize(
+    self, phone_number: str, threshold: int = 20
+) -> None:
+    conv_id = await self._get_conv_id(phone_number)
+    count = await self.repository.count_messages(conv_id)
+
+    if count < threshold:
+        return  # No hay suficientes mensajes
+
+    # Obtener mensajes viejos (todos menos los últimos verbatim_count)
+    old_messages = await self.repository.get_messages_before(
+        conv_id, offset=self.settings.history_verbatim_count
+    )
+    if not old_messages:
+        return
+
+    # Generar resumen con LLM
+    summary = await self._generate_summary(old_messages)
+
+    # Guardar y limpiar
+    await self.repository.save_summary(conv_id, summary)
+    await self.repository.delete_old_messages(conv_id, keep_last=8)
+```
+
+## Flush Pre-Compactación
+
+Antes de borrar mensajes viejos, el Summarizer extrae hechos importantes:
+
+```python
+async def flush_to_memory(self, phone_number: str, messages: list[dict]):
+    """Extrae facts de mensajes que van a ser borrados."""
+    prompt = FLUSH_PROMPT.format(messages=format_messages(messages))
+
+    response = await self.ollama_client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        think=False,  # Respuesta rápida, sin chain-of-thought
+    )
+
+    facts = parse_facts(response.content)
+    for fact in facts:
+        # Verificar que no sea duplicado
+        if not await self._is_duplicate(phone_number, fact):
+            await self.repository.add_memory(phone_number, fact)
+```
+
+<Concept title="flush_to_memory">
+"Flush" significa vaciar datos antes de borrarlos. Es como guardar el trabajo antes de cerrar un documento. Los hechos importantes se extraen y se guardan como memorias permanentes.
+</Concept>
+
+## BackgroundTasks de FastAPI
+
+```python
+# En el webhook handler
+@router.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    message = parse_payload(await request.json())
+    response = await process_message(message)
+
+    # El summarizer corre DESPUÉS de responder
+    background_tasks.add_task(
+        conversation.maybe_summarize, message.phone_number
+    )
+
+    return {"status": "ok"}
+```
+
+## Graceful Shutdown
+
+WasAP trackea todas las tareas de fondo para shutdown limpio:
+
+```python
+_background_tasks: set[asyncio.Task] = set()
+
+async def _track_task(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+# En shutdown:
+async def shutdown():
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+```
+
+<Callout variant="warning" title="No perder trabajo">
+Sin tracking de tareas, un shutdown mata las tareas de fondo inmediatamente. Con `_track_task()`, esperamos a que terminen antes de cerrar.
+</Callout>
+
+<Quiz
+  question="¿Qué hace flush_to_memory antes de borrar mensajes?"
+  options={[
+    "Hace un backup de toda la conversación",
+    "Extrae hechos importantes y los guarda como memorias permanentes",
+    "Envía los mensajes al usuario por email",
+    "Comprime los mensajes en formato ZIP"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa think=False en el prompt del flush?"
+  options={[
+    "Para ahorrar electricidad",
+    "Porque el modelo no soporta thinking",
+    "Para obtener una respuesta rápida sin chain-of-thought, ya que solo necesitamos extracción",
+    "Para evitar alucinaciones"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo WasAP mantiene estado entre turnos de conversación.

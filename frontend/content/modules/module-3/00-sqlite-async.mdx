@@ -1,0 +1,102 @@
+---
+title: "SQLite Async con aiosqlite"
+description: "Base de datos embebida, async, y optimizada para apps de IA local-first"
+xpReward: 50
+---
+
+## Por qué SQLite para Apps de IA
+
+Cuando construís un asistente de IA como WasAP, necesitás una base de datos que sea **rápida**, **embebida** (sin servidor separado), y que soporte el volumen de operaciones de un chatbot. SQLite es la elección perfecta para arquitecturas **local-first**.
+
+<Callout variant="info" title="Local-first">
+SQLite vive en un solo archivo. No necesitás PostgreSQL, MySQL ni ningún servidor de base de datos. Esto simplifica enormemente el deploy y reduce la superficie de ataque.
+</Callout>
+
+## aiosqlite: SQLite sin bloquear el Event Loop
+
+FastAPI es completamente async. Si usás `sqlite3` directo, cada query bloquea el event loop y tu app deja de responder. `aiosqlite` resuelve esto ejecutando las queries en un thread dedicado.
+
+```python
+import aiosqlite
+
+async def get_connection():
+    conn = await aiosqlite.connect(
+        "data/localforge.db",
+        check_same_thread=False  # Necesario para aiosqlite
+    )
+    conn.row_factory = aiosqlite.Row
+    return conn
+```
+
+<Concept title="check_same_thread=False">
+SQLite por defecto verifica que la conexión se use solo desde el thread que la creó. Como `aiosqlite` usa un thread interno, necesitamos desactivar esta verificación. Es seguro porque aiosqlite serializa el acceso internamente.
+</Concept>
+
+## PRAGMA Tuning: Rendimiento de Producción
+
+WasAP configura SQLite con PRAGMAs optimizados para rendimiento:
+
+```python
+PRAGMAS = [
+    "PRAGMA journal_mode=WAL",        # Write-Ahead Logging: lecturas no bloquean escrituras
+    "PRAGMA synchronous=NORMAL",       # Balance entre seguridad y velocidad
+    "PRAGMA cache_size=-32000",        # 32MB de cache en memoria
+    "PRAGMA temp_store=MEMORY",        # Tablas temporales en RAM
+    "PRAGMA mmap_size=30000000",       # 30MB de memory-mapped I/O
+    "PRAGMA busy_timeout=5000",        # Esperar 5s si la DB está bloqueada
+]
+```
+
+<Callout variant="warning" title="WAL Mode">
+`journal_mode=WAL` es **crítico** para una app async. Sin WAL, una escritura bloquea todas las lecturas. Con WAL, múltiples lectores pueden operar mientras un escritor trabaja.
+</Callout>
+
+## El Patrón de Inicialización
+
+En WasAP, la conexión se crea durante el `lifespan` de FastAPI:
+
+```python
+async def init_db(database_path: str) -> tuple[aiosqlite.Connection, bool]:
+    conn = await aiosqlite.connect(database_path, check_same_thread=False)
+    conn.row_factory = aiosqlite.Row
+
+    # Aplicar PRAGMAs
+    for pragma in PRAGMAS:
+        await conn.execute(pragma)
+
+    # Crear tablas (idempotente)
+    await conn.executescript(SCHEMA_SQL)
+
+    # Intentar cargar sqlite-vec
+    vec_available = await _try_load_vec(conn)
+
+    return conn, vec_available
+```
+
+<Callout variant="tip" title="Retorno dual">
+`init_db()` retorna `(conn, vec_available: bool)`. Esto permite degradación grácil: si sqlite-vec no está disponible, la app funciona sin búsqueda vectorial.
+</Callout>
+
+<Quiz
+  question="¿Por qué usamos check_same_thread=False con aiosqlite?"
+  options={[
+    "Para permitir múltiples conexiones simultáneas",
+    "Porque aiosqlite ejecuta queries en un thread interno diferente al que creó la conexión",
+    "Para desactivar el WAL mode",
+    "Para mejorar el rendimiento de las queries"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué hace PRAGMA synchronous=NORMAL?"
+  options={[
+    "Desactiva la escritura a disco completamente",
+    "Fuerza escritura sincrónica después de cada operación",
+    "Balancea entre seguridad de datos y velocidad de escritura",
+    "Activa el modo de solo lectura"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo se diseñan los 13 grupos de tablas que sostienen todo el sistema.

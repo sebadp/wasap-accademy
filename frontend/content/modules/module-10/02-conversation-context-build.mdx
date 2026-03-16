@@ -1,0 +1,127 @@
+---
+title: "ConversationContext.build()"
+description: "Factory async que centraliza la recolección de datos para el contexto"
+xpReward: 100
+---
+
+## El Factory Pattern
+
+`ConversationContext.build()` es un **async factory method** que recolecta toda la información necesaria para el contexto del LLM en un solo lugar.
+
+<Callout variant="info" title="¿Por qué factory?">
+Un constructor normal (`__init__`) no puede ser async. Como necesitamos hacer queries a la DB y llamadas a Ollama, usamos un class method async que retorna la instancia construida.
+</Callout>
+
+## ConversationContext
+
+```python
+@dataclass
+class ConversationContext:
+    query_embedding: list[float] | None = None
+    relevant_memories: list[tuple[str, float]] = field(default_factory=list)
+    relevant_notes: list[str] = field(default_factory=list)
+    daily_logs: str = ""
+    projects_summary: str = ""
+    sticky_categories: list[str] | None = None
+    user_facts: list[str] = field(default_factory=list)
+    token_estimate: int = 0
+
+    @classmethod
+    async def build(
+        cls,
+        phone_number: str,
+        user_message: str,
+        repository: Repository,
+        ollama_client: OllamaClient,
+        settings: Settings,
+        vec_available: bool = False,
+    ) -> "ConversationContext":
+        ctx = cls()
+
+        # Phase A: embed + I/O en paralelo
+        embed_task = ollama_client.embed(user_message) if vec_available else None
+        daily_task = daily_log.load_recent(settings.daily_log_days)
+
+        if embed_task:
+            ctx.query_embedding, ctx.daily_logs = await asyncio.gather(
+                embed_task, daily_task
+            )
+        else:
+            ctx.daily_logs = await daily_task
+
+        # Phase B: búsquedas en paralelo
+        tasks = [
+            repository.get_sticky_categories(phone_number),
+        ]
+        if ctx.query_embedding:
+            tasks.append(repository.search_similar_memories_with_distance(
+                phone_number, ctx.query_embedding
+            ))
+            tasks.append(repository.search_similar_notes(
+                phone_number, ctx.query_embedding
+            ))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ctx.sticky_categories = results[0] if not isinstance(results[0], Exception) else None
+        # ... parse remaining results
+
+        ctx.token_estimate = estimate_tokens(str(ctx))
+        return ctx
+```
+
+## Parallel Fetches Visualizado
+
+```
+Phase A:            Phase B:
+┌─ embed(query)     ┌─ search_memories ──┐
+│                   ├─ search_notes ─────┤
+├─ load_daily_logs  ├─ get_sticky ───────┤ → ConversationContext
+│                   ├─ get_projects ─────┤
+└─ save_message     └─ get_summary ──────┘
+     (paralelo)          (paralelo)
+```
+
+<Concept title="asyncio.gather maximiza paralelismo">
+Todas las operaciones I/O-bound de cada fase corren en paralelo. La latencia total es el max() de las operaciones individuales, no la suma.
+</Concept>
+
+## Factory vs Constructor
+
+```python
+# ❌ No se puede: __init__ no puede ser async
+class ConversationContext:
+    def __init__(self, phone, repo):
+        self.memories = await repo.get_memories(phone)  # SyntaxError!
+
+# ✅ Factory method async
+class ConversationContext:
+    @classmethod
+    async def build(cls, phone, repo):
+        ctx = cls()
+        ctx.memories = await repo.get_memories(phone)
+        return ctx
+```
+
+<Quiz
+  question="¿Por qué se usa un factory method en vez de __init__?"
+  options={[
+    "Porque __init__ no puede retornar valores",
+    "Porque __init__ no puede ser async y necesitamos hacer queries asíncronas",
+    "Porque los dataclasses no soportan __init__ custom",
+    "Para soportar herencia"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es la ventaja de ejecutar Phase A y Phase B con asyncio.gather?"
+  options={[
+    "Usa menos memoria",
+    "La latencia total es el máximo de las operaciones individuales, no la suma",
+    "Es más fácil de debuggear",
+    "Permite cancelar operaciones"
+  ]}
+  correct={1}
+/>
+
+En las siguientes lecciones veremos fact extraction y el ensamblaje final del prompt.

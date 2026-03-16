@@ -13,7 +13,7 @@ export interface ModuleMeta {
   id: string;
   title: string;
   description: string;
-  tier: "Foundation" | "Core" | "Advanced" | "Specialist" | "Capstone";
+  tier: "Foundation" | "Core" | "Intermediate" | "Advanced" | "Expert" | "Specialist" | "Production";
   order: number;
   lessons: LessonMeta[];
   totalXP: number;

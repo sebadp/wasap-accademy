@@ -1,0 +1,216 @@
+---
+title: "MCP: Model Context Protocol"
+description: "Conectar tools externas via stdio y HTTP con McpManager"
+xpReward: 100
+---
+
+## ¿Qué es MCP?
+
+**Model Context Protocol (MCP)** es un estándar abierto para conectar LLMs con tools externas. En vez de escribir un handler para cada tool, MCP define un protocolo estándar que cualquier servidor puede implementar.
+
+<Callout variant="info" title="MCP = USB para LLMs">
+Así como USB estandarizó cómo conectar dispositivos a una computadora, MCP estandariza cómo conectar tools a un LLM. Un MCP server puede ser una API de GitHub, un browser (Puppeteer), o cualquier servicio.
+</Callout>
+
+## Dos Tipos de Transporte
+
+| Transporte | Cuándo usar | Ejemplo |
+|-----------|------------|---------|
+| **stdio** | Server local (proceso hijo) | Puppeteer, mcp-fetch |
+| **HTTP** | Server remoto (Smithery, etc) | APIs externas |
+
+## McpManager: El Orquestador
+
+```python
+# app/mcp/manager.py
+class McpManager:
+    def __init__(self, config_path: str = "data/mcp_servers.json"):
+        self.config_path = config_path
+        self._server_stacks: dict[str, AsyncExitStack] = {}
+        self._sessions: dict[str, ClientSession] = {}
+        self._tools: dict[str, ToolDefinition] = {}
+        self._tools_by_server: dict[str, list[str]] = {}
+```
+
+## Conectar un Server Stdio
+
+```python
+async def _connect_server(self, name: str, cfg: dict):
+    """Connect to an MCP server and load its tools."""
+    server_stack = AsyncExitStack()
+
+    if cfg.get("type") == "http":
+        # HTTP: conectar a URL remota
+        transport = await server_stack.enter_async_context(
+            streamable_http_client(cfg["url"])
+        )
+        read, write, _ = transport
+    else:
+        # Stdio (default): lanzar proceso hijo
+        params = StdioServerParameters(
+            command=cfg["command"],
+            args=cfg.get("args", []),
+            env={**os.environ, **(cfg.get("env") or {})},
+        )
+        transport = await server_stack.enter_async_context(
+            stdio_client(params)
+        )
+        read, write = transport
+
+    # Crear sesión MCP
+    session = await server_stack.enter_async_context(
+        ClientSession(read, write)
+    )
+    await asyncio.wait_for(
+        session.initialize(),
+        timeout=MCP_CONNECT_TIMEOUT,  # 10 segundos
+    )
+
+    # Guardar referencias
+    self._server_stacks[name] = server_stack
+    self._sessions[name] = session
+
+    # Cargar tools del server
+    await self._load_tools(name, session)
+```
+
+<Concept title="AsyncExitStack per server">
+Cada server tiene su propio `AsyncExitStack` — un context manager que limpia recursos al desconectar. Esto permite hacer hot-remove de un server sin afectar a los demás.
+</Concept>
+
+## El Handler Factory: Evitar el Bug de Closure
+
+```python
+def _make_handler(session: ClientSession, tool_name: str):
+    """Factory que evita closure-over-loop-variable bug."""
+
+    async def handler(**kwargs):
+        try:
+            res = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments=kwargs),
+                timeout=MCP_TOOL_TIMEOUT,  # 30 segundos
+            )
+            text_parts = []
+            for content in res.content:
+                if content.type == "text":
+                    text_parts.append(content.text)
+                elif content.type == "image":
+                    text_parts.append(f"[Image: {content.mimeType}]")
+            return "\n".join(text_parts)
+        except TimeoutError:
+            return f"Error: tool {tool_name} timed out (30s)"
+        except Exception as e:
+            return f"Error: {e}"
+
+    return handler
+```
+
+<Callout variant="error" title="Closure bug sin factory">
+Sin la factory, este código tiene un bug clásico:
+```python
+# ❌ INCORRECTO — todas las tools llaman a la última
+for tool in tools:
+    handlers[tool.name] = lambda **kw: call(tool.name, kw)
+# tool.name es siempre el ÚLTIMO del loop
+
+# ✅ CORRECTO — factory captura el nombre
+for tool in tools:
+    handlers[tool.name] = _make_handler(session, tool.name)
+```
+El problema es que `lambda` captura la variable `tool`, no su valor. Al final del loop, `tool` es el último item, y todas las lambdas llaman a la misma tool.
+</Callout>
+
+## Cargar Tools de un Server
+
+```python
+async def _load_tools(self, server_name: str, session):
+    """List tools from server and register handlers."""
+    result = await session.list_tools()  # MCP protocol
+    self._tools_by_server[server_name] = []
+
+    for tool in result.tools:
+        # Detectar colisiones de nombre
+        if tool.name in self._tools:
+            logger.warning("MCP tool collision: %s", tool.name)
+
+        tool_def = ToolDefinition(
+            name=tool.name,
+            description=tool.description or "",
+            parameters=tool.inputSchema,
+            handler=_make_handler(session, tool.name),
+            skill_name=f"mcp::{server_name}",
+        )
+        self._tools[tool.name] = tool_def
+        self._tools_by_server[server_name].append(tool.name)
+```
+
+## Configuración: mcp_servers.json
+
+```json
+{
+  "servers": {
+    "puppeteer": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "mcp_server_puppeteer"],
+      "enabled": true,
+      "description": "Browser automation & screenshots"
+    },
+    "mcp-fetch": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@smithery/mcp-fetch"],
+      "enabled": true,
+      "description": "Plain HTTP fetch"
+    },
+    "external": {
+      "type": "http",
+      "url": "https://smithery.ai/api/mcp/...",
+      "enabled": false,
+      "description": "Remote API integration"
+    }
+  }
+}
+```
+
+## Timeouts
+
+| Timeout | Valor | Propósito |
+|---------|-------|-----------|
+| MCP_CONNECT_TIMEOUT | 10s | Conectar y hacer handshake |
+| MCP_TOOL_TIMEOUT | 30s | Ejecutar una tool call |
+
+<Quiz
+  question="¿Qué es MCP (Model Context Protocol)?"
+  options={[
+    "Un lenguaje de programación",
+    "Un estándar abierto para conectar LLMs con tools externas via un protocolo unificado",
+    "Un tipo de base de datos",
+    "Un framework de testing"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el bug de 'closure over loop variable' que la factory previene?"
+  options={[
+    "Memory leak",
+    "Todas las lambdas en un loop capturan la misma variable (la última), no el valor de cada iteración",
+    "Stack overflow",
+    "Type error"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántos segundos tiene una tool MCP para responder antes de timeout?"
+  options={[
+    "10 segundos",
+    "30 segundos",
+    "60 segundos",
+    "Sin límite"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos hot-reload de servidores MCP.

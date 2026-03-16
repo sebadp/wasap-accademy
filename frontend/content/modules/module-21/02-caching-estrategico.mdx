@@ -1,0 +1,171 @@
+---
+title: "Caching Estratégico"
+description: "Caches a nivel de módulo, invalidación, y cuándo NO cachear"
+xpReward: 100
+---
+
+## Cachear o No Cachear
+
+El caching puede reducir latencia dramáticamente, pero un cache mal implementado es peor que ningún cache. La regla fundamental:
+
+<Concept title="Cache invalidation">
+"There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton. Un cache es útil solo si sabés cuándo el dato cacheado deja de ser válido. Si no podés invalidar correctamente, no cacheés.
+</Concept>
+
+## _cached_tools_map: Cache Estático
+
+El mapa de tools (nombre -> schema) no cambia durante la ejecución normal. Se construye una sola vez:
+
+```python
+# app/skills/executor.py
+
+_cached_tools_map: dict[str, dict] | None = None
+
+def _get_cached_tools_map(
+    registry: SkillRegistry,
+    mcp_tools: list[dict] | None = None,
+) -> dict[str, dict]:
+    """Construir el tools map una sola vez, cachear después."""
+    global _cached_tools_map
+
+    if _cached_tools_map is not None:
+        return _cached_tools_map
+
+    tools_map = {}
+
+    # Skills builtin
+    for tool in registry.get_all_tools():
+        tools_map[tool.name] = tool.to_ollama_schema()
+
+    # MCP tools
+    if mcp_tools:
+        for tool in mcp_tools:
+            tools_map[tool["name"]] = tool
+
+    _cached_tools_map = tools_map
+    return _cached_tools_map
+
+
+def invalidate_tools_cache() -> None:
+    """Llamar cuando se agregan/remueven MCP servers."""
+    global _cached_tools_map
+    _cached_tools_map = None
+```
+
+<Callout variant="info" title="Invalidación explícita">
+El tools map se invalida solo cuando se conecta o desconecta un MCP server. Eso pasa raramente (al startup o si el admin agrega un server). Entre esos eventos, el cache es perfectamente válido.
+</Callout>
+
+## _conv_id_cache: Mapping Inmutable
+
+El ID de conversación para un teléfono nunca cambia (un teléfono siempre tiene el mismo conv_id):
+
+```python
+# app/conversation/manager.py
+
+class ConversationManager:
+    def __init__(self, repository: Repository):
+        self._repo = repository
+        self._conv_id_cache: dict[str, int] = {}
+
+    async def _get_conv_id(self, phone: str) -> int:
+        """Obtener conv_id, cacheando el resultado."""
+        if phone in self._conv_id_cache:
+            return self._conv_id_cache[phone]
+
+        conv_id = await self._repo.get_or_create_conversation(phone)
+        self._conv_id_cache[phone] = conv_id
+        return conv_id
+```
+
+<Concept title="Cache de mappings inmutables">
+Cuando el dato nunca cambia una vez creado (como phone -> conv_id), el cache es trivial: no necesita invalidación. Es el caso ideal para cachear.
+</Concept>
+
+## Cuándo NO Cachear
+
+No todo se beneficia del caching. Hay datos que cambian en cada request:
+
+```python
+# MAL: cachear memorias (cambian con /remember, flush, consolidation)
+_cached_memories = None  # NUNCA hacer esto
+
+# MAL: cachear el historial (cada mensaje lo modifica)
+_cached_history = None   # NUNCA hacer esto
+
+# MAL: cachear embeddings de la query (cada query es distinta)
+_cached_embedding = None # NUNCA hacer esto
+```
+
+### Decisión de Caching
+
+| Dato | Cambia con frecuencia? | Cacheable? | Invalidación |
+|------|----------------------|-----------|-------------|
+| Tools map | Casi nunca | Si | Al agregar MCP |
+| Conv ID | Nunca (inmutable) | Si | Nunca (no necesita) |
+| Memorias | Cada /remember, flush | No | Demasiado complejo |
+| Historial | Cada mensaje | No | Imposible de mantener |
+| Query embedding | Cada request | No | No tiene sentido |
+| Settings | Nunca (runtime) | Si | Restart |
+
+<Callout variant="warning" title="El cache más peligroso">
+Cachear datos que cambian frecuentemente causa bugs sutiles: el usuario hace `/remember algo`, pero el cache sigue sirviendo las memorias viejas. El LLM no "ve" la memoria nueva. Debugging: pesadilla.
+</Callout>
+
+## Pattern: Compute Once Per Request
+
+Para datos que se usan múltiples veces en el mismo request pero cambian entre requests:
+
+```python
+async def _handle_message(phone, text, ...):
+    # Calcular UNA vez, reusar muchas
+    query_embedding = await ollama.embed(text)
+
+    # Usar el mismo embedding para búsqueda de memorias Y notas
+    memories = await repository.search_similar_memories(query_embedding)
+    notes = await repository.search_similar_notes(query_embedding)
+    # No re-computar el embedding para cada búsqueda
+```
+
+Esto no es un cache persistente, es **compute-once-per-request**: el embedding se calcula una vez y se pasa a todas las funciones que lo necesitan dentro del mismo request.
+
+## Module-Level vs Instance-Level
+
+```python
+# Module-level: compartido por todos los requests
+_cached_tools_map: dict | None = None      # OK: cambia raramente
+
+# Instance-level: compartido por un ConversationManager
+self._conv_id_cache: dict[str, int] = {}   # OK: inmutable per-phone
+
+# Request-level: solo vive durante un request
+query_embedding = await ollama.embed(text)  # OK: compute once, use many
+```
+
+<Callout variant="tip" title="Regla de oro">
+Si no podés definir claramente cuándo invalidar el cache, no lo implementes. Un cache stale es peor que recalcular.
+</Callout>
+
+<Quiz
+  question="¿Por qué _conv_id_cache nunca necesita invalidación?"
+  options={[
+    "Porque se invalida automáticamente cada hora",
+    "Porque el mapping phone → conv_id es inmutable: una vez creado, nunca cambia",
+    "Porque SQLite maneja la invalidación internamente",
+    "Porque se recrea en cada request"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se invalida _cached_tools_map?"
+  options={[
+    "En cada request",
+    "Cada 5 minutos",
+    "Cuando se conecta o desconecta un MCP server",
+    "Nunca se invalida"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo optimizar SQLite con PRAGMAs y indexes.

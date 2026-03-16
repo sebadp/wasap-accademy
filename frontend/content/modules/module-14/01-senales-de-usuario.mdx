@@ -1,0 +1,270 @@
+---
+title: "Señales de Usuario"
+description: "Reacciones de WhatsApp, /rate y /feedback como fuentes de eval data"
+xpReward: 75
+---
+
+## El Problema: ¿Cómo Sabe el Bot Si Hizo Bien?
+
+Los guardrails detectan problemas técnicos (PII, JSON crudo, idioma), pero no pueden evaluar **calidad subjetiva**: ¿la respuesta fue útil?, ¿fue demasiado larga?, ¿el tono fue apropiado? Para eso necesitamos **señales del usuario real**.
+
+<Callout variant="info" title="3 canales de señal">
+LocalForge captura feedback del usuario por tres vías: reacciones de WhatsApp (pasivas), el comando `/rate` (numérico), y el comando `/feedback` (texto libre). Cada uno genera un trace score que alimenta el pipeline de curación.
+</Callout>
+
+## Canal 1: Reacciones de WhatsApp
+
+WhatsApp permite reaccionar a mensajes con emojis. LocalForge intercepta estas reacciones y las convierte en scores numéricos:
+
+```python
+# app/webhook/router.py
+_REACTION_SCORE_MAP: dict[str, float] = {
+    "👍": 1.0,
+    "❤️": 1.0,
+    "🙏": 0.9,
+    "😂": 0.8,
+    "😮": 0.5,
+    "😢": 0.2,
+    "👎": 0.0,
+}
+```
+
+<Concept title="Mapeo semántico de emojis">
+No todos los emojis son iguales. 👍 y ❤️ son claramente positivos (1.0). 😮 es neutral (0.5). 😢 y 👎 son negativos. Un emoji no mapeado recibe 0.5 por defecto. Este mapeo simple pero efectivo convierte una señal cualitativa en cuantitativa.
+</Concept>
+
+## El Handler de Reacciones
+
+```python
+async def _handle_reaction(reaction, repository, wa_client=None, settings=None) -> None:
+    """Convert a WhatsApp reaction to a trace score and trigger dataset curation."""
+    from app.models import WhatsAppReaction
+
+    if not isinstance(reaction, WhatsAppReaction):
+        return
+    try:
+        # 1. Encontrar la traza asociada al mensaje reaccionado
+        trace_id = await repository.get_trace_id_by_wa_message_id(
+            reaction.reacted_message_id
+        )
+        if not trace_id:
+            return
+
+        # 2. Convertir emoji → score numérico
+        value = _REACTION_SCORE_MAP.get(reaction.emoji, 0.5)
+
+        # 3. Guardar como trace score
+        await repository.save_trace_score(
+            trace_id=trace_id,
+            name="user_reaction",
+            value=value,
+            source="user",
+            comment=reaction.emoji,
+        )
+```
+
+<Callout variant="tip" title="Vinculación por message_id">
+La clave es `get_trace_id_by_wa_message_id`: conecta el mensaje de WhatsApp (que el usuario reacciona) con la traza interna (que tiene toda la info de procesamiento). Sin esta vinculación, la reacción sería inútil.
+</Callout>
+
+## Reacciones Negativas: Solicitar Corrección
+
+Cuando la reacción es muy negativa (score ≤ 0.2, como 👎 o 😢), el bot proactivamente pide la respuesta correcta:
+
+```python
+        # Para reacciones muy negativas, pedir corrección
+        if value <= 0.2 and wa_client:
+            existing_scores = await repository.get_trace_scores(trace_id)
+            already_prompted = any(
+                s["name"] == "correction_prompted" for s in existing_scores
+            )
+            if not already_prompted:
+                # Marcar que ya se pidió corrección (evitar spam)
+                await repository.save_trace_score(
+                    trace_id=trace_id,
+                    name="correction_prompted",
+                    value=1.0,
+                    source="system",
+                    comment="correction prompt sent after negative reaction",
+                )
+                # Enviar mensaje pidiendo la respuesta correcta
+                await wa_client.send_message(
+                    reaction.from_number,
+                    "Vi que no te gustó mi respuesta. "
+                    "¿Qué debería haber dicho? "
+                    "Respondé con la respuesta correcta y la recordaré para mejorar.",
+                )
+```
+
+<Callout variant="warning" title="Anti-spam: correction_prompted">
+El score `correction_prompted` actúa como flag de deduplicación. Si el usuario reacciona con 👎 tres veces al mismo mensaje, solo se pide corrección UNA vez. Sin esta protección, el bot spamearía al usuario.
+</Callout>
+
+## Alimentar el Pipeline de Curación
+
+Después de guardar el score de reacción, se dispara la curación automática:
+
+```python
+        # Feed reaction signal into the dataset curation pipeline
+        if settings and getattr(settings, "eval_auto_curate", False):
+            io = await repository.get_trace_io_by_id(trace_id)
+            if io:
+                input_text, output_text = io
+                _track_task(
+                    asyncio.create_task(
+                        maybe_curate_to_dataset(
+                            trace_id=trace_id,
+                            input_text=input_text,
+                            output_text=output_text,
+                            repository=repository,
+                        )
+                    )
+                )
+```
+
+## Canal 2: /rate — Calificación Numérica
+
+El comando `/rate` permite una calificación explícita del 1 al 5:
+
+```python
+# app/commands/builtins.py
+async def cmd_rate(args: str, context: CommandContext) -> str:
+    """Rate the last response on a 1-5 scale."""
+    try:
+        score = int(args.strip())
+        if not 1 <= score <= 5:
+            raise ValueError
+    except ValueError:
+        return "Uso: /rate <1-5>\nEjemplo: /rate 4"
+
+    trace_id = await context.repository.get_latest_trace_id(context.phone_number)
+    if not trace_id:
+        return "No encontré una interacción reciente para evaluar."
+
+    from app.tracing.recorder import TraceRecorder
+
+    recorder = TraceRecorder(context.repository)
+    await recorder.add_score(
+        trace_id=trace_id,
+        name="human_rating",
+        value=score / 5.0,         # Normalizar 1-5 → 0.0-1.0
+        source="human",
+        comment=f"{score}/5",
+    )
+    return f"Calificación {score}/5 registrada. ¡Gracias!"
+```
+
+<Concept title="Normalización a 0.0-1.0">
+Todas las señales se normalizan al rango 0.0-1.0, sin importar su escala original. `/rate 1` → 0.2, `/rate 3` → 0.6, `/rate 5` → 1.0. Esto permite que el pipeline de curación use los mismos umbrales (< 0.3 = failure, ≥ 0.8 = golden) para todas las fuentes.
+</Concept>
+
+## Canal 3: /feedback — Texto Libre con Análisis de Sentimiento
+
+El `/feedback` acepta texto libre y usa el LLM para analizar el sentimiento:
+
+```python
+async def cmd_feedback(args: str, context: CommandContext) -> str:
+    """Tag the last interaction with human feedback (free text)."""
+    if not args.strip():
+        return "Uso: /feedback <comentario>"
+
+    trace_id = await context.repository.get_latest_trace_id(context.phone_number)
+    if not trace_id:
+        return "No encontré una interacción reciente para evaluar."
+
+    # Analizar sentimiento con LLM para asignar score numérico
+    sentiment_value = 0.5  # default: neutral
+    if context.ollama_client:
+        try:
+            result = await context.ollama_client.chat(
+                [ChatMessage(role="user", content=(
+                    "Rate the sentiment of this feedback about an AI response "
+                    "on a scale of 0.0 to 1.0. "
+                    "0.0=very negative, 0.5=neutral, 1.0=very positive. "
+                    "Reply ONLY with the number, nothing else.\n\n"
+                    f"Feedback: {args.strip()}"
+                ))]
+            )
+            sentiment_value = max(0.0, min(1.0, float(result.strip())))
+        except (ValueError, Exception):
+            pass  # keep default 0.5
+
+    recorder = TraceRecorder(context.repository)
+    await recorder.add_score(
+        trace_id=trace_id,
+        name="human_feedback",
+        value=sentiment_value,
+        source="human",
+        comment=args.strip(),
+    )
+    return "Gracias por el feedback. Lo voy a tener en cuenta para mejorar."
+```
+
+<Callout variant="tip" title="LLM como clasificador de sentimiento">
+El feedback "estuvo buena la respuesta pero muy larga" no es ni positivo ni negativo puro. El LLM asigna ~0.6 (ligeramente positivo). Esto es más informativo que un simple positivo/negativo binario.
+</Callout>
+
+## Correction Pairs desde Reply Context
+
+Cuando el usuario responde a un mensaje del bot con una corrección, el sistema lo detecta automáticamente:
+
+```python
+# En _run_normal_flow, después de detectar correction_score == 0.0
+if correction_score == 0.0 and settings.eval_auto_curate:
+    prev_trace = await repository.get_trace_with_spans(prev_trace_id)
+    _track_task(
+        asyncio.create_task(
+            add_correction_pair(
+                previous_trace_id=prev_trace_id,
+                input_text=(prev_trace["input_text"] if prev_trace else ""),
+                bad_output=(prev_trace["output_text"] if prev_trace else None),
+                correction_text=user_text,
+                repository=repository,
+            )
+        )
+    )
+```
+
+## Resumen: El Ciclo de Señales
+
+| Canal | Source | Name | Rango | Ejemplo |
+|-------|--------|------|-------|---------|
+| Reacción emoji | `"user"` | `user_reaction` | 0.0-1.0 | 👍→1.0, 👎→0.0 |
+| `/rate` | `"human"` | `human_rating` | 0.0-1.0 | 4/5 → 0.8 |
+| `/feedback` | `"human"` | `human_feedback` | 0.0-1.0 | "Muy útil" → ~0.9 |
+| Reply correction | `"human"` | `correction_received` | 1.0 | Siempre 1.0 |
+
+<Quiz
+  question="¿Qué pasa cuando un usuario reacciona con 👎 a un mensaje?"
+  options={[
+    "Se borra el mensaje",
+    "Se guarda score 0.0, se pide corrección al usuario, y se alimenta el pipeline de curación",
+    "Se envía una disculpa automática",
+    "Se ignora la reacción"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué /feedback usa un LLM para analizar sentimiento?"
+  options={[
+    "Porque Python no puede analizar texto",
+    "Porque el feedback en texto libre no tiene score numérico inherente, y el LLM puede asignar un valor 0.0-1.0",
+    "Porque Langfuse lo requiere",
+    "Porque es más rápido que regex"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el umbral para que una señal de usuario sea considerada 'negativa' en el pipeline?"
+  options={[
+    "< 0.1",
+    "< 0.3",
+    "< 0.5",
+    "= 0.0"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo usar el dataset para evaluación offline con LLM-as-judge.

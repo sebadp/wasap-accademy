@@ -1,0 +1,122 @@
+---
+title: "Vector Storage con sqlite-vec"
+description: "Búsqueda vectorial nativa en SQLite para embeddings de 768 dimensiones"
+xpReward: 75
+---
+
+## Qué es sqlite-vec
+
+sqlite-vec es una extensión nativa de SQLite que agrega **búsqueda de similitud vectorial**. Esto permite hacer RAG (Retrieval-Augmented Generation) sin necesitar Pinecone, Weaviate, ni ningún servicio externo.
+
+<Callout variant="tip" title="Todo en un archivo">
+Con sqlite-vec, tus embeddings viven en el mismo archivo SQLite que tus datos. Sin infraestructura adicional, sin latencia de red.
+</Callout>
+
+## Tablas Virtuales vec0
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories
+USING vec0(
+    memory_id INTEGER PRIMARY KEY,
+    embedding float[768]
+);
+```
+
+<Concept title="float[768]">
+Cada embedding es un vector de 768 números decimales. El modelo `nomic-embed-text` de Ollama genera vectores de exactamente 768 dimensiones. Cada dimensión captura un aspecto del significado del texto.
+</Concept>
+
+## Cargar la Extensión
+
+sqlite-vec es una extensión compilada en C. Hay que cargarla explícitamente:
+
+```python
+async def _try_load_vec(conn: aiosqlite.Connection) -> bool:
+    try:
+        # Acceder a la conexión subyacente de sqlite3
+        raw_conn = conn._connection
+        raw_conn.enable_load_extension(True)
+        raw_conn.load_extension("vec0")
+        raw_conn.enable_load_extension(False)  # Seguridad: desactivar después
+        return True
+    except Exception as e:
+        logger.warning("sqlite-vec not available: %s", e)
+        return False
+```
+
+<Callout variant="warning" title="conn._connection">
+`aiosqlite` envuelve la conexión nativa de `sqlite3`. Para cargar extensiones necesitamos acceder a `conn._connection`. Esto es seguro durante la inicialización porque aún no hay queries concurrentes.
+</Callout>
+
+## Serialización de Vectores
+
+Los vectores se almacenan como blobs binarios usando `struct.pack`:
+
+```python
+import struct
+
+def serialize_vector(vector: list[float]) -> bytes:
+    """Convierte lista de floats a blob binario."""
+    return struct.pack(f"{len(vector)}f", *vector)
+
+# Ejemplo: 768 floats → 3072 bytes (768 × 4 bytes por float)
+embedding = [0.1, 0.2, ..., 0.768]  # 768 dimensiones
+blob = serialize_vector(embedding)
+```
+
+## Guardar y Buscar
+
+```python
+# Guardar embedding
+async def save_embedding(self, memory_id: int, vector: list[float]):
+    blob = struct.pack(f"{len(vector)}f", *vector)
+    await self.conn.execute(
+        "INSERT INTO vec_memories (memory_id, embedding) VALUES (?, ?)",
+        (memory_id, blob),
+    )
+    await self.conn.commit()
+
+# Buscar similares (distancia L2)
+async def search_similar_memories(
+    self, query_vector: list[float], top_k: int = 10
+) -> list[tuple[int, float]]:
+    blob = struct.pack(f"{len(query_vector)}f", *query_vector)
+    cursor = await self.conn.execute(
+        "SELECT memory_id, distance FROM vec_memories "
+        "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        (blob, top_k),
+    )
+    return [(row[0], row[1]) for row in await cursor.fetchall()]
+```
+
+## Degradación Grácil
+
+WasAP funciona **sin** sqlite-vec. Si la extensión no se puede cargar:
+
+```python
+conn, vec_available = await init_db(database_path)
+# vec_available = False → la app usa get_active_memories() como fallback
+```
+
+<Callout variant="info" title="Best-effort">
+Este es un patrón clave de WasAP: los embeddings son "best-effort". Si fallan, se loguea un warning y la app sigue funcionando con búsqueda por recencia.
+</Callout>
+
+<Quiz
+  question="¿Cuántas dimensiones tiene cada embedding de nomic-embed-text?"
+  options={["128", "256", "512", "768"]}
+  correct={3}
+/>
+
+<Quiz
+  question="¿Qué pasa si sqlite-vec no está disponible?"
+  options={[
+    "La app no inicia",
+    "Se lanza una excepción en cada búsqueda",
+    "La app funciona con búsqueda por recencia como fallback",
+    "Se descarga automáticamente"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo de Database & Persistence. Ahora entendés cómo WasAP gestiona datos desde SQLite async hasta búsqueda vectorial.

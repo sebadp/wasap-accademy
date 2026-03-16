@@ -1,0 +1,99 @@
+---
+title: "Fact Extraction"
+description: "Extraer datos del usuario con regex — sin LLM, rápido y determinístico"
+xpReward: 75
+---
+
+## Extracción sin LLM
+
+WasAP extrae hechos del usuario de sus memorias usando **regex puro**. No necesita llamar al LLM para saber que "Soy Juan, trabajo en Buenos Aires" contiene un nombre y una ubicación.
+
+<Callout variant="tip" title="¿Por qué no LLM?">
+Un LLM tardaría ~500ms y consumiría tokens. Los regex tardan <1ms y son determinísticos. Para patrones conocidos (nombre, ubicación, rol), regex es suficiente.
+</Callout>
+
+## fact_extractor.py
+
+```python
+# app/context/fact_extractor.py
+import re
+
+PATTERNS = {
+    "name": [
+        r"(?:me llamo|mi nombre es|soy)\s+(\w+)",
+        r"(?:my name is|i'm|i am)\s+(\w+)",
+    ],
+    "location": [
+        r"(?:vivo en|estoy en|soy de)\s+(.+?)(?:\.|,|$)",
+        r"(?:i live in|i'm from|based in)\s+(.+?)(?:\.|,|$)",
+    ],
+    "role": [
+        r"(?:trabajo como|soy|work as)\s+(.+?)(?:\.|,|$)",
+        r"(?:i'm a|i am a)\s+(.+?)(?:\.|,|$)",
+    ],
+    "preference": [
+        r"(?:prefiero|me gusta|prefer)\s+(.+?)(?:\.|,|$)",
+    ],
+}
+
+def extract_user_facts(memories: list[str]) -> dict[str, list[str]]:
+    facts: dict[str, list[str]] = {}
+    text = "\n".join(memories).lower()
+
+    for category, patterns in PATTERNS.items():
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                facts.setdefault(category, []).extend(matches)
+
+    return facts
+```
+
+## Resultado
+
+```python
+memories = [
+    "Me llamo Sebastián",
+    "Trabajo como backend developer en Buenos Aires",
+    "Prefiero respuestas técnicas y directas",
+]
+
+facts = extract_user_facts(memories)
+# {
+#     "name": ["sebastián"],
+#     "location": ["buenos aires"],
+#     "role": ["backend developer en buenos aires"],
+#     "preference": ["respuestas técnicas y directas"],
+# }
+```
+
+## Inyección en el Contexto
+
+Los facts extraídos se usan para personalizar la respuesta:
+
+```python
+# En _build_context()
+if ctx.user_facts:
+    fact_text = "\n".join(
+        f"- {cat}: {', '.join(vals)}"
+        for cat, vals in ctx.user_facts.items()
+    )
+    builder.add_section("user_profile", fact_text)
+```
+
+<Concept title="Separación de concerns">
+La extracción de facts NO modifica las memorias ni crea datos nuevos. Solo lee las memorias existentes y extrae patrones. Es una vista derivada, no una fuente de datos.
+</Concept>
+
+<Quiz
+  question="¿Por qué la extracción de facts usa regex en vez de LLM?"
+  options={[
+    "Porque el LLM no puede extraer datos",
+    "Porque regex es rápido (<1ms), determinístico, y suficiente para patrones conocidos",
+    "Porque regex es más preciso",
+    "Porque el LLM está ocupado con otras tareas"
+  ]}
+  correct={1}
+/>
+
+En la última lección ensamblamos el prompt final completo.

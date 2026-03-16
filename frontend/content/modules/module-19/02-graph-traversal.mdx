@@ -1,0 +1,213 @@
+---
+title: "Graph Traversal y Enriquecimiento"
+description: "BFS para explorar el grafo, límites por hop, y cómo inyectar contexto de grafo en el prompt"
+xpReward: 100
+---
+
+## Traversar el Grafo
+
+Tener entidades y relaciones almacenadas es solo la mitad. El valor real está en **traversar** el grafo para descubrir conexiones que enriquezcan la respuesta del LLM.
+
+<Concept title="BFS (Breadth-First Search)">
+BFS explora un grafo nivel por nivel. Desde una entidad, primero visita todos sus vecinos directos (depth=1), luego los vecinos de los vecinos (depth=2), y así sucesivamente. Es ideal para knowledge graphs porque las conexiones más cercanas suelen ser las más relevantes.
+</Concept>
+
+## traverse() en graph.py
+
+```python
+# app/ontology/graph.py
+from collections import deque
+
+async def traverse(
+    registry: EntityRegistry,
+    entity_id: int,
+    depth: int = 1,
+    max_per_hop: int = 10,
+) -> list[dict]:
+    """
+    BFS desde entity_id hasta `depth` niveles.
+    Retorna lista de {entity, relation, distance}.
+    Cap de max_per_hop nodos por nivel para evitar explosión.
+    """
+    visited: set[int] = {entity_id}
+    queue: deque[tuple[int, int]] = deque([(entity_id, 0)])
+    results: list[dict] = []
+
+    while queue:
+        current_id, current_depth = queue.popleft()
+
+        if current_depth >= depth:
+            continue
+
+        relations = await registry.get_relations(current_id)
+        hop_count = 0
+
+        for rel in relations:
+            # Obtener el otro extremo de la relación
+            neighbor_id = (
+                rel["target_id"]
+                if rel["source_id"] == current_id
+                else rel["source_id"]
+            )
+
+            if neighbor_id in visited:
+                continue
+
+            visited.add(neighbor_id)
+            hop_count += 1
+
+            if hop_count > max_per_hop:
+                break  # Cap por hop
+
+            entity = await registry.get_entity(neighbor_id)
+            results.append({
+                "entity": entity,
+                "relation": rel["relation_type"],
+                "distance": current_depth + 1,
+            })
+
+            queue.append((neighbor_id, current_depth + 1))
+
+    return results
+```
+
+<Callout variant="warning" title="Cap de 10 nodos por hop">
+Sin el cap, una entidad muy conectada (ej: "Python" como topic) podria generar cientos de resultados. `max_per_hop=10` limita la exploración a los primeros 10 vecinos por nivel, manteniendo el traversal rápido y el contexto acotado.
+</Callout>
+
+## Visualizando el Traversal
+
+```
+Depth 0:  [Juan] ← entidad de partida
+              │
+Depth 1:  [API v2] ──trabaja_en
+          [María]  ──colabora_con
+          [Python] ──usa
+              │
+Depth 2:  [PostgreSQL] ──usa (desde API v2)
+          [Deploy]     ──relacionado (desde API v2)
+```
+
+Con `depth=1`, solo obtenemos API v2, María y Python. Con `depth=2`, también PostgreSQL y Deploy.
+
+## enricher.py: De Grafo a Texto
+
+El LLM no entiende grafos directamente. `enricher.py` convierte el resultado del traversal en texto:
+
+```python
+# app/ontology/enricher.py
+
+GRAPH_CONTEXT_BUDGET = 1000  # caracteres máximo
+
+async def enrich_from_graph(
+    registry: EntityRegistry,
+    entity_names: list[str],
+    depth: int = 1,
+) -> str:
+    """Generar contexto de texto desde el knowledge graph."""
+    sections = []
+
+    for name in entity_names:
+        entity = await registry.find_entity(name)
+        if not entity:
+            continue
+
+        neighbors = await traverse(registry, entity["id"], depth=depth)
+        if not neighbors:
+            continue
+
+        lines = [f"{entity['name']} ({entity['type']}):"]
+        for n in neighbors:
+            e = n["entity"]
+            lines.append(f"  - {n['relation']} → {e['name']} ({e['type']})")
+
+        sections.append("\n".join(lines))
+
+    result = "\n\n".join(sections)
+
+    # Respetar budget de caracteres
+    if len(result) > GRAPH_CONTEXT_BUDGET:
+        result = result[:GRAPH_CONTEXT_BUDGET] + "..."
+
+    return result
+```
+
+## Inyección en ConversationContext
+
+El texto enriquecido se inyecta como una sección XML en el prompt:
+
+```python
+# En _build_context() de router.py
+if graph_context:
+    builder.add_section("knowledge_graph", graph_context)
+```
+
+Resultado en el prompt:
+
+```xml
+<knowledge_graph>
+Juan (person):
+  - trabaja_en → API v2 (project)
+  - colabora_con → María (person)
+  - usa → Python (tool)
+
+API v2 (project):
+  - usa → PostgreSQL (tool)
+</knowledge_graph>
+```
+
+<Callout variant="tip" title="Budget de ~1000 caracteres">
+El grafo compite por tokens con memorias, notas e historial. ~1000 caracteres (~250 tokens) es suficiente para las conexiones más relevantes sin consumir demasiado presupuesto.
+</Callout>
+
+## Cuándo Se Activa el Traversal
+
+No todos los mensajes necesitan contexto de grafo. El traversal se activa cuando:
+
+1. La query del usuario menciona una entidad conocida
+2. Las memorias semánticas retornan entidades con relaciones
+3. El mensaje está en contexto de un proyecto activo
+
+```python
+# Detección de entidades en la query
+mentioned = extract_entities(user_message)
+if mentioned:
+    graph_context = await enrich_from_graph(
+        registry, [name for name, _ in mentioned], depth=1
+    )
+```
+
+<Quiz
+  question="¿Qué algoritmo usa traverse() para explorar el knowledge graph?"
+  options={[
+    "DFS (Depth-First Search)",
+    "BFS (Breadth-First Search)",
+    "Dijkstra",
+    "A*"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se limita a 10 nodos por hop?"
+  options={[
+    "Porque SQLite no soporta más de 10 JOINs",
+    "Para evitar explosión combinatoria en entidades muy conectadas",
+    "Porque el LLM solo puede procesar 10 entidades",
+    "Es un límite arbitrario sin justificación técnica"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el budget de caracteres para el contexto de grafo?"
+  options={[
+    "500 caracteres",
+    "1000 caracteres",
+    "2000 caracteres",
+    "Sin límite"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo rastrear el origen y las mutaciones de cada entidad con data provenance.

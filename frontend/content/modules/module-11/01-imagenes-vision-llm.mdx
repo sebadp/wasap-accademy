@@ -1,0 +1,254 @@
+---
+title: "Imágenes: Vision LLM"
+description: "Análisis de imágenes con llava:7b via Ollama y el flujo de two-model pipeline"
+xpReward: 75
+---
+
+## El Problema: Un LLM de Texto No Ve
+
+El modelo principal de LocalForge (`qwen3.5:9b`) es excelente para texto, pero no puede procesar imágenes. Para soportar fotos enviadas por chat, necesitamos un **vision model** separado.
+
+<Callout variant="info" title="Two-model pipeline">
+LocalForge usa un pipeline de dos modelos: **llava:7b** describe la imagen en texto, y luego **qwen3.5:9b** procesa esa descripción como parte del contexto de conversación. No es un modelo multimodal end-to-end, sino una composición de especialistas.
+</Callout>
+
+## El Vision Model: LLaVA
+
+**LLaVA (Large Language and Vision Assistant)** combina un encoder visual con un LLM para generar descripciones textuales de imágenes. Se ejecuta localmente via Ollama.
+
+| Aspecto | Chat (qwen3.5:9b) | Vision (llava:7b) |
+|---------|-------------------|-------------------|
+| Input | Texto | Texto + imágenes |
+| Output | Texto | Texto (descripción) |
+| Tools | Sí | No |
+| Think mode | Sí | No |
+| Uso | Conversación principal | Solo describir imágenes |
+
+## Configuración
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    vision_model: str = "llava:7b"
+```
+
+Overrideable via env var `VISION_MODEL`. Si necesitás más calidad, podés usar `llava:13b` o `llava:34b`, con más VRAM.
+
+## El Flujo de Imagen Completo
+
+```
+┌──────────────┐    ┌──────────────┐    ┌───────────┐    ┌───────────┐
+│  WhatsApp    │───▶│  download_   │───▶│  llava:7b  │───▶│  qwen3.5  │
+│  photo msg   │    │  media()     │    │  describe  │    │  respond  │
+│  (JPEG/PNG)  │    │  → bytes     │    │  → text    │    │  → reply  │
+└──────────────┘    └──────────────┘    └───────────┘    └───────────┘
+```
+
+## Paso 1: Download + Base64
+
+Cuando llega una imagen, primero se descarga y convierte a Base64:
+
+```python
+# app/webhook/router.py — en _handle_message
+if msg.type == "image" and msg.media_id:
+    try:
+        image_bytes = await platform_client.download_media(msg.media_id)
+        image_b64 = base64.b64encode(image_bytes).decode()
+```
+
+<Concept title="Base64 encoding para Ollama">
+Ollama espera las imágenes como strings Base64 en el campo `images` del mensaje. Una imagen de 1MB se convierte en ~1.3MB de texto Base64 (overhead del 33%). Este encoding es el estándar de facto para pasar binarios en JSON.
+</Concept>
+
+## Paso 2: LLaVA Describe la Imagen
+
+```python
+        # Step 1: llava describes the image
+        vision_messages = [
+            ChatMessage(
+                role="user",
+                content="Describe this image in detail.",
+                images=[image_b64],
+            ),
+        ]
+        description = await ollama_client.chat(
+            vision_messages,
+            model=settings.vision_model,  # llava:7b
+        )
+        logger.info(
+            "Vision description [%s]: %s",
+            msg.user_id, description[:120],
+        )
+```
+
+El campo `images` en `ChatMessage` acepta una lista de strings Base64. `OllamaClient.chat()` pasa este campo tal cual a la API de Ollama:
+
+```python
+# app/llm/client.py
+def _build_message_dicts(self, messages: list[ChatMessage]) -> list[dict]:
+    msg_dicts = []
+    for m in messages:
+        d: dict = {"role": m.role, "content": m.content}
+        if m.images:
+            d["images"] = m.images  # Lista de Base64 strings
+        msg_dicts.append(d)
+    return msg_dicts
+```
+
+## Paso 3: Qwen3 Responde con Contexto de Imagen
+
+La descripción generada por LLaVA se inyecta en el contexto de conversación de qwen3:
+
+```python
+        # Normal image flow: pass description to qwen3 with context
+        user_text = msg.text or "Describe what you see in this image"
+        history_text = f"[Image] {user_text}"
+        await conversation.add_message(
+            msg.user_id, "user", history_text, msg.message_id
+        )
+
+        # Build full conversation context
+        context = await conversation.get_context(
+            msg.user_id, settings.system_prompt, memories
+        )
+
+        # Add image description as context for qwen3
+        context.append(
+            ChatMessage(
+                role="user",
+                content=(
+                    f"[The user sent an image. Description: {description}]"
+                    f"\n\n{user_text}"
+                ),
+            )
+        )
+
+        reply = await ollama_client.chat(context)
+        await conversation.add_message(msg.user_id, "assistant", reply)
+        await platform_client.send_message(
+            msg.user_id, platform_client.format_text(reply)
+        )
+```
+
+<Concept title="Injection pattern: [Image] prefix">
+En el historial de conversación, la imagen se guarda como `[Image] caption_o_default`. Qwen3 nunca "ve" la imagen directamente — solo lee la descripción generada por LLaVA. Esto mantiene la separación de responsabilidades entre modelos.
+</Concept>
+
+## Caption vs Default
+
+Si el usuario envía la imagen con un caption (texto acompañante), se usa ese caption como `user_text`. Si no hay caption:
+
+```python
+user_text = msg.text or "Describe what you see in this image"
+```
+
+Esto permite dos flujos:
+- **Con caption**: "¿Qué ingredientes tiene este plato?" → LLaVA describe, qwen3 responde sobre los ingredientes
+- **Sin caption**: Se pide una descripción general de la imagen
+
+## Caso Especial: Onboarding
+
+Si el usuario está en proceso de onboarding, la descripción de la imagen se usa directamente como su "respuesta" al paso actual:
+
+```python
+        if in_onboarding:
+            user_text = description
+            next_state, reply, new_data = await handle_onboarding_message(
+                user_text,
+                profile_row["onboarding_state"],
+                profile_row["data"],
+                ollama_client,
+            )
+            await repository.save_user_profile(
+                msg.user_id, next_state, new_data
+            )
+            await platform_client.send_message(
+                msg.user_id,
+                platform_client.format_text(reply),
+            )
+            return
+```
+
+## Error Handling
+
+El bloque completo está envuelto en try/except para manejar fallos de descarga o del modelo:
+
+```python
+    except Exception:
+        logger.exception("Image processing failed")
+        await platform_client.send_message(
+            msg.user_id,
+            "Sorry, I couldn't process that image. Please try again.",
+        )
+    return  # Early return — no continuar al flujo de texto
+```
+
+<Callout variant="warning" title="return al final del bloque de imagen">
+Nótese el `return` fuera del try/except. Después de procesar una imagen (exitosamente o con error), el flujo se detiene. No se pasa al procesamiento de texto normal. Cada tipo de mensaje (texto, audio, imagen) tiene su propio early return.
+</Callout>
+
+## Parsing de Imágenes por Plataforma
+
+### WhatsApp
+
+```python
+# app/webhook/parser.py
+elif msg_type == "image":
+    media_id = msg["image"]["id"]
+    caption = msg["image"].get("caption")
+    if caption:
+        text = caption
+```
+
+### Telegram
+
+```python
+# app/telegram/parser.py
+elif "photo" in msg:
+    # Usar la foto de mayor resolución (última del array)
+    photo = msg["photo"][-1]
+    return [IncomingMessage(
+        type="image",
+        media_id=photo["file_id"],
+        text=msg.get("caption", ""),
+    )]
+```
+
+<Callout variant="tip" title="Telegram envía múltiples resoluciones">
+Telegram envía un array de fotos con diferentes resoluciones. `msg["photo"][-1]` selecciona la de mayor resolución (la última del array). WhatsApp envía solo un `media_id`.
+</Callout>
+
+<Quiz
+  question="¿Por qué LocalForge usa dos modelos (llava + qwen3) en vez de uno solo para imágenes?"
+  options={[
+    "Porque qwen3.5:9b no soporta input de imágenes — llava describe la imagen en texto que qwen3 puede procesar",
+    "Para ahorrar memoria GPU",
+    "Porque es más rápido",
+    "Por requisito de la API de WhatsApp"
+  ]}
+  correct={0}
+/>
+
+<Quiz
+  question="¿En qué formato se envían las imágenes a Ollama?"
+  options={[
+    "URL directa al archivo",
+    "Bytes raw como binary",
+    "String Base64 en el campo 'images' del mensaje",
+    "File path en el servidor"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué pasa si el usuario envía una imagen sin caption?"
+  options={[
+    "Se ignora la imagen",
+    "Se usa 'Describe what you see in this image' como texto por defecto",
+    "Se devuelve un error",
+    "Se guarda la imagen sin procesar"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo LocalForge convierte el markdown del LLM al formato nativo de WhatsApp.

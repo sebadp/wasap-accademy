@@ -1,0 +1,110 @@
+---
+title: "Consolidación por LLM"
+description: "Detectar y fusionar memorias duplicadas o contradictorias usando IA"
+xpReward: 100
+---
+
+## El Problema: Memorias Redundantes
+
+Con el tiempo, el sistema acumula memorias duplicadas o contradictorias:
+
+```
+- "Trabaja como backend developer"
+- "Es desarrollador backend en Python"        ← duplicado
+- "Trabaja en empresa fintech"
+- "Trabaja en una startup de e-commerce"       ← contradicción
+```
+
+<Callout variant="info" title="Consolidación">
+El consolidador revisa todas las memorias activas, detecta duplicados y contradicciones, y las fusiona en una versión limpia.
+</Callout>
+
+## Detección de Duplicados: difflib
+
+Antes de usar el LLM (caro), WasAP intenta detectar duplicados con **similitud de texto**:
+
+```python
+from difflib import SequenceMatcher
+
+DEDUP_THRESHOLD = 0.8
+
+def _is_duplicate(existing: str, new: str) -> bool:
+    ratio = SequenceMatcher(None, existing.lower(), new.lower()).ratio()
+    return ratio > DEDUP_THRESHOLD
+```
+
+<Concept title="SequenceMatcher ratio > 0.8">
+Un ratio de 0.8 significa que el 80% del texto es idéntico. "Trabaja como backend developer" vs "Es desarrollador backend" tiene ~0.6 (no duplicado). "Trabaja en fintech" vs "Trabaja en fintech desde 2024" tiene ~0.85 (duplicado).
+</Concept>
+
+## Consolidación por LLM
+
+Para contradicciones y fusiones más complejas, se usa el LLM:
+
+```python
+async def consolidate_memories(
+    repository: Repository,
+    ollama_client: OllamaClient,
+    phone_number: str,
+):
+    memories = await repository.get_active_memories(phone_number)
+    if len(memories) < MIN_MEMORIES:
+        return  # No vale la pena con pocas memorias
+
+    prompt = CONSOLIDATE_PROMPT.format(
+        memories="\n".join(f"- [{m['id']}] {m['content']}" for m in memories)
+    )
+
+    response = await ollama_client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        think=False,  # Respuesta estructurada, sin reasoning
+    )
+
+    actions = parse_consolidation_response(response.content)
+    for action in actions:
+        if action.type == "merge":
+            await _merge_memories(repository, action.ids, action.merged_text)
+        elif action.type == "delete":
+            await repository.remove_memory(phone_number, action.id)
+```
+
+## El Pipeline Completo
+
+```
+flush_to_memory()              consolidate_memories()
+  │                              │
+  ▼                              ▼
+Extraer facts          Revisar TODAS las memorias
+de mensajes viejos     activas del usuario
+  │                              │
+  ▼                              ▼
+Crear nuevas memorias  Detectar duplicados (difflib)
+  │                    Detectar contradicciones (LLM)
+  ▼                              │
+embed_memory()                   ▼
+(indexar vector)       Merge o delete memorias
+                       Actualizar embeddings
+```
+
+<Callout variant="tip" title="Background task">
+La consolidación corre como tarea programada (scheduler), no en el hot path. No afecta la latencia de respuesta al usuario.
+</Callout>
+
+<Quiz
+  question="¿Qué threshold usa difflib para detectar duplicados?"
+  options={["0.5 (50%)", "0.7 (70%)", "0.8 (80%)", "0.95 (95%)"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué el consolidador usa think=False?"
+  options={[
+    "Porque necesita respuesta JSON estructurada, no razonamiento libre",
+    "Porque el modelo no soporta thinking",
+    "Para usar menos memoria RAM",
+    "Para evitar alucinaciones"
+  ]}
+  correct={0}
+/>
+
+En la última lección del módulo veremos el flush pre-compactación.

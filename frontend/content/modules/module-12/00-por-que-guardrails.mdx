@@ -1,0 +1,122 @@
+---
+title: "Por Qué Guardrails"
+description: "Los riesgos de un LLM en producción y el patrón fail-open"
+xpReward: 50
+---
+
+## Un LLM Sin Supervisión es Peligroso
+
+Cuando desplegás un LLM que habla directamente con usuarios reales, cosas malas **van a pasar**. No es cuestión de si, sino de cuándo:
+
+- **Respuesta vacía**: el modelo genera solo whitespace
+- **PII filtrado**: incluye emails, teléfonos o tarjetas de crédito del usuario en su respuesta
+- **Idioma incorrecto**: el usuario habla español y el modelo responde en inglés
+- **JSON crudo**: el modelo expone los resultados internos de las herramientas
+- **Alucinaciones**: inventa información que no está en el contexto
+
+<Callout variant="warning" title="Producción ≠ Demo">
+En una demo, estos problemas son anécdotas graciosas. En producción, son quejas de usuarios, violaciones de privacidad, y pérdida de confianza. Los guardrails son la red de seguridad.
+</Callout>
+
+## Qué es un Guardrail
+
+Un **guardrail** es una validación que se ejecuta sobre la respuesta del LLM **antes** de enviarla al usuario. Si detecta un problema, puede intentar remediarlo o al menos registrarlo.
+
+```
+LLM genera respuesta
+        │
+        ▼
+┌───────────────────┐
+│    GUARDRAILS      │
+│  ┌──────────────┐  │
+│  │ not_empty    │  │
+│  │ max_length   │  │
+│  │ no_raw_json  │  │
+│  │ language     │  │
+│  │ no_pii       │  │
+│  └──────────────┘  │
+│                    │
+│  ¿Todo OK?         │
+│  ├─ Sí → Enviar    │
+│  └─ No → Remediar  │
+└───────────────────┘
+        │
+        ▼
+  Enviar al usuario
+```
+
+## Los Modelos de Datos
+
+```python
+# app/guardrails/models.py
+class GuardrailResult(BaseModel):
+    check_name: str       # "not_empty", "no_pii", etc.
+    passed: bool          # True si pasó la validación
+    message: str = ""     # Detalle del fallo si aplica
+    severity: str = "warning"  # "warning" | "error"
+
+class GuardrailReport(BaseModel):
+    results: list[GuardrailResult]
+    all_passed: bool      # True si TODOS los checks pasaron
+```
+
+<Concept title="GuardrailReport">
+El reporte agrega todos los resultados individuales. `all_passed` es un shortcut: si cualquier check falla, es `False`. Los handlers pueden decidir qué hacer basándose en la severidad de cada fallo.
+</Concept>
+
+## Fail-Open: La Decisión de Diseño
+
+WasAP usa **fail-open**: si los guardrails mismos tienen un error (crash, timeout), el mensaje se envía de todas formas.
+
+```python
+try:
+    report = await run_guardrails(response, context)
+    if not report.all_passed:
+        response = await _handle_guardrail_failure(response, report)
+except Exception as e:
+    logger.warning("Guardrails failed: %s", e)
+    # Fail-open: enviar la respuesta original sin modificar
+```
+
+<Callout variant="info" title="¿Por qué fail-open y no fail-closed?">
+En un chatbot, no responder es peor que responder imperfectamente. El usuario espera una respuesta. Si los guardrails crashean por un bug, prefiero enviar la respuesta del LLM (que probablemente está bien) antes que dejar al usuario sin respuesta.
+</Callout>
+
+## La Arquitectura de Guardrails en WasAP
+
+<FileTree>
+  app/guardrails/
+  ├── models.py      # GuardrailResult, GuardrailReport
+  ├── checks.py      # 5 checks determinísticos + 2 LLM
+  └── pipeline.py    # run_guardrails(), remediación
+</FileTree>
+
+<Quiz
+  question="¿Qué significa fail-open en el contexto de guardrails?"
+  options={[
+    "Si un guardrail falla, se bloquea el mensaje hasta que pase",
+    "Si los guardrails crashean, el mensaje se envía de todas formas",
+    "Se abren checks adicionales cuando hay un fallo",
+    "Se desactivan todos los guardrails permanentemente"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál de estos es un riesgo real de un LLM en producción?"
+  options={[
+    "El modelo consume demasiada electricidad",
+    "El modelo expone JSON interno de herramientas en la respuesta al usuario",
+    "El modelo genera código más lento",
+    "El modelo se desconecta de internet"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántos checks determinísticos tiene WasAP?"
+  options={["3", "5", "7", "10"]}
+  correct={1}
+/>
+
+En la siguiente lección veremos los 5 checks que no necesitan IA para funcionar.

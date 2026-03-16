@@ -1,0 +1,285 @@
+---
+title: "LLM-as-Judge"
+description: "Evaluación offline multi-criterio con run_eval.py y exit codes para CI"
+xpReward: 100
+---
+
+## El Concepto: Usar un LLM para Evaluar a Otro
+
+¿Cómo sabés si tu chatbot responde bien sin revisar cada respuesta manualmente? Usás otro LLM como **juez**: le das la pregunta, la respuesta esperada y la respuesta actual, y te dice si es correcta.
+
+<Callout variant="info" title="LLM-as-Judge">
+Es un patrón de eval donde un LLM evalúa la calidad de las respuestas de otro LLM (o del mismo modelo con diferente prompt). Es imperfecto pero escalable — permite evaluar cientos de entries en minutos.
+</Callout>
+
+## 3 Niveles de Evaluación
+
+`scripts/run_eval.py` implementa 3 modos de evaluación, de menor a mayor profundidad:
+
+<Step number={1} title="classify — Level 1 (~1-2s por entry)">
+Solo evalúa clasificación de intent. ¿El router asignó las categorías correctas? No ejecuta el LLM principal.
+</Step>
+
+<Step number={2} title="tools — Level 2 (~2-3s por entry)">
+Evalúa clasificación + selección de tools. ¿Se eligieron las herramientas correctas para la query?
+</Step>
+
+<Step number={3} title="e2e — Level 3 (lento, ~5-10s por entry)">
+End-to-end: genera la respuesta completa y un LLM judge evalúa calidad multi-criterio.
+</Step>
+
+## El Judge Prompt: QAG Multi-Criterio
+
+El juez no da un simple yes/no. Evalúa múltiples criterios:
+
+```python
+# scripts/run_eval.py
+_JUDGE_PROMPT = (
+    "Evaluate this response. Answer each criterion with YES or NO "
+    "and a brief reason.\n\n"
+    "Input: {input_text}\n"
+    "Expected: {expected}\n"
+    "Actual: {actual}\n\n"
+    "1. CORRECTNESS: Does the actual response answer the question "
+    "correctly? (YES/NO - reason)\n"
+    "2. COMPLETENESS: Does it address the full question without "
+    "missing key parts? (YES/NO - reason)\n"
+    "{tool_section}"
+    "\n{verdict_line}"
+)
+```
+
+Si la entry tiene expected_tools, se agrega un tercer criterio:
+
+```python
+_JUDGE_TOOL_CRITERION = (
+    "3. TOOL_USAGE: Did the model call the correct tools? "
+    "Expected tools: {expected_tools}. Called tools: {called_tools}. "
+    "(YES/NO - reason)\n"
+)
+```
+
+<Concept title="QAG = Question-Answer-Grading">
+El patrón QAG divide la evaluación en criterios independientes. Un modelo puede ser correcto pero incompleto (CORRECTNESS: YES, COMPLETENESS: NO). Esto da más información que un score binario único.
+</Concept>
+
+## Parsing del Judge Response
+
+El LLM judge puede responder de varias formas. El parser maneja la variabilidad:
+
+```python
+# Regex para parsear criterios numerados
+_RE_CRITERION = re.compile(
+    r"^\d+\.\s*\w+.*?\b(YES|NO|SI|SÍ)\b", re.IGNORECASE
+)
+_RE_VERDICT = re.compile(r"VERDICT.*?\b(PASS|FAIL)\b", re.IGNORECASE)
+
+def _parse_judge_response(raw: str, has_tools: bool) -> dict:
+    criteria: dict[str, bool] = {}
+    expected_criteria = ["correctness", "completeness"]
+    if has_tools:
+        expected_criteria.append("tool_usage")
+
+    criterion_idx = 0
+    for line in raw.strip().splitlines():
+        m = _RE_CRITERION.match(line.strip())
+        if m and criterion_idx < len(expected_criteria):
+            matched = m.group(1).upper()
+            value = matched in ("YES", "SI", "SÍ")
+            criteria[expected_criteria[criterion_idx]] = value
+            criterion_idx += 1
+
+    # Score = fracción de criterios que pasaron
+    if criteria:
+        score = sum(1.0 for v in criteria.values() if v) / len(criteria)
+    else:
+        # Fallback: contar YES vs NO en todo el texto
+        yes_count = len(_RE_YES.findall(raw))
+        no_count = len(_RE_NO.findall(raw))
+        total_votes = yes_count + no_count
+        score = yes_count / total_votes if total_votes else 0.0
+
+    return {
+        "criteria": criteria,
+        "score": score,
+        "passed": score >= 0.5,
+        "raw_reasoning": raw[:300],
+    }
+```
+
+<Callout variant="tip" title="Bilingüe: SI/SÍ y YES">
+El parser acepta tanto YES/NO (inglés) como SI/SÍ/NO (español), porque el input suele ser en español y el LLM a veces responde en el idioma del contenido.
+</Callout>
+
+## Estrategia de Scoring para Tools
+
+Cuando una entry espera tools, hay 3 escenarios posibles:
+
+```python
+# scripts/run_eval.py — dentro de _run_e2e
+# Caso 1: El modelo llamó tools y produjo poco texto
+# → scoring determinístico por tool match (no necesita judge)
+if needs_tools and tool_calls_made and len(actual) < 20:
+    tool_score = _score_tools(expected_tools, tool_calls_made)
+    passed = tool_score >= 0.5
+
+# Caso 2: El modelo debía llamar tools pero no lo hizo
+# → FAIL determinístico
+if needs_tools and not tool_calls_made and len(actual) < 20:
+    passed = False
+
+# Caso 3: El modelo produjo texto (con o sin tools)
+# → LLM judge evalúa la calidad del texto
+judge_result = await _judge_response(
+    client, input_text, expected_output, actual, meta,
+    tool_calls_made=tool_calls_made,
+)
+```
+
+<Concept title="Scoring determinístico vs LLM judge">
+Para entries que dependen de tools, el scoring es determinístico (¿llamó la tool correcta?). No tiene sentido usar un LLM judge para evaluar texto vacío — el modelo no pudo generar texto porque las tools no se ejecutan en eval mode. Esto hace el eval más rápido y predecible.
+</Concept>
+
+## Uso desde CLI
+
+```bash
+# Modo e2e (default): evaluación completa con LLM judge
+python scripts/run_eval.py --mode e2e --threshold 0.7
+
+# Solo clasificación (rápido)
+python scripts/run_eval.py --mode classify --threshold 0.8
+
+# Filtrar por tipo y sección
+python scripts/run_eval.py --entry-type correction --section math
+
+# Verbose: ver respuestas y razonamiento del judge
+python scripts/run_eval.py -v --limit 20
+
+# Sincronizar resultados a Langfuse Experiments
+python scripts/run_eval.py --langfuse --run-name "v2.3-pre-release"
+```
+
+## Exit Codes para CI
+
+```python
+# Exit codes:
+#   0   accuracy >= threshold (PASS)
+#   1   accuracy < threshold (FAIL)
+#   2   no evaluatable entries found
+
+accuracy = correct / total
+if accuracy >= threshold:
+    print(f"PASS -- accuracy {accuracy:.1%} >= threshold {threshold:.1%}")
+    return 0
+else:
+    print(f"FAIL -- accuracy {accuracy:.1%} < threshold {threshold:.1%}")
+    return 1
+```
+
+<Callout variant="warning" title="Exit code en CI">
+El exit code es lo que hace que eval sea integrable en CI/CD. En GitHub Actions: `python scripts/run_eval.py --threshold 0.7 || exit 1`. Si la accuracy baja del 70%, el pipeline falla y el merge se bloquea.
+</Callout>
+
+## Output: Tabla de Resultados
+
+```
+Evaluating 15 entries (mode=e2e, model=qwen3.5:9b, threshold=70%)
+
+id       section      pass     score        input
+------------------------------------------------------------
+1        math         PASS     100%         '15% de 230'
+2        weather      PASS     100%         'clima en Buenos Aires'
+3        time         PASS     100%         'qué hora es'
+4        chat         FAIL     50%          'contame un chiste largo'
+         correctness=YES completeness=NO
+5        notes        PASS     100%         'acordate que me gusta el café'
+
+Summary (e2e): 12/15 correct (80.0%)
+  section:chat: 2/4 (50.0%)
+  section:math: 3/3 (100.0%)
+  section:weather: 4/4 (100.0%)
+
+  Latency: avg=3200ms  max=8100ms  total=48.0s
+
+PASS -- accuracy 80.0% >= threshold 70.0%
+```
+
+## Sync a Langfuse Experiments
+
+Con `--langfuse`, cada resultado se sincroniza como un experiment run:
+
+```python
+# Crear dataset en Langfuse (idempotente)
+lf.create_dataset(name=dataset_name)
+
+for r in results:
+    # Trace ID determinístico por entry+run
+    lf_trace_id = lf.create_trace_id(
+        seed=f"eval-{r['id']}-{effective_run}"
+    )
+
+    # Root span con metadata
+    root = lf.start_span(
+        trace_context={"trace_id": lf_trace_id},
+        name=f"eval_{mode}",
+    )
+
+    # Generation span: respuesta del modelo
+    model_gen = root.start_generation(
+        name="model_response",
+        output=r.get("actual_response", ""),
+        model=model,
+        usage_details=usage,
+    )
+
+    # Scores por criterio
+    for crit_name, crit_val in criteria.items():
+        lf.create_score(
+            trace_id=lf_trace_id,
+            name=crit_name,
+            value=1.0 if crit_val else 0.0,
+        )
+
+    # Vincular a dataset item + experiment run
+    item = lf.create_dataset_item(
+        dataset_name=dataset_name,
+        input={"text": input_text},
+        expected_output={"text": expected_output},
+    )
+    item.link(trace_or_observation=root, run_name=effective_run)
+```
+
+<Quiz
+  question="¿Cuáles son los 3 modos de evaluación en run_eval.py?"
+  options={[
+    "fast, medium, slow",
+    "classify (clasificación), tools (selección de herramientas), e2e (end-to-end con judge)",
+    "unit, integration, acceptance",
+    "online, offline, hybrid"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué exit code retorna run_eval.py si la accuracy es menor al threshold?"
+  options={[
+    "0 (success)",
+    "1 (fail — accuracy below threshold)",
+    "2 (no entries found)",
+    "255 (error)"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa scoring determinístico para entries con tools?"
+  options={[
+    "Porque es más preciso que el LLM judge",
+    "Porque las tools no se ejecutan en eval mode, así que el modelo no puede generar texto — evaluar el texto sería inútil",
+    "Porque es más barato",
+    "Porque el LLM judge no puede evaluar tools"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo funciona el sistema de versionado de prompts.

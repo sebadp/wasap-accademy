@@ -1,0 +1,249 @@
+---
+title: "CI Pipeline con GitHub Actions"
+description: "3 jobs paralelos: lint, typecheck, test. Pre-commit hooks y make check local"
+xpReward: 100
+---
+
+## Los Tres Pilares de Calidad
+
+Antes de que cualquier cambio llegue a producción, debe pasar tres verificaciones:
+
+```
+Push / PR
+    │
+    ├── Job 1: Lint (ruff)       → ¿El código está formateado y sin errores de estilo?
+    ├── Job 2: Typecheck (mypy)  → ¿Los tipos son correctos?
+    └── Job 3: Test (pytest)     → ¿Los tests pasan?
+```
+
+<Callout variant="info" title="Jobs paralelos">
+Los tres jobs corren en paralelo en GitHub Actions. Si lint falla, no bloquea a test ni typecheck. Esto da feedback rápido: sabés en ~1 minuto qué falló.
+</Callout>
+
+## GitHub Actions Workflow
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install ruff
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Check linting
+        run: ruff check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install mypy
+      - name: Type check
+        run: mypy app/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest tests/ -v
+```
+
+## Job 1: Lint con ruff
+
+ruff es un linter y formatter extremadamente rápido (escrito en Rust):
+
+```python
+# pyproject.toml
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+ignore = [
+    "E501",  # Line too long (manejado por formatter)
+    "B008",  # Do not perform function call in argument defaults (FastAPI Depends)
+]
+```
+
+<Terminal title="Chequear formato">
+ruff format --check .
+</Terminal>
+
+<Terminal title="Chequear errores de estilo">
+ruff check .
+</Terminal>
+
+<Terminal title="Autofix formato y errores">
+ruff format . && ruff check --fix .
+</Terminal>
+
+<Concept title="¿Por qué ignorar E501 y B008?">
+`E501` (líneas largas) se maneja con `ruff format` que auto-wrappea. `B008` alerta sobre `Depends(get_db)` como default argument, pero es el patrón oficial de FastAPI para dependency injection.
+</Concept>
+
+## Job 2: Typecheck con mypy
+
+mypy verifica tipos estáticos solo en `app/`, no en `tests/`:
+
+```python
+# pyproject.toml
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true  # faster-whisper, sqlite-vec no tienen stubs
+warn_return_any = true
+warn_unused_configs = true
+```
+
+<Callout variant="warning" title="ignore_missing_imports = true">
+Varias dependencias (faster-whisper, sqlite-vec, mcp, watchdog) no tienen type stubs. Sin este flag, mypy reportaría errores falsos por cada import de estas libraries.
+</Callout>
+
+## Job 3: Tests con pytest
+
+```python
+# pyproject.toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+```python
+# tests/test_webhook.py (integration test con TestClient)
+from fastapi.testclient import TestClient
+
+def test_webhook_valid_message(client: TestClient, mock_whatsapp):
+    response = client.post("/webhook", json=valid_payload, headers=headers)
+    assert response.status_code == 200
+
+# tests/test_executor.py (unit test async)
+async def test_tool_execution(mock_registry, mock_ollama):
+    result = await execute_tool_loop(
+        messages=[{"role": "user", "content": "What time is it?"}],
+        ollama_client=mock_ollama,
+        registry=mock_registry,
+    )
+    assert result.content is not None
+```
+
+## Pre-Commit Hooks
+
+Para validar localmente antes del push:
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format --check
+        language: system
+        types: [python]
+
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check
+        language: system
+        types: [python]
+
+      - id: mypy
+        name: mypy
+        entry: mypy app/
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: pytest
+        name: pytest
+        entry: pytest tests/ -v --tb=short
+        language: system
+        types: [python]
+        pass_filenames: false
+```
+
+<Terminal title="Instalar pre-commit hooks">
+make dev
+</Terminal>
+
+## make check: Todo en Un Comando
+
+```makefile
+# Makefile
+.PHONY: lint format typecheck test check
+
+lint:
+	ruff check .
+
+format:
+	ruff format .
+
+typecheck:
+	mypy app/
+
+test:
+	.venv/bin/python -m pytest tests/ -v
+
+check: lint typecheck test
+	@echo "All checks passed!"
+```
+
+<Terminal title="Correr las tres verificaciones localmente">
+make check
+</Terminal>
+
+<Callout variant="tip" title="Correr antes de pushear">
+`make check` localmente es mucho más rápido que esperar al CI de GitHub Actions. Si falla localmente, no pierdas tiempo pusheando.
+</Callout>
+
+<Quiz
+  question="¿Por qué los 3 jobs del CI corren en paralelo?"
+  options={[
+    "Porque GitHub lo requiere",
+    "Para dar feedback rápido: sabés qué falló en ~1 minuto en vez de esperar a que cada job termine secuencialmente",
+    "Porque son dependientes entre sí",
+    "Para usar menos créditos de GitHub Actions"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué mypy solo chequea app/ y no tests/?"
+  options={[
+    "Porque tests/ no tiene código Python",
+    "Porque los tests usan mocks y fixtures que son difíciles de tipar estrictamente, y el valor de typecheck está en el código de producción",
+    "Porque mypy no soporta pytest",
+    "Porque los tests son opcionales"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo integrar evaluaciones automáticas en el pipeline de CI.

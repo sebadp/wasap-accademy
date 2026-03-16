@@ -1,0 +1,108 @@
+---
+title: "Daily Logs & Episodic Memory"
+description: "Registros diarios append-only que capturan eventos día a día"
+xpReward: 75
+---
+
+## Memoria Episódica vs Semántica
+
+<Concept title="Dos tipos de memoria">
+**Semántica**: hechos permanentes ("Es desarrollador Python"). **Episódica**: eventos temporales ("Hoy discutimos la migración de la API"). Los daily logs son memoria episódica.
+</Concept>
+
+## Daily Logs: Archivos Markdown Append-Only
+
+WasAP mantiene un archivo por día en `data/memory/`:
+
+<FileTree>
+  data/memory/
+  ├── 2026-03-14.md
+  ├── 2026-03-15.md
+  ├── 2026-03-16.md   # Hoy
+  └── snapshots/
+      └── 2026-03-15-migracion-api.md
+</FileTree>
+
+```python
+class DailyLog:
+    def __init__(self, memory_dir: str):
+        self.memory_dir = Path(memory_dir)
+
+    async def append_event(self, phone_number: str, event: str):
+        today = date.today().isoformat()
+        path = self.memory_dir / f"{today}.md"
+
+        line = f"- [{phone_number}] {event}\n"
+        # asyncio.to_thread para I/O bloqueante de filesystem
+        await asyncio.to_thread(self._append_to_file, path, line)
+
+    def _append_to_file(self, path: Path, content: str):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(content)
+```
+
+<Callout variant="warning" title="asyncio.to_thread">
+Escribir archivos es I/O bloqueante. `asyncio.to_thread()` ejecuta la escritura en un thread del pool, sin bloquear el event loop de FastAPI.
+</Callout>
+
+## Inyección en el Contexto
+
+Los daily logs de hoy y ayer se inyectan en cada llamada al LLM:
+
+```python
+async def load_recent(self, days: int = 2) -> str:
+    logs = []
+    for i in range(days):
+        day = date.today() - timedelta(days=i)
+        path = self.memory_dir / f"{day.isoformat()}.md"
+        if path.exists():
+            content = await asyncio.to_thread(path.read_text)
+            logs.append(f"## {day.isoformat()}\n{content}")
+    return "\n".join(logs)
+```
+
+Esto le da al LLM **contexto temporal**: qué pasó ayer, qué está pasando hoy.
+
+## Append-Only: Por Qué
+
+<Callout variant="tip" title="Inmutabilidad">
+Los daily logs nunca se editan ni borran. Solo se agregan líneas. Esto garantiza un registro fiel de lo que ocurrió — fundamental para auditoría y debugging.
+</Callout>
+
+## Session Snapshots
+
+Cuando el usuario ejecuta `/clear`, los últimos 15 mensajes se guardan como snapshot:
+
+```python
+async def save_snapshot(self, phone: str, messages: list, slug: str):
+    path = self.memory_dir / "snapshots" / f"{date.today()}-{slug}.md"
+    content = format_messages_as_markdown(messages)
+    await asyncio.to_thread(self._write_file, path, content)
+```
+
+El `slug` se genera por LLM (ej: "migracion-api") con fallback a timestamp.
+
+<Quiz
+  question="¿Cuál es la diferencia entre memoria semántica y episódica?"
+  options={[
+    "Semántica usa SQLite, episódica usa archivos",
+    "Semántica son hechos permanentes, episódica son eventos temporales día a día",
+    "Semántica es para el LLM, episódica es para el usuario",
+    "No hay diferencia, son lo mismo"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa asyncio.to_thread() para escribir daily logs?"
+  options={[
+    "Para encriptar el contenido",
+    "Porque escribir archivos es I/O bloqueante y bloquearía el event loop",
+    "Para comprimir los archivos",
+    "Para enviar los logs a un servidor remoto"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la sincronización bidireccional con MEMORY.md.

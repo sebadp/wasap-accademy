@@ -1,0 +1,187 @@
+---
+title: "Health Checks: Liveness y Readiness"
+description: "Endpoints /health y /ready para monitoreo, y cómo usarlos con Kubernetes probes"
+xpReward: 75
+---
+
+## Dos Preguntas Diferentes
+
+Un sistema de monitoreo necesita responder dos preguntas distintas:
+
+1. **Liveness**: "¿La app está corriendo?" -- si no, hay que **reiniciarla**
+2. **Readiness**: "¿La app puede atender requests?" -- si no, hay que **dejar de enviarle tráfico**
+
+<Concept title="Liveness vs Readiness">
+Una app puede estar "viva" (el proceso corre) pero no "ready" (la DB no está conectada, Ollama no responde). Liveness dice "reiniciá el container", readiness dice "no le mandes requests hasta que esté lista".
+</Concept>
+
+## /health (Liveness)
+
+El endpoint más simple posible. Si la app responde, está viva:
+
+```python
+# app/main.py o app/api/health.py
+
+@app.get("/health")
+async def health():
+    """Liveness probe: la app está corriendo."""
+    return {"status": "ok"}
+```
+
+Eso es todo. No hay lógica, no hay queries. Si FastAPI puede responder un JSON, la app está viva.
+
+<Callout variant="info" title="No agregar lógica a /health">
+Un error común es agregar checks de DB o servicios externos a `/health`. Si la DB está caída, `/health` falla, Kubernetes reinicia el container... que vuelve a fallar porque la DB sigue caída. Loop infinito de restarts.
+</Callout>
+
+## /ready (Readiness)
+
+Verifica que las dependencias críticas estén disponibles:
+
+```python
+@app.get("/ready")
+async def ready():
+    """
+    Readiness probe: la app puede atender requests.
+    Chequea DB y Ollama.
+    """
+    checks = {}
+
+    # Check 1: DB conectada
+    try:
+        db = get_db()
+        await db.execute("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # Check 2: Ollama disponible
+    try:
+        ollama = get_ollama_client()
+        # Lightweight check: listar modelos
+        models = await ollama.list_models()
+        has_chat_model = any(
+            m["name"].startswith("qwen3") for m in models
+        )
+        checks["ollama"] = "ok" if has_chat_model else "model_missing"
+    except Exception as e:
+        checks["ollama"] = f"error: {e}"
+
+    # Ready solo si todos los checks pasan
+    all_ok = all(v == "ok" for v in checks.values())
+    status_code = 200 if all_ok else 503
+
+    return JSONResponse(
+        content={"status": "ready" if all_ok else "not_ready", "checks": checks},
+        status_code=status_code,
+    )
+```
+
+<Callout variant="warning" title="503 Service Unavailable">
+`/ready` retorna 503 si algún check falla. El load balancer ve el 503 y deja de enviar tráfico a este pod hasta que vuelva a retornar 200.
+</Callout>
+
+## Kubernetes Probes
+
+```yaml
+# kubernetes/deployment.yaml
+spec:
+  containers:
+    - name: localforge
+      image: localforge:latest
+      ports:
+        - containerPort: 8000
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 10    # Esperar 10s al startup
+        periodSeconds: 30          # Chequear cada 30s
+        failureThreshold: 3        # 3 fallos = reiniciar
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 15    # Ollama tarda en cargar
+        periodSeconds: 10          # Chequear cada 10s
+        failureThreshold: 2        # 2 fallos = dejar de rutear
+```
+
+## Flujo Visual
+
+```
+Container arranca
+    │
+    ├── livenessProbe (/health)
+    │   └── 200 OK → container está vivo ✅
+    │   └── Falla 3 veces → RESTART container
+    │
+    ├── readinessProbe (/ready)
+    │   └── 200 OK → recibir tráfico ✅
+    │   └── 503 → dejar de recibir tráfico ⏳
+    │       (DB o Ollama no disponible)
+    │
+    └── Tráfico de usuarios
+        └── Solo llega si readiness = OK
+```
+
+## Docker Compose Health Check
+
+Sin Kubernetes, Docker Compose también soporta health checks:
+
+```yaml
+services:
+  app:
+    build: .
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  ollama:
+    image: ollama/ollama:latest
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+```
+
+<Callout variant="tip" title="depends_on con condition">
+Con health checks en Docker Compose, podés usar `depends_on` con condición:
+
+```yaml
+app:
+  depends_on:
+    ollama:
+      condition: service_healthy
+```
+
+Esto asegura que la app no arranca hasta que Ollama esté healthy (modelo cargado).
+</Callout>
+
+<Quiz
+  question="¿Qué pasa si /health falla en Kubernetes?"
+  options={[
+    "Se le deja de enviar tráfico al pod",
+    "Se reinicia el container",
+    "Se escala horizontalmente",
+    "Nada, es solo informativo"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué /health NO debe verificar la base de datos?"
+  options={[
+    "Porque es más lento",
+    "Porque si la DB está caída, reiniciar el container no arregla la DB, causando un loop infinito de restarts",
+    "Porque la DB se verifica en /ready",
+    "Porque Docker no soporta queries SQL"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo configurar el pipeline de CI/CD con GitHub Actions.

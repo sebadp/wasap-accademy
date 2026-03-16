@@ -1,0 +1,102 @@
+---
+title: "Conversation State"
+description: "Estado persistente por conversación: sticky categories y metadata"
+xpReward: 50
+---
+
+## Estado Entre Turnos
+
+Los LLMs son **stateless** — no recuerdan nada entre llamadas. Pero una conversación necesita continuidad. WasAP usa la tabla `conversation_state` para persistir metadata entre turnos.
+
+<Callout variant="info" title="Stateless + State = Stateful">
+El LLM es stateless, pero WasAP le inyecta estado relevante en cada llamada. La base de datos mantiene la memoria que el modelo no tiene.
+</Callout>
+
+## La Tabla conversation_state
+
+```sql
+CREATE TABLE IF NOT EXISTS conversation_state (
+    phone_number TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT (datetime('now')),
+    PRIMARY KEY (phone_number, key)
+);
+```
+
+Es un **key-value store** por usuario. Cualquier subsistema puede guardar y leer estado.
+
+## Sticky Categories
+
+El caso de uso más importante: **sticky categories** para el router de herramientas.
+
+```python
+# Guardar categorías activas
+async def save_sticky_categories(
+    self, phone_number: str, categories: list[str]
+) -> None:
+    value = json.dumps(categories)
+    await self.conn.execute(
+        "INSERT OR REPLACE INTO conversation_state "
+        "(phone_number, key, value) VALUES (?, 'sticky_categories', ?)",
+        (phone_number, value),
+    )
+    await self.conn.commit()
+
+# Leer categorías activas
+async def get_sticky_categories(
+    self, phone_number: str
+) -> list[str] | None:
+    cursor = await self.conn.execute(
+        "SELECT value FROM conversation_state "
+        "WHERE phone_number = ? AND key = 'sticky_categories'",
+        (phone_number,),
+    )
+    row = await cursor.fetchone()
+    return json.loads(row["value"]) if row else None
+```
+
+<Concept title="Sticky Categories">
+Si el usuario está hablando de proyectos y envía "¿cómo va?", el classifier podría retornar "none" (no hay keywords claras). Las sticky categories recuerdan que estábamos en contexto de proyectos y mantienen las herramientas disponibles.
+</Concept>
+
+## Flujo de Re-clasificación
+
+```
+Usuario: "agregá una tarea al proyecto"
+  → classify_intent → ["projects"]          ← claro
+  → save_sticky_categories(["projects"])
+
+Usuario: "¿cómo va?"
+  → classify_intent → ["none"]              ← ambiguo
+  → get_sticky_categories() → ["projects"]  ← rescate
+  → re-classify con contexto → ["projects"] ← correcto
+```
+
+<Callout variant="tip" title="Fallback inteligente">
+Sin sticky categories, "¿cómo va?" sin contexto iría a plain chat. Con stickies, se mantiene la continuidad de la conversación sobre proyectos.
+</Callout>
+
+<Quiz
+  question="¿Qué tipo de estructura es conversation_state?"
+  options={[
+    "Tabla relacional con schema fijo",
+    "Key-value store por usuario (phone_number + key → value)",
+    "Documento JSON anidado",
+    "Archivo de configuración"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se usan las sticky categories?"
+  options={[
+    "Siempre, en cada mensaje",
+    "Como fallback cuando classify_intent retorna 'none' en un mensaje ambiguo",
+    "Solo en modo agente",
+    "Para generar resúmenes"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo WasAP compacta outputs grandes de herramientas.

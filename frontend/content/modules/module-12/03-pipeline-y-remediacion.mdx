@@ -1,0 +1,179 @@
+---
+title: "Pipeline y Remediación"
+description: "run_guardrails() orquesta checks y remedia fallos sin recursión"
+xpReward: 100
+---
+
+## El Orquestador: run_guardrails()
+
+`run_guardrails()` ejecuta todos los checks y genera el `GuardrailReport`:
+
+```python
+# app/guardrails/pipeline.py
+async def run_guardrails(
+    response: str,
+    context: dict,
+    ollama_client: OllamaClient | None = None,
+    settings: Settings | None = None,
+) -> GuardrailReport:
+    results = []
+
+    # Checks determinísticos (siempre corren)
+    results.append(check_not_empty(response))
+    results.append(check_excessive_length(response))
+    results.append(check_no_raw_tool_json(response))
+
+    if settings and settings.guardrails_language_check:
+        results.append(
+            await check_language_match(response, context.get("user_lang", "es"))
+        )
+
+    if settings and settings.guardrails_pii_check:
+        results.append(check_no_pii(response))
+
+    # Checks LLM (solo si opt-in y client disponible)
+    if settings and settings.guardrails_llm_checks and ollama_client:
+        results.append(
+            await check_tool_coherence(
+                context["user_message"],
+                context.get("tool_results", []),
+                response,
+                ollama_client,
+            )
+        )
+        results.append(
+            await check_hallucination(
+                context.get("full_context", ""),
+                response,
+                ollama_client,
+            )
+        )
+
+    return GuardrailReport(
+        results=results,
+        all_passed=all(r.passed for r in results),
+    )
+```
+
+<Callout variant="info" title="Configurable por check">
+Cada tipo de check tiene su propio flag de activación. Podés tener PII check activo pero language check desactivado, o LLM checks solo en producción.
+</Callout>
+
+## Remediación Single-Shot
+
+Cuando uno o más checks fallan, WasAP intenta **remediar** la respuesta una sola vez:
+
+```python
+async def _handle_guardrail_failure(
+    response: str,
+    report: GuardrailReport,
+    context: dict,
+    ollama_client: OllamaClient,
+) -> str:
+    """Remedia la respuesta en un solo intento. Sin recursión."""
+    failures = [r for r in report.results if not r.passed]
+    failure_descriptions = "\n".join(
+        f"- {f.check_name}: {f.message}" for f in failures
+    )
+
+    user_lang = context.get("user_lang", "es")
+
+    # Prompt bilingüe: idioma del usuario + English fallback
+    prompt = f"""Fix this response. The following quality checks failed:
+
+{failure_descriptions}
+
+Original response:
+{response}
+
+Rewrite the response fixing ALL the issues above.
+Respond in {user_lang}.
+If the original response was empty, generate a helpful response to: {context['user_message']}"""
+
+    fixed = await ollama_client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+    )
+
+    return fixed.content
+```
+
+<Concept title="Single-shot: sin recursión">
+La remediación se ejecuta UNA sola vez. El resultado remediado NO se re-valida con guardrails. ¿Por qué? Porque si la remediación también falla, re-remediar crearía un loop infinito. Es mejor enviar una respuesta imperfecta que quedarse en un loop.
+</Concept>
+
+## Prompt Bilingüe
+
+El prompt de remediación menciona el idioma del usuario explícitamente. Esto es especialmente útil cuando el fallo fue `language_match`:
+
+```
+Si el fallo fue language_match (expected: es, got: en):
+  → "Respond in es" le indica al LLM que traduzca
+  → El fallback en inglés ayuda si el LLM no entiende "es"
+```
+
+<Callout variant="tip" title="Por qué bilingüe">
+El LLM que remedia puede no conocer el código de idioma "es". El prompt incluye instrucciones en el idioma target Y en inglés para maximizar la probabilidad de éxito.
+</Callout>
+
+## Integración con Tracing
+
+Cada remediación se registra como un span en Langfuse:
+
+```python
+async def _run_with_guardrails(response, context, trace_ctx):
+    report = await run_guardrails(response, context)
+
+    if not report.all_passed:
+        with trace_ctx.span("guardrails:remediation") as span:
+            span.set_attribute("failures", [r.check_name for r in report.results if not r.passed])
+            response = await _handle_guardrail_failure(response, report, context)
+
+    return response
+```
+
+## El Flujo Completo
+
+<Step number={1} title="LLM genera respuesta">
+El modelo produce texto basado en el contexto y herramientas.
+</Step>
+
+<Step number={2} title="run_guardrails() evalúa">
+Los 5-7 checks validan la respuesta. Resultado: GuardrailReport.
+</Step>
+
+<Step number={3} title="¿Todos pasaron?">
+Si `all_passed=True`, se envía directamente al usuario.
+</Step>
+
+<Step number={4} title="Remediación single-shot">
+Si hay fallos, se pide al LLM que corrija. Una sola oportunidad.
+</Step>
+
+<Step number={5} title="Enviar al usuario">
+Sea la original o la remediada, se envía. Nunca se bloquea el envío.
+</Step>
+
+<Quiz
+  question="¿Cuántas veces se intenta remediar una respuesta que falla guardrails?"
+  options={[
+    "Hasta que todos los checks pasen",
+    "3 veces con backoff exponencial",
+    "Una sola vez (single-shot), sin re-validar",
+    "Depende de la severidad del fallo"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué el prompt de remediación es bilingüe?"
+  options={[
+    "Para soportar más idiomas simultáneamente",
+    "Porque el LLM puede no entender el código de idioma, el prompt en ambos idiomas maximiza éxito",
+    "Para traducir la respuesta a dos idiomas",
+    "Porque es un requisito de WhatsApp"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo los fallos de guardrails alimentan el dataset de evaluación.

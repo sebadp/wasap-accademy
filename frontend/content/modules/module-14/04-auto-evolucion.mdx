@@ -1,0 +1,335 @@
+---
+title: "Auto-Evolución"
+description: "Self-correction memories, propose_prompt_change, y el loop MIPRO-lite"
+xpReward: 150
+---
+
+## El Objetivo: Un Bot que Mejora Solo
+
+La auto-evolución es el nivel más alto del sistema de eval: el bot detecta patrones de fallo, propone modificaciones a sus propios prompts, y un humano aprueba o rechaza. Es un loop de mejora continua semi-autónomo.
+
+<Callout variant="info" title="MIPRO-lite">
+El nombre interno es "MIPRO-lite" — inspirado en el paper MIPRO (Multi-prompt Instruction Proposal Optimization). La versión de LocalForge es más simple: detectar → diagnosticar → proponer → evaluar → aprobar.
+</Callout>
+
+## Pilar 1: Self-Correction Memories
+
+Cuando un guardrail falla, el sistema automáticamente persiste una memoria de auto-corrección:
+
+```python
+# app/webhook/router.py
+async def _save_self_correction_memory(
+    user_text: str,
+    failed_checks: list[str],
+    repository,
+    memory_file,
+    ollama_client,
+    embed_model: str | None,
+    vec_available: bool,
+) -> None:
+    """Persist a guardrail failure as a self_correction memory."""
+    try:
+        # Cooldown: si el mismo tipo de check ya se registró en las
+        # últimas 2 horas, skip para evitar spam
+        recent = await repository.get_recent_self_corrections(hours=2)
+        recent_check_types: set[str] = set()
+        for m in recent:
+            if "detectaron:" in m.content:
+                existing_checks_str = m.content.split("detectaron:")[1].split(".")[0]
+                recent_check_types.update(
+                    c.strip() for c in existing_checks_str.split(",")
+                )
+
+        new_checks = [c for c in failed_checks if c not in recent_check_types]
+        if not new_checks:
+            logger.info("Self-correction skipped (cooldown active)")
+            return
+
+        checks_str = ", ".join(new_checks)
+        note = (
+            f"[auto-corrección] Al responder '{user_text[:60]}...', "
+            f"los guardrails detectaron: {checks_str}. "
+            f"Recordar evitar este tipo de error."
+        )
+        # Guardar en DB con categoría especial
+        mem_id = await repository.add_memory(
+            note, category="self_correction"
+        )
+```
+
+<Concept title="Cooldown de 2 horas">
+Sin cooldown, si el bot comete el mismo error repetidamente (ej: siempre falla `language_match`), se generaría una memoria por cada fallo. El cooldown de 2 horas agrupa errores del mismo tipo y previene spam en la memoria.
+</Concept>
+
+## Cómo Funciona el Cooldown
+
+```python
+# Flujo de decisión:
+# 1. Obtener correcciones recientes (últimas 2h)
+recent = await repository.get_recent_self_corrections(hours=2)
+
+# 2. Extraer tipos de checks ya registrados
+recent_check_types = {"language_match", "no_pii"}  # ejemplo
+
+# 3. Filtrar solo checks nuevos
+failed_checks = ["language_match", "raw_json"]
+new_checks = ["raw_json"]  # language_match ya tiene cooldown
+
+# 4. Si no hay checks nuevos → skip
+if not new_checks:
+    return  # "Self-correction skipped (cooldown active)"
+```
+
+## Invocación: Cuando Guardrails Fallan
+
+La memoria de auto-corrección se dispara como background task cuando el guardrail report indica fallo:
+
+```python
+# app/webhook/router.py — dentro de _run_normal_flow
+if not guardrail_report.passed:
+    failed_checks = [
+        r.check_name for r in guardrail_report.results if not r.passed
+    ]
+    _track_task(
+        asyncio.create_task(
+            _save_self_correction_memory(
+                user_text=user_text,
+                failed_checks=failed_checks,
+                repository=repository,
+                memory_file=memory_file,
+                ollama_client=ollama_client,
+                embed_model=settings.embedding_model if vec_available else None,
+                vec_available=vec_available,
+            )
+        )
+    )
+```
+
+<Callout variant="tip" title="Embedding de auto-correcciones">
+Las memorias de auto-corrección también se indexan con embeddings. Esto permite que búsquedas semánticas futuras encuentren correcciones relevantes — si el bot va a cometer un error similar, la memoria se inyecta en el contexto para prevenirlo.
+</Callout>
+
+## Pilar 2: Proponer Cambios al Prompt
+
+`propose_prompt_change` usa el LLM para generar una modificación al prompt actual:
+
+```python
+# app/eval/evolution.py
+async def propose_prompt_change(
+    prompt_name: str,
+    diagnosis: str,
+    proposed_change: str,
+    ollama_client: OllamaClient,
+    repository: object,
+) -> dict:
+    """Generate a prompt modification proposal using the LLM.
+
+    Does NOT activate it — saves as draft (is_active=0).
+    """
+    # 1. Obtener el prompt actual
+    current_row = await repository.get_active_prompt_version(prompt_name)
+    current_content = current_row["content"] if current_row else ""
+    current_version = current_row["version"] if current_row else 0
+
+    if not current_content:
+        return {"error": "No active prompt version found"}
+
+    # 2. Pedir al LLM que modifique el prompt
+    system_msg = ChatMessage(
+        role="system",
+        content=(
+            "You are a prompt engineer. You modify system prompts to fix "
+            "specific issues. Make minimal, targeted changes that address "
+            "the diagnosed problem without breaking existing behavior. "
+            "Output ONLY the complete modified prompt text, nothing else."
+        ),
+    )
+    user_msg = ChatMessage(
+        role="user",
+        content=(
+            f"Current prompt:\n{current_content}\n\n"
+            f"Problem diagnosed: {diagnosis}\n"
+            f"Proposed change: {proposed_change}\n\n"
+            f"Generate the complete modified prompt."
+        ),
+    )
+
+    new_content = await ollama_client.chat(
+        [system_msg, user_msg], think=False
+    )
+    new_content = str(new_content).strip()
+
+    # 3. Guardar como draft (is_active=0)
+    new_version = current_version + 1
+    await repository.save_prompt_version(
+        prompt_name=prompt_name,
+        version=new_version,
+        content=new_content,
+        created_by="agent",
+    )
+
+    return {
+        "version": new_version,
+        "content": new_content,
+        "prompt_name": prompt_name,
+    }
+```
+
+<Concept title="Minimal, targeted changes">
+El system prompt del prompt engineer es clave: "Make minimal, targeted changes that address the diagnosed problem without breaking existing behavior." No queremos que reescriba todo el prompt — solo que ajuste la parte relevante al problema diagnosticado.
+</Concept>
+
+## Pilar 3: /approve-prompt — El Humano Decide
+
+```python
+# app/commands/builtins.py
+async def cmd_approve_prompt(args: str, context: CommandContext) -> str:
+    """Activate a proposed prompt version, optionally running eval first."""
+    parts = args.strip().split()
+    prompt_name, version_str = parts
+    version = int(version_str)
+
+    row = await context.repository.get_prompt_version(prompt_name, version)
+    if not row:
+        return f"No encontré la versión {version} del prompt '{prompt_name}'."
+    if row["is_active"]:
+        return "Esa versión ya está activa."
+
+    # Correr eval como gate (advisory, no blocking)
+    eval_result = await activate_with_eval(
+        prompt_name=prompt_name,
+        version=version,
+        repository=context.repository,
+        ollama_client=context.ollama_client,
+    )
+    score = eval_result["score"]
+    passed = eval_result["passed"]
+
+    # Activar siempre (el eval es advisory)
+    await context.repository.activate_prompt_version(prompt_name, version)
+
+    # Invalidar cache in-memory
+    from app.eval.prompt_manager import invalidate_prompt_cache
+    invalidate_prompt_cache(prompt_name)
+
+    # Sync a Langfuse con label "production"
+    if context.trace_recorder:
+        await context.trace_recorder.upsert_prompt(
+            name=prompt_name,
+            content=row["content"],
+            version=version,
+            labels=["production"],
+        )
+
+    return f"Prompt '{prompt_name}' v{version} activado. Eval: {score:.0%}"
+```
+
+<Callout variant="warning" title="Eval advisory, no blocking">
+Notar que `/approve-prompt` siempre activa la versión, incluso si el eval score es bajo. El eval es informativo — le dice al humano "cuidado, esta versión pasó 50% del eval" pero no bloquea. El humano tiene la última palabra.
+</Callout>
+
+## El Loop Completo de Auto-Evolución
+
+```
+[Guardrails detectan fallo recurrente]
+     ↓
+[_save_self_correction_memory] → "language_match falló 3 veces"
+     ↓
+[Memorias se inyectan en contexto LLM] → el bot las "ve" al responder
+     ↓
+[Si el patrón persiste, agente/operador diagnostica]
+     ↓
+[propose_prompt_change(
+    prompt_name="system_prompt",
+    diagnosis="El bot responde en inglés a usuarios hispanohablantes",
+    proposed_change="Agregar instrucción explícita de responder en español"
+)]
+     ↓
+[Se guarda como v(N+1), is_active=0]
+     ↓
+[Operador revisa: /approve-prompt system_prompt N+1]
+     ↓
+[activate_with_eval corre eval → score 85%]
+     ↓
+[Se activa, cache invalidado, sync a Langfuse]
+     ↓
+[Próximos mensajes usan el prompt mejorado]
+```
+
+## Audit Trail de Correcciones
+
+Las memorias de auto-corrección se registran en el audit log:
+
+```python
+# Audit log (best-effort)
+from app.provenance.context import get_audit_logger
+from app.provenance.models import Action, Actor, EntityType
+
+_al = get_audit_logger()
+if _al:
+    await _al.log_mutation(
+        EntityType.MEMORY,
+        mem_id,
+        Action.CREATE,
+        Actor.SYSTEM,
+        after_snapshot=note,
+        metadata={
+            "category": "self_correction",
+            "checks": new_checks,
+        },
+    )
+```
+
+<Concept title="Trazabilidad completa">
+Cada auto-corrección queda registrada en 3 lugares: la tabla de memorias (contenido), el audit trail (quién/cuándo/qué), y opcionalmente embeddings (para búsqueda semántica). Esto permite reconstruir la historia completa de cómo el bot aprendió de sus errores.
+</Concept>
+
+## Resumen del Módulo
+
+| Componente | Archivo | Función |
+|-----------|---------|---------|
+| Auto-curación 3-tier | `eval/dataset.py` | `maybe_curate_to_dataset()` |
+| Correction pairs | `eval/dataset.py` | `add_correction_pair()` |
+| Reacciones | `webhook/router.py` | `_handle_reaction()` |
+| /rate y /feedback | `commands/builtins.py` | `cmd_rate()`, `cmd_feedback()` |
+| LLM-as-judge | `scripts/run_eval.py` | `_run_e2e()`, `_judge_response()` |
+| Catálogo de prompts | `eval/prompt_registry.py` | `PROMPT_DEFAULTS` |
+| Cache chain | `eval/prompt_manager.py` | `get_active_prompt()` |
+| Propuesta de cambio | `eval/evolution.py` | `propose_prompt_change()` |
+| Aprobación humana | `commands/builtins.py` | `cmd_approve_prompt()` |
+| Self-correction | `webhook/router.py` | `_save_self_correction_memory()` |
+
+<Quiz
+  question="¿Qué hace el cooldown de 2 horas en self-correction memories?"
+  options={[
+    "Borra memorias viejas cada 2 horas",
+    "Evita crear memorias duplicadas para el mismo tipo de fallo dentro de 2 horas",
+    "Espera 2 horas antes de guardar la memoria",
+    "Limita el acceso a la DB a cada 2 horas"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Quién activa una nueva versión del prompt propuesta por el LLM?"
+  options={[
+    "El LLM automáticamente",
+    "El sistema de eval si pasa el threshold",
+    "Un humano vía /approve-prompt (el eval es advisory, no blocking)",
+    "Langfuse"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cuál es el flujo correcto del loop de auto-evolución?"
+  options={[
+    "Proponer → Activar → Evaluar",
+    "Detectar fallo → Diagnosticar → Proponer cambio → Humano aprueba → Activar",
+    "Evaluar → Cambiar prompt → Deploy",
+    "Reacción del usuario → Cambio automático del prompt"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Evaluation & Self-Improvement. Ahora entendés cómo LocalForge construye, evalúa y mejora su propio comportamiento de forma semi-autónoma.

@@ -1,0 +1,142 @@
+---
+title: "Ensamblando el Prompt Final"
+description: "_build_context(): la función sync que construye el prompt sin DB calls"
+xpReward: 100
+---
+
+## El Ensamblaje Final
+
+`_build_context()` en `router.py` es una función **sincrónica** que toma todos los datos ya recolectados por `ConversationContext.build()` y construye el prompt final.
+
+<Callout variant="info" title="Sin DB calls">
+_build_context() no hace ninguna query a la base de datos ni llamada a Ollama. Solo ensambla strings. Toda la I/O ya se hizo en las fases anteriores.
+</Callout>
+
+## _build_context()
+
+```python
+def _build_context(
+    system_prompt: str,
+    memories: list[tuple[str, float]],
+    notes: list[str],
+    daily_logs: str,
+    projects_summary: str,
+    capabilities: list[str],
+    summary: str | None,
+) -> str:
+    builder = ContextBuilder(system_prompt)
+
+    # Memorias (ordenadas por relevancia)
+    if memories:
+        mem_text = "\n".join(f"- {content}" for content, _ in memories)
+        builder.add_section("user_memories", mem_text)
+
+    # Proyectos activos
+    if projects_summary:
+        builder.add_section("active_projects", projects_summary)
+
+    # Notas relevantes
+    if notes:
+        notes_text = "\n".join(f"- {note}" for note in notes)
+        builder.add_section("relevant_notes", notes_text)
+
+    # Actividad reciente
+    if daily_logs:
+        builder.add_section("recent_activity", daily_logs)
+
+    # Capabilities (solo tools activos)
+    if capabilities:
+        cap_text = "Available tools: " + ", ".join(capabilities)
+        builder.add_section("capabilities", cap_text)
+
+    # Resumen de conversación anterior
+    if summary:
+        builder.add_section("conversation_summary", summary)
+
+    return builder.build()
+```
+
+## _build_capabilities_for_categories()
+
+Las capabilities solo muestran herramientas de las categorías activas:
+
+```python
+def _build_capabilities_for_categories(
+    categories: list[str],
+) -> list[str]:
+    if categories == ["none"]:
+        return []  # Sin tools, sin capabilities
+
+    capabilities = []
+    for cat in categories:
+        tools = TOOL_CATEGORIES.get(cat, [])
+        capabilities.extend(tools)
+    return capabilities
+```
+
+<Concept title="Capabilities filtradas">
+Si classify retornó `["weather", "notes"]`, las capabilities solo muestran `get_weather, save_note, list_notes, ...`. No se muestra `calculate` ni `web_search`. Esto reduce el ruido en el prompt.
+</Concept>
+
+## El Flujo Completo
+
+```
+                    Phase A         Phase B          Phase C          Phase D
+Mensaje ──► embed + save ──► search all ──► classify ──► _build_context()
+             (paralelo)      (paralelo)    (async task)    │
+                                                           ▼
+                                                    System prompt
+                                                    + XML sections
+                                                           │
+                                                           ▼
+                                                   execute_tool_loop()
+                                                    o chat() directo
+```
+
+## Anatomía del Prompt Final
+
+```
+[System Message - construido por _build_context()]
+Sos LocalForge, un asistente personal inteligente...
+
+<user_memories>
+- Sebastián, backend developer, Buenos Aires
+</user_memories>
+
+<relevant_notes>
+- [API v2] Endpoints definidos: /users, /auth
+</relevant_notes>
+
+<capabilities>
+Available tools: get_weather, save_note, list_notes
+</capabilities>
+
+[Messages - historial de 8 mensajes]
+User: "¿Cómo va el proyecto?"
+Assistant: "Tu proyecto API v2 tiene 3 de 5 tareas..."
+User: "Agregá una tarea de testing"
+```
+
+<Quiz
+  question="¿_build_context() hace queries a la base de datos?"
+  options={[
+    "Sí, busca memorias y notas",
+    "No, es una función sync que solo ensambla strings ya recolectados",
+    "Solo si faltan datos",
+    "Depende de la configuración"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué se incluye en capabilities?"
+  options={[
+    "Todos los 60+ tools disponibles",
+    "Solo los tools de las categorías clasificadas para este mensaje",
+    "Solo los tools más populares",
+    "Nada, capabilities siempre está vacío"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Context Engineering. Ahora dominás cómo WasAP construye el contexto óptimo para cada interacción.

@@ -1,0 +1,65 @@
+---
+title: "El Problema de Routing"
+description: "Por qué un LLM pequeño no puede manejar 60+ herramientas"
+xpReward: 50
+---
+
+## 60 Tools vs 6 Tools
+
+WasAP tiene más de 60 herramientas. Pero qwen3.5:9b solo puede manejar ~6 tools confiablemente por llamada. Si le pasás las 60, **ignora todas**.
+
+<Callout variant="warning" title="Descubrimiento empírico">
+Esto no está documentado en ningún lado. Se descubrió experimentando: a partir de ~15 tools, el modelo empieza a inventar nombres de tools que no existen.
+</Callout>
+
+## La Solución: Two-Stage Routing
+
+```
+                      Stage 1                    Stage 2
+Mensaje ──► classify_intent() ──► categories ──► select_tools() ──► 6-8 tools
+            "¿qué tipo de              │          "¿cuáles?"
+             pregunta es?"         ["weather",
+                                    "notes"]
+```
+
+<Step number={1} title="Stage 1: Clasificar intención">
+Un LLM rápido (sin tools) clasifica el mensaje en categorías: "weather", "notes", "math", etc.
+</Step>
+
+<Step number={2} title="Stage 2: Seleccionar tools">
+Un mapeo determinístico (dict) convierte categorías en tools específicas, capeadas a ~8 max.
+</Step>
+
+## Por Qué Funciona
+
+| Aspecto | Sin routing | Con routing |
+|---------|------------|-------------|
+| Tools por llamada | 60+ | 6-8 |
+| Confiabilidad | ~10% | ~95% |
+| Latencia classify | 0ms | ~200ms |
+| Latencia total | +2s (tool confusion) | ~200ms overhead |
+
+<Concept title="El overhead se paga solo">
+200ms extra de clasificación ahorra 2+ segundos de confusión del modelo. Es una inversión neta positiva.
+</Concept>
+
+La clasificación es un LLM call **sin tools** (solo texto) con `think=False`. Es rápida porque no necesita generar structured output.
+
+<Quiz
+  question="¿Cuántas herramientas puede manejar qwen3.5:9b de forma confiable?"
+  options={["2-3", "5-6", "15-20", "Ilimitadas"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántos stages tiene el routing de WasAP?"
+  options={[
+    "1: pasar todos los tools al LLM",
+    "2: classify_intent (LLM) → select_tools (determinístico)",
+    "3: classify → filter → select",
+    "4: parse → classify → filter → select"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo funciona classify_intent.

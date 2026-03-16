@@ -1,0 +1,112 @@
+---
+title: "MEMORY.md Bidireccional"
+description: "Sincronización de memorias entre SQLite y un archivo markdown editable"
+xpReward: 75
+---
+
+## La Idea: Un Archivo que Podés Editar
+
+WasAP mantiene un archivo `data/MEMORY.md` que refleja las memorias de SQLite. Podés **editarlo manualmente** con cualquier editor de texto, y los cambios se sincronizan de vuelta a la base de datos.
+
+<Callout variant="tip" title="Bidireccional">
+SQLite → MEMORY.md: cuando se agrega/borra una memoria via `/remember` o `/forget`. MEMORY.md → SQLite: cuando editás el archivo manualmente.
+</Callout>
+
+## Sync SQLite → Archivo
+
+```python
+class MemoryFile:
+    def __init__(self, path: Path, repository: Repository):
+        self.path = path
+        self.repository = repository
+        self._sync_guard = threading.Event()
+
+    async def sync_to_file(self, phone_number: str):
+        self._sync_guard.set()  # Señal: "yo estoy escribiendo, ignorar cambios"
+        try:
+            memories = await self.repository.get_active_memories(phone_number)
+            content = self._format_markdown(memories)
+            await asyncio.to_thread(self.path.write_text, content)
+        finally:
+            # Pequeño delay para que el watcher ignore el evento
+            await asyncio.sleep(0.1)
+            self._sync_guard.clear()
+```
+
+## Sync Archivo → SQLite (Watchdog)
+
+`memory/watcher.py` usa la librería **watchdog** para detectar cambios en el filesystem:
+
+```python
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class _MemoryFileHandler(FileSystemEventHandler):
+    def __init__(self, memory_file: MemoryFile, sync_guard: threading.Event):
+        self.memory_file = memory_file
+        self.sync_guard = sync_guard
+
+    def on_modified(self, event):
+        if self.sync_guard.is_set():
+            return  # Ignorar: el cambio lo hicimos nosotros
+        # Parsear el archivo y sincronizar a SQLite
+        asyncio.run_coroutine_threadsafe(
+            self.memory_file.sync_from_file(), loop
+        )
+
+    def on_created(self, event):
+        # Editores como vim escriben un archivo nuevo y lo renombran
+        self.on_modified(event)
+```
+
+<Concept title="threading.Event como guard">
+El `_sync_guard` es un flag compartido entre el writer (sync_to_file) y el watcher. Cuando el writer está activo, el watcher ignora los cambios para evitar un loop infinito.
+</Concept>
+
+## El Problema del Feedback Loop
+
+Sin el guard:
+```
+1. /remember "Soy developer"     → SQLite INSERT
+2. sync_to_file()                → escribe MEMORY.md
+3. Watchdog detecta cambio       → dispara sync_from_file()
+4. sync_from_file()              → lee MEMORY.md, re-inserta en SQLite
+5. Goto 2... ♾️ loop infinito
+```
+
+Con el guard:
+```
+1. /remember "Soy developer"     → SQLite INSERT
+2. sync_guard.set()              → "yo estoy escribiendo"
+3. sync_to_file()                → escribe MEMORY.md
+4. Watchdog detecta cambio       → ve guard activo → ignora
+5. sync_guard.clear()            → listo
+```
+
+<Callout variant="warning" title="on_created para editores atómicos">
+Vim, Emacs y otros editores no modifican el archivo directo. Escriben uno nuevo y lo renombran (atomic rename). Por eso WasAP escucha tanto `on_modified` como `on_created`.
+</Callout>
+
+<Quiz
+  question="¿Qué previene el feedback loop entre sync_to_file y el watcher?"
+  options={[
+    "Un lock mutex",
+    "Un threading.Event que señala cuándo el writer está activo",
+    "Desactivar el watcher temporalmente",
+    "Un timer de cooldown"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el watcher escucha on_created además de on_modified?"
+  options={[
+    "Para detectar archivos nuevos en el directorio",
+    "Porque editores como vim usan atomic rename (escriben archivo nuevo + renombran)",
+    "Para detectar cuando se borra el archivo",
+    "Para soportar Windows"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo el consolidador limpia memorias duplicadas.

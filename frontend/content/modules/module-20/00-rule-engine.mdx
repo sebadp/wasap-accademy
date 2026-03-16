@@ -1,0 +1,168 @@
+---
+title: "Rule Engine: Automatización Declarativa"
+description: "Sistema de reglas IF-THEN para automatizar operaciones sin código"
+xpReward: 50
+---
+
+## Reglas en Vez de Código
+
+LocalForge necesita automatizar tareas operacionales: notificar al admin si los guardrails se degradan, correr VACUUM cuando la DB crece mucho, o consolidar memorias pendientes. Podrías hardcodear todo en Python... pero hay un enfoque mejor.
+
+<Concept title="Rule Engine">
+Un motor de reglas evalúa condiciones declarativas y ejecuta acciones predefinidas. En vez de escribir `if db_size > 500: vacuum()` en el código, definís una regla: `condition: db_size_mb > 500`, `action: run_task(vacuum_db)`. Las reglas se pueden crear, modificar y desactivar sin deploy.
+</Concept>
+
+## ¿Por Qué Reglas Declarativas?
+
+| Aspecto | Código hardcodeado | Reglas declarativas |
+|---------|-------------------|-------------------|
+| Cambiar umbral | Editar código + deploy | Actualizar regla en DB |
+| Auditoría | Buscar en git history | Tabla de reglas + log |
+| Quién puede configurar | Solo developers | Cualquiera (via chat) |
+| Testing | Unit tests por cada caso | Un engine, N reglas |
+
+<Callout variant="info" title="Separar el qué del cómo">
+El rule engine separa la *lógica de negocio* (cuándo y qué hacer) de la *implementación* (cómo evaluar y ejecutar). Esto es un patrón clásico en sistemas de automatización.
+</Callout>
+
+## AutomationRule Model
+
+```python
+# app/automation/models.py
+from pydantic import BaseModel
+
+class AutomationRule(BaseModel):
+    id: int | None = None
+    name: str
+    description: str
+    enabled: bool = True
+
+    # Condición
+    condition_type: str      # "query", "metric", "schedule"
+    condition_config: dict   # Parámetros específicos del tipo
+
+    # Acción
+    action_type: str         # "notify_user", "notify_admin", "run_task", "log"
+    action_config: dict      # Parámetros específicos de la acción
+
+    # Control de spam
+    cooldown_minutes: int = 60
+    last_triggered_at: str | None = None
+```
+
+## El Ciclo de Evaluación
+
+```
+APScheduler (cada N minutos)
+    │
+    ▼
+┌─────────────────────┐
+│  Para cada regla     │
+│  enabled = True      │
+│  cooldown expirado   │
+├─────────────────────┤
+│  check_condition()   │──── False ──► skip
+│       │              │
+│     True             │
+│       ▼              │
+│  execute_action()    │
+│       │              │
+│       ▼              │
+│  update last_trigger │
+└─────────────────────┘
+```
+
+```python
+# app/automation/engine.py
+
+async def evaluate_rules(repository: Repository, **clients) -> None:
+    """Evaluar todas las reglas activas."""
+    rules = await repository.get_enabled_rules()
+
+    for rule_data in rules:
+        rule = AutomationRule(**rule_data)
+
+        # Verificar cooldown
+        if not _cooldown_expired(rule):
+            continue
+
+        # Evaluar condición
+        triggered = await check_condition(
+            rule.condition_type,
+            rule.condition_config,
+            repository,
+        )
+
+        if triggered:
+            await execute_action(
+                rule.action_type,
+                rule.action_config,
+                **clients,
+            )
+            await repository.update_rule_trigger(rule.id)
+```
+
+<Callout variant="warning" title="Cooldown obligatorio">
+Sin cooldown, una regla que detecta "DB > 500MB" dispararía VACUUM cada 15 minutos indefinidamente. El cooldown asegura que la acción se ejecute máximo una vez por período.
+</Callout>
+
+## Dispatchers: check_condition y execute_action
+
+```python
+# Dispatcher de condiciones
+async def check_condition(
+    condition_type: str,
+    config: dict,
+    repository: Repository,
+) -> bool:
+    match condition_type:
+        case "query":
+            return await _check_query(config, repository)
+        case "metric":
+            return await _check_metric(config, repository)
+        case "schedule":
+            return _check_schedule(config)
+        case _:
+            logger.warning("Unknown condition type: %s", condition_type)
+            return False
+
+# Dispatcher de acciones
+async def execute_action(
+    action_type: str,
+    config: dict,
+    **clients,
+) -> None:
+    match action_type:
+        case "notify_user":
+            await _action_notify_user(config, **clients)
+        case "notify_admin":
+            await _action_notify_admin(config, **clients)
+        case "run_task":
+            await _action_run_task(config, **clients)
+        case "log":
+            _action_log(config)
+```
+
+<Quiz
+  question="¿Cuál es la ventaja principal de un rule engine sobre código hardcodeado?"
+  options={[
+    "Es más rápido de ejecutar",
+    "Las reglas se pueden crear, modificar y desactivar sin deploy",
+    "Usa menos memoria",
+    "No necesita base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Para qué sirve el cooldown en una regla de automatización?"
+  options={[
+    "Para que la regla se ejecute más rápido",
+    "Para limitar la frecuencia de ejecución y evitar spam",
+    "Para priorizar reglas importantes",
+    "Para sincronizar reglas entre servidores"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos los tres tipos de condiciones que puede evaluar el engine.

@@ -1,0 +1,151 @@
+---
+title: "Scores y Métricas"
+description: "Registrar calidad con scores, sampling rate, y token tracking"
+xpReward: 100
+---
+
+## Scores: Medir Calidad por Traza
+
+Cada traza puede tener múltiples **scores** — valores numéricos que miden aspectos de calidad. Langfuse los agrega en dashboards para análisis temporal.
+
+```python
+# Registrar score desde cualquier punto
+trace = get_current_trace()
+if trace:
+    trace.recorder.create_score(
+        trace_id=trace.trace_id,
+        name="guardrail:no_pii",
+        value=1.0,           # 0.0 = fail, 1.0 = pass
+        source="system",     # Quién lo generó
+        comment="All PII checks passed",
+    )
+```
+
+## Las 3 Fuentes de Scores
+
+<Step number={1} title="System (automáticos)">
+Guardrail checks: `value=1.0` si pasó, `0.0` si falló. Se registran automáticamente para cada check. Source: `"system"`.
+</Step>
+
+<Step number={2} title="Eval (LLM-as-judge)">
+Evaluación offline donde un LLM juzga la calidad. `value=0.0-1.0`. Source: `"eval:judge"`.
+</Step>
+
+<Step number={3} title="User (señales del usuario)">
+Reacciones de WhatsApp (👍/👎), `/rate 1-5`, `/feedback texto`. Mapped a `0.0-1.0`. Source: `"user"`.
+</Step>
+
+```python
+# Score de usuario via /rate
+async def cmd_rate(ctx, args):
+    score_value = int(args.split()[0]) / 5.0  # Normalizar 1-5 a 0.0-1.0
+    trace.add_score(
+        name="user_rating",
+        value=score_value,
+        source="user",
+        comment=args,
+    )
+```
+
+## Sampling Rate
+
+No todas las trazas necesitan ser registradas en Langfuse. En producción de alto volumen, se usa **random sampling**:
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    tracing_sample_rate: float = 1.0  # 1.0 = 100%, 0.1 = 10%
+
+# En el handler
+import random
+
+should_trace = random.random() < settings.tracing_sample_rate
+if should_trace:
+    trace_ctx = TraceContext(recorder, trace_id)
+else:
+    trace_ctx = None  # Sin tracing para este request
+```
+
+<Concept title="Sampling en producción">
+Con 1000 mensajes por hora, registrar 100% genera mucho dato. Con `tracing_sample_rate=0.1`, solo 10% de los requests se trazan, reduciendo almacenamiento y costos sin perder visibilidad estadística.
+</Concept>
+
+## Token Tracking
+
+Ollama retorna métricas de uso que se registran en cada generation:
+
+```python
+gen.end(
+    output=response.content,
+    usage_details={
+        "input": response.prompt_eval_count,    # Tokens de entrada
+        "output": response.eval_count,           # Tokens generados
+        "total_duration": response.total_duration,  # Nanoseconds
+    },
+)
+```
+
+Esto permite ver en Langfuse:
+- **Costo por mensaje** (basado en tokens)
+- **Latencia del modelo** (total_duration)
+- **Ratio input/output** (indica eficiencia del prompt)
+
+## Cleanup: Retención de Trazas
+
+```python
+# Configuración
+class Settings(BaseSettings):
+    trace_retention_days: int = 90  # Borrar trazas después de 90 días
+
+# Job programado a las 03:00 UTC
+async def cleanup_old_traces():
+    cutoff = datetime.utcnow() - timedelta(days=settings.trace_retention_days)
+    deleted = await repository.delete_traces_before(cutoff)
+    logger.info("Cleaned up %d old traces", deleted)
+```
+
+<Callout variant="warning" title="03:00 UTC">
+El cleanup corre a las 3 AM UTC — fuera de horario pico para la mayoría de los usuarios. Es un job del scheduler de APScheduler.
+</Callout>
+
+## Dashboard Mental
+
+Con scores y métricas, podés construir dashboards que respondan:
+
+| Pregunta | Métrica |
+|----------|---------|
+| ¿Cuántos guardrails fallan? | Pass rate por check name |
+| ¿Los usuarios están contentos? | Promedio de user_rating |
+| ¿El LLM está empeorando? | Eval judge score over time |
+| ¿Cuánto cuesta cada mensaje? | Tokens promedio por trace |
+| ¿Qué herramientas se usan más? | Count por tool name |
+
+<Quiz
+  question="¿Cuáles son las 3 fuentes de scores en WasAP?"
+  options={[
+    "Ollama, Langfuse, SQLite",
+    "System (guardrails automáticos), Eval (LLM-as-judge), User (reacciones/feedback)",
+    "Frontend, Backend, Database",
+    "Input, Output, Error"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué hace tracing_sample_rate=0.1?"
+  options={[
+    "Traza cada 10 minutos",
+    "Solo el 10% de los requests se trazan, reduciendo volumen de datos",
+    "Traza solo errores",
+    "Reduce la precisión de las trazas al 10%"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿A qué hora corre el cleanup de trazas viejas?"
+  options={["00:00 local", "03:00 UTC", "12:00 UTC", "Cuando la DB está llena"]}
+  correct={1}
+/>
+
+Has completado el módulo Tracing & Observability. Ahora entendés cómo WasAP registra, propaga y analiza trazas para mejorar la calidad.

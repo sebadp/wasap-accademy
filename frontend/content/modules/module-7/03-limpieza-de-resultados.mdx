@@ -1,0 +1,120 @@
+---
+title: "Limpieza de Resultados"
+description: "Gestionar el contexto cuando los tool outputs acumulan tokens"
+xpReward: 75
+---
+
+## El Problema: Tool Outputs se Acumulan
+
+En cada iteración del loop, los tool results se agregan al historial de mensajes. Después de 3-4 iteraciones, el historial puede tener miles de tokens solo en tool outputs.
+
+```
+Iteración 1: web_search → 2000 chars de resultados
+Iteración 2: get_weather → 500 chars
+Iteración 3: web_search de nuevo → 2000 chars más
+Total tool outputs: 4500 chars (~1125 tokens)
+```
+
+<Callout variant="warning" title="Presupuesto de contexto">
+Cada token gastado en tool outputs viejos es un token menos para historial, memorias y el system prompt. La limpieza es crítica para la calidad de las respuestas.
+</Callout>
+
+## _clear_old_tool_results()
+
+```python
+def _clear_old_tool_results(
+    messages: list[dict],
+    keep_last: int = 1,
+) -> list[dict]:
+    """Reemplaza tool results de iteraciones anteriores con placeholder."""
+    tool_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "tool"
+    ]
+
+    # Mantener solo los últimos 'keep_last' grupos
+    to_clear = tool_indices[:-keep_last] if keep_last else tool_indices
+
+    for idx in to_clear:
+        messages[idx]["content"] = "[Previous tool result cleared]"
+
+    return messages
+```
+
+<Concept title="Solo los últimos resultados importan">
+El LLM ya "vio" los resultados de iteraciones anteriores cuando decidió pedir más tools. No necesita verlos de nuevo — solo necesita los resultados de la iteración actual.
+</Concept>
+
+## Cuándo se Ejecuta
+
+```python
+# Dentro del execute_tool_loop
+for iteration in range(max_iterations):
+    # Limpiar resultados viejos antes de la siguiente llamada al LLM
+    if iteration > 0:
+        _clear_old_tool_results(messages)
+
+    response = await ollama_client.chat_with_tools(...)
+```
+
+## Compactación JSON (para outputs grandes)
+
+Para outputs individuales que son JSON grandes, WasAP aplica compactación de 3 niveles:
+
+```python
+async def _maybe_compact(result: ToolResult, budget: int = 1000) -> str:
+    content = result.content
+    if len(content) <= budget:
+        return content  # Ya es corto, no tocar
+
+    # Intentar compactar
+    return await compact_tool_output(content, budget)
+```
+
+## Antes y Después
+
+```
+ANTES (sin limpieza, iteración 3):
+messages = [
+    {role: user, content: "busca noticias de Argentina y el clima"},
+    {role: assistant, tool_calls: [search("argentina"), weather("BA")]},
+    {role: tool, content: "... 2000 chars de búsqueda ..."},        ← viejo
+    {role: tool, content: "... 500 chars de clima ..."},             ← viejo
+    {role: assistant, tool_calls: [search("argentina economía")]},
+    {role: tool, content: "... 2000 chars más ..."},                 ← actual
+]
+
+DESPUÉS (con limpieza):
+messages = [
+    {role: user, content: "busca noticias de Argentina y el clima"},
+    {role: assistant, tool_calls: [search("argentina"), weather("BA")]},
+    {role: tool, content: "[Previous tool result cleared]"},          ← limpio
+    {role: tool, content: "[Previous tool result cleared]"},          ← limpio
+    {role: assistant, tool_calls: [search("argentina economía")]},
+    {role: tool, content: "... 2000 chars más ..."},                 ← intacto
+]
+```
+
+<Quiz
+  question="¿Por qué se limpian los tool results de iteraciones anteriores?"
+  options={[
+    "Para ahorrar espacio en disco",
+    "Para liberar tokens del contexto que se necesitan para historial y memorias",
+    "Porque los resultados expiran",
+    "Para proteger información sensible"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Con qué se reemplazan los tool results limpiados?"
+  options={[
+    "String vacío",
+    "null",
+    "El placeholder '[Previous tool result cleared]'",
+    "Un resumen LLM"
+  ]}
+  correct={2}
+/>
+
+En la última lección veremos los meta-tools y el dynamic tool budget.

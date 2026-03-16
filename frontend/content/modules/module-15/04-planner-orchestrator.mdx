@@ -1,0 +1,352 @@
+---
+title: "Planner-Orchestrator"
+description: "Patrón 3-fases: UNDERSTAND → EXECUTE → SYNTHESIZE con workers especializados"
+xpReward: 150
+---
+
+## El Problema del Loop Reactivo
+
+El loop reactivo funciona, pero es ineficiente para tareas complejas. El agente no tiene visión global — va probando herramientas sin estrategia. El **planner-orchestrator** resuelve esto separando el trabajo en 3 fases claras.
+
+<Callout variant="info" title="Planner = cerebro, Workers = manos">
+El planner solo piensa — descompone la tarea en pasos. Los workers solo ejecutan — cada uno con herramientas especializadas. El synthesizer resume todo al final. Ninguno hace el trabajo del otro.
+</Callout>
+
+## Fase 1: UNDERSTAND (Crear Plan)
+
+```python
+# app/agent/planner.py
+async def create_plan(
+    objective: str,
+    ollama_client: OllamaClient,
+    context: str | None = None,
+) -> AgentPlan:
+    prompt = _PLANNER_CREATE_PROMPT.format(
+        objective=objective,
+        context_block=f"CONTEXT:\n{context}" if context else "",
+    )
+    resp = await ollama_client.chat(
+        [ChatMessage(role="user", content=prompt)],
+        think=False,
+    )
+    return _parse_plan_json(str(resp), objective)
+```
+
+El LLM produce un plan estructurado en JSON:
+
+```json
+{
+  "context_summary": "Backend repo needs CI/CD pipeline",
+  "tasks": [
+    {
+      "id": 1,
+      "description": "Read repository structure and CI config",
+      "worker_type": "reader",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "description": "Analyze testing coverage and gaps",
+      "worker_type": "analyzer",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "description": "Write GitHub Actions workflow",
+      "worker_type": "coder",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "description": "Generate report with recommendations",
+      "worker_type": "reporter",
+      "depends_on": [3]
+    }
+  ]
+}
+```
+
+## Worker Types
+
+Cada tipo de worker tiene un system prompt especializado y un subconjunto de herramientas:
+
+| Worker | Especialidad | Tools Típicas |
+|--------|-------------|---------------|
+| **reader** | Leer información | web search, fetch pages, GitHub API |
+| **analyzer** | Analizar datos | code search, metrics, CI checks |
+| **coder** | Modificar código | preview_patch, apply_patch, run tests |
+| **reporter** | Sintetizar hallazgos | (solo texto, cita file paths) |
+| **general** | Todo | Todas las categorías |
+
+```python
+# app/agent/workers.py
+WORKER_PROMPTS = {
+    "reader": (
+        "You are a research specialist. Your job is to gather information. "
+        "Use web search, fetch pages, and GitHub API tools. "
+        "Synthesize your findings clearly."
+    ),
+    "analyzer": (
+        "You are an analysis specialist. Provide evidence-based findings. "
+        "Inspect source code, patterns, CI/CD, and metrics. "
+        "Always cite specific file paths and line numbers."
+    ),
+    "coder": (
+        "You are a coding specialist. Read code first, then modify. "
+        "Use preview_patch before apply_patch. Test after changes."
+    ),
+    "reporter": (
+        "You are a reporting specialist. Synthesize findings into "
+        "a clear, actionable markdown report. Include file paths "
+        "and line references."
+    ),
+    "general": (
+        "You are a general-purpose worker. Use all available tools. "
+        "Don't stop after one tool call — keep working until the "
+        "task is fully addressed."
+    ),
+}
+```
+
+## Fase 2: EXECUTE (Workers)
+
+```python
+async def execute_worker(
+    task: TaskStep,
+    objective: str,
+    ollama_client: OllamaClient,
+    registry: SkillRegistry,
+    plan: AgentPlan,
+) -> str:
+    # 1. Construir prompt con contexto del worker
+    system_prompt = WORKER_PROMPTS[task.worker_type]
+
+    # 2. Inyectar resultados de dependencias
+    dep_context = ""
+    for dep_id in task.depends_on:
+        dep_task = plan.get_task(dep_id)
+        if dep_task and dep_task.result:
+            dep_context += (
+                f"\nResult from step #{dep_id} "
+                f"({dep_task.description}):\n{dep_task.result}\n"
+            )
+
+    messages = [
+        ChatMessage(role="system", content=system_prompt),
+        ChatMessage(role="user", content=(
+            f"OBJECTIVE: {objective}\n"
+            f"YOUR TASK: {task.description}\n"
+            f"{dep_context}"
+        )),
+    ]
+
+    # 3. Filtrar tools por worker type
+    categories = WORKER_TOOL_SETS.get(task.worker_type, None)
+
+    # 4. Ejecutar tool loop
+    result = await execute_tool_loop(
+        messages=messages,
+        ollama_client=ollama_client,
+        skill_registry=registry,
+        pre_classified_categories=categories,
+        max_iterations=8,  # Max tools por worker
+    )
+
+    return result
+```
+
+<Concept title="Dependencias entre tareas">
+El campo `depends_on` establece orden. Si la tarea 3 depende de [1, 2], solo se ejecuta cuando ambas están completadas. Los resultados de las dependencias se inyectan como contexto para el worker, dándole información que necesita sin re-ejecutar las búsquedas.
+</Concept>
+
+## Cascade Failure
+
+Si una dependencia falla, la tarea dependiente se marca automáticamente como failed:
+
+```python
+# app/agent/models.py — AgentPlan
+def next_task(self) -> TaskStep | None:
+    for task in self.tasks:
+        if task.status != "pending":
+            continue
+
+        # Verificar dependencias
+        deps_ok = True
+        for dep_id in task.depends_on:
+            dep = self.get_task(dep_id)
+            if dep and dep.status == "failed":
+                # Cascade: marcar como failed
+                task.status = "failed"
+                task.result = f"Skipped: dependency #{dep_id} failed"
+                deps_ok = False
+                break
+            if dep and dep.status != "done":
+                deps_ok = False  # Dependency not ready yet
+                break
+
+        if deps_ok:
+            return task
+    return None
+```
+
+## Fase 3: REPLAN o SYNTHESIZE
+
+Después de ejecutar todas las tareas (o si algunas fallaron):
+
+```python
+async def replan(
+    objective: str,
+    plan: AgentPlan,
+    ollama_client: OllamaClient,
+) -> dict:
+    """Planner reviews results and decides next action."""
+    prompt = _PLANNER_REPLAN_PROMPT.format(
+        objective=objective,
+        completed_steps=_format_completed(plan),
+        remaining_steps=_format_remaining(plan),
+    )
+    resp = await ollama_client.chat(
+        [ChatMessage(role="user", content=prompt)],
+        think=False,
+    )
+    # Returns: {"action": "done"} | {"action": "continue"} | {"action": "replan", ...}
+    return json.loads(str(resp))
+```
+
+<Step number={1} title="'done' — Objetivo cumplido">
+El planner decide que los resultados son suficientes. Se pasa a synthesize.
+</Step>
+
+<Step number={2} title="'continue' — Seguir con tareas restantes">
+Las tareas pendientes siguen siendo válidas. El loop continúa.
+</Step>
+
+<Step number={3} title="'replan' — Nuevo plan necesario">
+Resultados inesperados requieren un plan diferente. Se genera nuevo `AgentPlan` y se incrementa `plan.replans`. Máximo 3 replans.
+</Step>
+
+## Synthesis: Resumir Todo
+
+```python
+async def synthesize(
+    objective: str,
+    plan: AgentPlan,
+    ollama_client: OllamaClient,
+) -> str:
+    """Generate final summary from all task results."""
+    all_results = "\n".join(
+        f"#{t.id} [{t.status}] {t.description}\n{t.result or '(no result)'}"
+        for t in plan.tasks
+    )
+    prompt = _PLANNER_SYNTHESIZE_PROMPT.format(
+        objective=objective,
+        context_summary=plan.context_summary,
+        all_results=all_results,
+    )
+    return str(await ollama_client.chat(
+        [ChatMessage(role="user", content=prompt)],
+        think=False,
+    ))
+```
+
+## JSON Parsing Robusto
+
+El LLM no siempre produce JSON perfecto. El parser maneja varios quirks:
+
+```python
+def _parse_plan_json(raw: str, objective: str) -> AgentPlan:
+    # Limpiar markdown fences
+    raw = re.sub(r"```(?:json|python)?\s*", "", raw)
+    raw = raw.replace("```", "")
+
+    try:
+        data = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return _fallback_plan(objective)
+
+    tasks = []
+    for t in data.get("tasks", []):
+        # Coercer IDs: el LLM puede dar "id": "#3-reader"
+        raw_id = t.get("id", len(tasks) + 1)
+        if isinstance(raw_id, int):
+            task_id = raw_id
+        else:
+            match = re.search(r"\d+", str(raw_id))
+            task_id = int(match.group()) if match else len(tasks) + 1
+
+        tasks.append(TaskStep(
+            id=task_id,
+            description=t.get("description", ""),
+            worker_type=t.get("worker_type", "general"),
+            depends_on=_coerce_deps(t.get("depends_on", [])),
+        ))
+
+    if not tasks:
+        return _fallback_plan(objective)
+
+    return AgentPlan(
+        objective=objective,
+        context_summary=data.get("context_summary", ""),
+        tasks=tasks,
+    )
+```
+
+<Callout variant="warning" title="Fallback plan">
+Si el parsing falla completamente, se crea un plan de una sola tarea "general" con el objetivo original como descripción. Así el agente nunca se queda sin plan — degradation graceful.
+</Callout>
+
+## El Flujo Completo
+
+```
+[create_plan(objective)]
+  → AgentPlan con N tareas
+     ↓
+[Loop: mientras haya tareas pendientes]
+  ├─ plan.next_task() → TaskStep
+  ├─ execute_worker(task) → result
+  ├─ task.status = "done" | "failed"
+  ├─ Enviar progreso al usuario
+  └─ Persistir ronda en JSONL
+     ↓
+[¿Todas las tareas completadas?]
+  ├─ SÍ → synthesize() → resumen final
+  └─ NO (algunas fallaron) → replan()
+       ├─ "done" → synthesize()
+       ├─ "continue" → seguir loop
+       └─ "replan" → nuevo AgentPlan (max 3)
+```
+
+<Quiz
+  question="¿Cuáles son las 3 fases del patrón planner-orchestrator?"
+  options={[
+    "Input → Process → Output",
+    "UNDERSTAND (crear plan) → EXECUTE (workers) → SYNTHESIZE (resumir)",
+    "Read → Write → Test",
+    "Parse → Classify → Generate"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si una tarea depende de otra que falló?"
+  options={[
+    "Se ejecuta de todas formas",
+    "Se salta silenciosamente",
+    "Se marca automáticamente como 'failed' (cascade failure)",
+    "Se reintenta la dependencia"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cuántas veces puede replannear el planner?"
+  options={[
+    "1 vez",
+    "Ilimitado",
+    "Máximo 3 veces (max_replans)",
+    "5 veces"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo Agent Sessions. Ahora entendés cómo LocalForge implementa agentes autónomos con safety nets, persistencia, y planificación estructurada.

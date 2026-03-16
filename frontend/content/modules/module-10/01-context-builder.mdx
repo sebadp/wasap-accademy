@@ -1,0 +1,114 @@
+---
+title: "ContextBuilder"
+description: "Consolidar múltiples secciones en un system message con XML tags"
+xpReward: 100
+---
+
+## El Problema: Muchas Fuentes de Contexto
+
+El LLM necesita información de 6+ fuentes: system prompt, memorias, notas, historial, proyectos, capabilities. Enviar cada una como un mensaje separado es ineficiente.
+
+<Callout variant="info" title="Una sola fuente de verdad">
+ContextBuilder consolida todo en **un solo system message** con secciones XML. Ollama optimiza mejor con menos mensajes.
+</Callout>
+
+## ContextBuilder
+
+```python
+# app/context/context_builder.py
+class ContextBuilder:
+    def __init__(self, system_prompt: str):
+        self.sections: list[tuple[str, str]] = []
+        self.system_prompt = system_prompt
+
+    def add_section(self, tag: str, content: str):
+        if content and content.strip():  # Skip si vacío
+            self.sections.append((tag, content))
+
+    def build(self) -> str:
+        parts = [self.system_prompt]
+        for tag, content in self.sections:
+            parts.append(f"\n<{tag}>\n{content}\n</{tag}>")
+        return "\n".join(parts)
+```
+
+## Las Secciones XML
+
+```xml
+Sos LocalForge, un asistente personal con IA...
+
+<user_memories>
+- Es desarrollador Python senior
+- Trabaja en fintech
+- Zona horaria: Buenos Aires (UTC-3)
+</user_memories>
+
+<active_projects>
+- API v2: 3/5 tareas completadas (60%)
+</active_projects>
+
+<relevant_notes>
+- [Deploy] Usar Docker Compose en producción
+</relevant_notes>
+
+<recent_activity>
+## 2026-03-16
+- Discutió arquitectura de la API
+- Creó 2 tareas nuevas
+</recent_activity>
+
+<capabilities>
+Podés usar: get_weather, save_note, calculate, web_search
+</capabilities>
+
+<conversation_summary>
+El usuario viene trabajando en su API v2...
+</conversation_summary>
+```
+
+## Skip-If-Empty: Ahorrar Tokens
+
+```python
+builder = ContextBuilder(system_prompt)
+builder.add_section("user_memories", memories_text)     # Solo si hay memorias
+builder.add_section("active_projects", projects_text)   # Solo si hay proyectos
+builder.add_section("relevant_notes", notes_text)       # Solo si hay notas
+builder.add_section("recent_activity", daily_logs)      # Solo si hay logs
+builder.add_section("capabilities", capabilities_text)  # Solo si hay tools
+builder.add_section("conversation_summary", summary)    # Solo si hay resumen
+```
+
+<Concept title="Secciones vacías se omiten">
+Si el usuario no tiene notas, `notes_text` es vacío y `add_section` no agrega nada. Esto ahorra tokens que se usarían en tags XML vacíos.
+</Concept>
+
+## Por Qué XML Tags
+
+- **Estructura clara**: el LLM puede distinguir memorias de notas de proyectos
+- **Referenciables**: "según tus `<user_memories>`, trabajás en fintech"
+- **Parseables**: se pueden extraer secciones del output si es necesario
+- **Estándar en la industria**: Anthropic y otros recomiendan XML para structured prompts
+
+<Quiz
+  question="¿Por qué ContextBuilder usa un solo system message en vez de varios?"
+  options={[
+    "Porque Ollama solo soporta un system message",
+    "Porque Ollama optimiza mejor con menos mensajes y el modelo ve todo el contexto junto",
+    "Para reducir la latencia de red",
+    "Porque XML requiere un solo bloque"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa con una sección que tiene contenido vacío?"
+  options={[
+    "Se agrega con tags vacíos <section></section>",
+    "Se reemplaza con un placeholder",
+    "Se omite completamente para ahorrar tokens",
+    "Se lanza un error"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos ConversationContext.build() — el factory que recolecta todos los datos.

@@ -1,0 +1,147 @@
+---
+title: "TraceContext & Propagation"
+description: "Propagar trazas a través de funciones async con contextvars"
+xpReward: 100
+---
+
+## El Problema: ¿Cómo Acceder a la Traza?
+
+Una request pasa por muchas funciones: webhook handler → parser → classifier → executor → guardrails → sender. Cada función necesita acceder a la traza actual para registrar spans. ¿Cómo pasar la traza sin agregarla como parámetro en todas las funciones?
+
+<Callout variant="info" title="contextvars al rescate">
+Python tiene `contextvars.ContextVar` — variables que son automáticamente propagadas a través del call stack async. Cada coroutine hereda el contexto de su padre.
+</Callout>
+
+## TraceContext
+
+```python
+# app/tracing/context.py
+import contextvars
+from contextlib import asynccontextmanager
+
+_current_trace: contextvars.ContextVar[TraceContext | None] = (
+    contextvars.ContextVar("_current_trace", default=None)
+)
+
+def get_current_trace() -> TraceContext | None:
+    """Obtener la traza actual desde cualquier punto del código."""
+    return _current_trace.get()
+
+class TraceContext:
+    def __init__(self, recorder: TraceRecorder, trace_id: str):
+        self.recorder = recorder
+        self.trace_id = trace_id
+        self._spans: list = []
+
+    @asynccontextmanager
+    async def span(self, name: str, kind: str = "span"):
+        """Crear un span dentro de la traza actual."""
+        span_obj = self.recorder.start_span(
+            trace_id=self.trace_id,
+            name=name,
+            kind=kind,
+        )
+        try:
+            yield span_obj
+        finally:
+            self.recorder.end_span(span_obj)
+```
+
+<Concept title="contextvars.ContextVar">
+A diferencia de una variable global (que es compartida entre todas las coroutines), un `ContextVar` es **aislado por coroutine**. Si dos mensajes se procesan simultáneamente, cada uno tiene su propia traza sin interferir con la otra.
+</Concept>
+
+## Uso: Crear y Propagar Traza
+
+```python
+# En el webhook handler — crear la traza
+async def _run_normal_flow(phone, text, message_id, ...):
+    trace_ctx = TraceContext(
+        recorder=trace_recorder,
+        trace_id=Langfuse.create_trace_id(seed=str(message_id)),
+    )
+    # Setear en el contexto actual
+    _current_trace.set(trace_ctx)
+
+    # Ahora cualquier función llamada puede acceder a la traza
+    async with trace_ctx.span("phase_a"):
+        embedding, _ = await asyncio.gather(embed(text), save(text))
+
+    async with trace_ctx.span("phase_b"):
+        memories = await search_memories(phone, embedding)
+
+    async with trace_ctx.span("llm_generation", kind="generation"):
+        response = await execute_tool_loop(messages)
+
+    async with trace_ctx.span("guardrails"):
+        response = await run_guardrails(response, context)
+```
+
+## Acceso desde Funciones Profundas
+
+```python
+# En app/skills/executor.py — muchos niveles deep
+async def _run_tool_call(tool_call, tools_map):
+    trace = get_current_trace()  # Acceso sin parámetro
+
+    if trace:
+        async with trace.span(f"tool:{tool_call.name}", kind="tool"):
+            result = await handler(**tool_call.arguments)
+    else:
+        result = await handler(**tool_call.arguments)
+
+    return result
+```
+
+<Callout variant="tip" title="Graceful if no trace">
+`get_current_trace()` retorna `None` si no hay traza activa. El código siempre verifica `if trace:` antes de crear spans. Esto permite que la app funcione sin tracing activado.
+</Callout>
+
+## La Jerarquía de Spans
+
+```
+[Trace: message abc123]
+  ├─ [span: phase_a] ─────── 200ms
+  │   ├─ embed_query           150ms
+  │   └─ save_message           50ms
+  ├─ [span: phase_b] ─────── 300ms
+  │   ├─ search_memories       200ms
+  │   ├─ search_notes          100ms
+  │   └─ get_summary            50ms
+  ├─ [generation: llm] ──── 1200ms
+  │   ├─ [generation: iter_1]  800ms
+  │   │   └─ [tool: get_weather] 500ms
+  │   └─ [generation: iter_2]  400ms
+  ├─ [span: guardrails] ────── 50ms
+  └─ [span: delivery] ──────── 80ms
+```
+
+<Quiz
+  question="¿Qué problema resuelve contextvars.ContextVar?"
+  options={[
+    "Almacenar datos en disco",
+    "Propagar la traza a través del call stack async sin pasarla como parámetro explícito",
+    "Comprimir los datos de traza",
+    "Enviar trazas a Langfuse"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué retorna get_current_trace() si no hay traza activa?"
+  options={["Error", "Un trace vacío", "None", "False"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué diferencia hay entre un span con kind='span' y kind='generation'?"
+  options={[
+    "No hay diferencia funcional",
+    "generation aparece como llamada LLM en Langfuse y puede registrar tokens",
+    "span es más rápido",
+    "generation solo funciona con OpenAI"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos el TraceRecorder — el singleton que persiste las trazas.

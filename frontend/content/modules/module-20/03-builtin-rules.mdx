@@ -1,0 +1,197 @@
+---
+title: "Reglas Built-in"
+description: "5 reglas predefinidas que LocalForge incluye para auto-mantenimiento"
+xpReward: 75
+---
+
+## Reglas de Fábrica
+
+LocalForge incluye 5 reglas predefinidas que cubren los escenarios operacionales más comunes. Se seedean de forma **idempotente** al iniciar la app:
+
+```python
+# app/automation/seeds.py
+
+BUILTIN_RULES = [
+    {
+        "name": "project_inactive",
+        "description": "Notificar al usuario si un proyecto lleva 7+ días sin actividad",
+        "condition_type": "metric",
+        "condition_config": {
+            "name": "inactive_projects_days",
+            "operator": "gte",
+            "threshold": 7,
+        },
+        "action_type": "notify_user",
+        "action_config": {
+            "message": "Tenés un proyecto que lleva más de 7 días sin actividad. ¿Querés revisarlo?"
+        },
+        "cooldown_minutes": 1440,  # 24 horas
+    },
+    # ... 4 reglas más
+]
+
+async def seed_builtin_rules(repository: Repository) -> None:
+    """Insertar reglas built-in si no existen (idempotente)."""
+    for rule_data in BUILTIN_RULES:
+        existing = await repository.get_rule_by_name(rule_data["name"])
+        if not existing:
+            await repository.create_automation_rule(**rule_data)
+            logger.info("Seeded automation rule: %s", rule_data["name"])
+```
+
+<Callout variant="info" title="Seed idempotente">
+`seed_builtin_rules` chequea por nombre antes de insertar. Si la regla ya existe, no la toca. Esto permite correr el seed en cada startup sin duplicar reglas y sin sobreescribir cambios del usuario (ej: si desactivó una regla).
+</Callout>
+
+## Las 5 Reglas
+
+### 1. project_inactive
+
+```
+SI: algún proyecto lleva >= 7 días sin actividad
+ENTONCES: notificar al usuario
+COOLDOWN: 24 horas
+```
+
+| Campo | Valor |
+|-------|-------|
+| Condición | `metric: inactive_projects_days >= 7` |
+| Acción | `notify_user` con mensaje amigable |
+| Cooldown | 1440 min (24h) |
+| Objetivo | Recordar proyectos abandonados |
+
+### 2. guardrail_degraded
+
+```
+SI: el pass rate de guardrails < 70% en las últimas 24h
+ENTONCES: notificar al admin
+COOLDOWN: 4 horas
+```
+
+```python
+{
+    "name": "guardrail_degraded",
+    "condition_type": "metric",
+    "condition_config": {
+        "name": "guardrail_pass_rate",
+        "operator": "lt",
+        "threshold": 0.7,
+    },
+    "action_type": "notify_admin",
+    "action_config": {
+        "message": "Guardrail pass rate bajo: menos del 70% en las últimas 24h. Revisar logs."
+    },
+    "cooldown_minutes": 240,  # 4 horas
+}
+```
+
+<Callout variant="warning" title="Alerta crítica">
+Un pass rate menor a 70% indica que el LLM está generando respuestas de baja calidad. El admin necesita investigar: ¿cambió el prompt? ¿hay un problema con Ollama? ¿el modelo se degradó?
+</Callout>
+
+### 3. embeddings_desync
+
+```
+SI: más de 10 memorias sin embedding
+ENTONCES: correr backfill_embeddings
+COOLDOWN: 6 horas
+```
+
+```python
+{
+    "name": "embeddings_desync",
+    "condition_type": "metric",
+    "condition_config": {
+        "name": "embedding_desync",
+        "operator": "gt",
+        "threshold": 10,
+    },
+    "action_type": "run_task",
+    "action_config": {"task": "backfill_embeddings"},
+    "cooldown_minutes": 360,  # 6 horas
+}
+```
+
+### 4. db_large
+
+```
+SI: la DB supera 500 MB
+ENTONCES: correr VACUUM
+COOLDOWN: 24 horas
+```
+
+```python
+{
+    "name": "db_large",
+    "condition_type": "metric",
+    "condition_config": {
+        "name": "db_size_mb",
+        "operator": "gt",
+        "threshold": 500,
+    },
+    "action_type": "run_task",
+    "action_config": {"task": "vacuum_db"},
+    "cooldown_minutes": 1440,  # 24 horas
+}
+```
+
+<Concept title="VACUUM en SQLite">
+Cuando se borran filas en SQLite, el espacio no se libera automáticamente. VACUUM reconstruye la DB, liberando espacio. Es una operación pesada (bloquea la DB brevemente), por eso el cooldown es de 24 horas.
+</Concept>
+
+### 5. consolidation_pending
+
+```
+SI: más de 30 memorias sin consolidar en la última semana
+ENTONCES: correr consolidate_memories
+COOLDOWN: 12 horas
+```
+
+```python
+{
+    "name": "consolidation_pending",
+    "condition_type": "metric",
+    "condition_config": {
+        "name": "pending_consolidation",
+        "operator": "gt",
+        "threshold": 30,
+    },
+    "action_type": "run_task",
+    "action_config": {"task": "consolidate_memories"},
+    "cooldown_minutes": 720,  # 12 horas
+}
+```
+
+## Resumen Visual
+
+| Regla | Condición | Acción | Cooldown |
+|-------|-----------|--------|----------|
+| project_inactive | Proyecto inactivo >= 7d | Notificar usuario | 24h |
+| guardrail_degraded | Pass rate < 70% | Notificar admin | 4h |
+| embeddings_desync | > 10 sin embedding | Backfill embeddings | 6h |
+| db_large | DB > 500 MB | VACUUM | 24h |
+| consolidation_pending | > 30 sin consolidar | Consolidar memorias | 12h |
+
+<Quiz
+  question="¿Qué regla se dispara cuando el LLM genera muchas respuestas de baja calidad?"
+  options={[
+    "project_inactive",
+    "guardrail_degraded",
+    "embeddings_desync",
+    "consolidation_pending"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el seed de reglas built-in es idempotente?"
+  options={[
+    "Para que sea más rápido",
+    "Porque SQLite no soporta INSERT duplicados",
+    "Para no duplicar reglas ni sobreescribir cambios del usuario al reiniciar la app",
+    "Porque las reglas cambian en cada versión"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo crear reglas custom y cómo el usuario puede gestionar automatizaciones via chat.

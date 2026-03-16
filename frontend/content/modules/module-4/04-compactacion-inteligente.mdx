@@ -1,0 +1,108 @@
+---
+title: "Compactación Inteligente"
+description: "3 niveles de compactación para outputs de herramientas que saturan el contexto"
+xpReward: 75
+---
+
+## El Problema: Tool Outputs Gigantes
+
+Cuando una herramienta retorna JSON grande (ej: búsqueda web con 10 resultados, o un archivo de 500 líneas), ese output va al historial de mensajes. Si el LLM se llama de nuevo, todo ese JSON se re-envía.
+
+<Callout variant="warning" title="Contexto limitado">
+Un solo tool output de 4000 chars puede consumir el 12% de la ventana de contexto de 32K tokens. Con 3-4 tool calls, ya perdiste la mitad del contexto.
+</Callout>
+
+## Estrategia de 3 Niveles
+
+WasAP usa **compactación progresiva** en `formatting/compaction.py`:
+
+<Step number={1} title="Nivel 1: Extracción de campos clave">
+Si el output es JSON, extraer solo los campos más relevantes (título, URL, snippet). De ~4000 chars a ~800 chars.
+</Step>
+
+<Step number={2} title="Nivel 2: Resumen por LLM">
+Si aún es muy largo, pedir al LLM que resuma el contenido en ≤200 palabras. Usa `think=False` para velocidad.
+</Step>
+
+<Step number={3} title="Nivel 3: Truncado duro">
+Último recurso: cortar al presupuesto máximo. Nunca debería llegar acá si los niveles anteriores funcionan.
+</Step>
+
+## Implementación
+
+```python
+async def compact_tool_output(
+    output: str,
+    budget: int = 1000,
+    ollama_client: OllamaClient | None = None,
+) -> str:
+    # Nivel 1: Si es JSON, extraer campos clave
+    if len(output) > budget:
+        try:
+            data = json.loads(output)
+            output = _extract_key_fields(data)
+        except json.JSONDecodeError:
+            pass
+
+    # Nivel 2: Resumir con LLM
+    if len(output) > budget and ollama_client:
+        output = await _summarize_with_llm(output, budget, ollama_client)
+
+    # Nivel 3: Truncado duro
+    if len(output) > budget:
+        output = output[:budget] + "... [truncated]"
+
+    return output
+```
+
+## Limpieza de Tool Results Antiguos
+
+Además de compactar, WasAP **limpia** resultados de tools de iteraciones anteriores:
+
+```python
+def _clear_old_tool_results(messages: list[dict], keep_last: int = 1):
+    """Reemplaza tool results viejos con un placeholder corto."""
+    tool_msgs = [m for m in messages if m["role"] == "tool"]
+    for msg in tool_msgs[:-keep_last]:
+        msg["content"] = "[Previous tool result cleared]"
+```
+
+<Callout variant="tip" title="Solo los últimos">
+En el tool calling loop (hasta 5 iteraciones), solo necesitamos los resultados de la iteración actual. Los resultados de iteraciones anteriores ya fueron "vistos" por el LLM.
+</Callout>
+
+## Impacto en el Context Budget
+
+```
+Sin compactación:
+  3 tool outputs × 4000 chars = 12,000 chars (~3,000 tokens) → 9% del contexto
+
+Con compactación:
+  3 tool outputs × 800 chars = 2,400 chars (~600 tokens) → 2% del contexto
+
+Ahorro: ~7% del contexto disponible para historial y memorias
+```
+
+<Quiz
+  question="¿Cuáles son los 3 niveles de compactación en orden?"
+  options={[
+    "Truncar → Resumir → Comprimir",
+    "Extraer campos clave → Resumir con LLM → Truncado duro",
+    "Comprimir ZIP → Base64 → Truncar",
+    "LLM resumen → Regex → Eliminar"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se limpian los tool results de iteraciones anteriores?"
+  options={[
+    "Para ahorrar espacio en disco",
+    "Porque el LLM ya los procesó y no los necesita de nuevo, ahorrando contexto",
+    "Porque contienen información sensible",
+    "Para evitar errores de parsing"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo de Conversation & State Management. Ahora entendés cómo WasAP mantiene el flujo conversacional eficiente.

@@ -1,0 +1,249 @@
+---
+title: "Dataset Vivo"
+description: "Auto-curación de trazas en 3 niveles: failure, golden y candidate"
+xpReward: 50
+---
+
+## El Problema: ¿Cómo Construir un Dataset sin Trabajo Manual?
+
+Los datasets de eval tradicionales se construyen manualmente: alguien escribe preguntas y respuestas esperadas. Esto no escala — con cientos de mensajes por día, necesitás un sistema que **auto-curate** las mejores y peores interacciones automáticamente.
+
+<Callout variant="info" title="Dataset vivo">
+LocalForge construye su dataset de evaluación en tiempo real, alimentado por scores de guardrails y señales de usuarios. No hay paso manual — cada traza completada pasa por el pipeline de curación.
+</Callout>
+
+## Las 3 Tiers de Curación
+
+El sistema clasifica cada traza completada en uno de tres niveles:
+
+<Step number={1} title="Failure (máxima prioridad)">
+Cualquier guardrail con score < 0.3 O cualquier señal negativa del usuario (score < 0.3). Detectar problemas es lo más valioso — un failure enseña más que 10 éxitos.
+</Step>
+
+<Step number={2} title="Golden (confirmado)">
+Todos los guardrails con score ≥ 0.8 Y una señal positiva del usuario (score ≥ 0.8). Esto es una interacción verificada por dos fuentes independientes: checks automáticos + confirmación humana.
+</Step>
+
+<Step number={3} title="Candidate (golden sin confirmar)">
+Todos los guardrails con score ≥ 0.8, pero sin señal del usuario. Se guarda como `confirmed=False` — potencialmente golden, pendiente de validación humana.
+</Step>
+
+## La Función Central: `maybe_curate_to_dataset`
+
+```python
+# app/eval/dataset.py
+async def maybe_curate_to_dataset(
+    trace_id: str,
+    input_text: str,
+    output_text: str | None,
+    repository: object,
+    failed_check_names: list[str] | None = None,
+    trace_recorder: object | None = None,
+    primary_category: str | None = None,
+) -> None:
+    """Auto-curate a completed trace to the eval dataset. Best-effort — never raises."""
+    try:
+        scores = await repository.get_trace_scores(trace_id)
+        if not scores:
+            return
+
+        system_scores = [s for s in scores if s["source"] == "system"]
+        user_scores = [s for s in scores if s["source"] in ("user", "human")]
+
+        any_system_failure = any(s["value"] < 0.3 for s in system_scores)
+        all_system_high = system_scores and all(s["value"] >= 0.8 for s in system_scores)
+        has_positive_user = any(s["value"] >= 0.8 for s in user_scores)
+        has_negative_user = any(s["value"] < 0.3 for s in user_scores)
+```
+
+<Concept title="Failure tiene prioridad">
+El código evalúa failure PRIMERO. Si hay cualquier score bajo (< 0.3) de guardrails o del usuario, se clasifica como failure sin importar otros scores positivos. Esto es intencional: es mejor marcar un false-positive como failure que dejar pasar un problema real.
+</Concept>
+
+## El Flujo de Decisión
+
+```python
+        # Failure takes priority — detecting problems is most valuable
+        if any_system_failure or has_negative_user:
+            failure_tags: list[str] = []
+            if failed_check_names:
+                failure_tags.extend(f"guardrail:{name}" for name in failed_check_names)
+            if primary_category:
+                failure_tags.append(f"category:{primary_category}")
+            await repository.add_dataset_entry(
+                trace_id=trace_id,
+                entry_type="failure",
+                input_text=input_text,
+                output_text=output_text,
+                tags=failure_tags or None,
+            )
+            return
+
+        # Golden confirmed: system OK + user confirmed quality
+        if all_system_high and has_positive_user:
+            await repository.add_dataset_entry(
+                trace_id=trace_id,
+                entry_type="golden",
+                input_text=input_text,
+                output_text=output_text,
+                metadata={"confirmed": True, "primary_category": primary_category},
+            )
+            return
+
+        # Golden candidate: system OK, no user signal yet
+        if all_system_high and not user_scores:
+            await repository.add_dataset_entry(
+                trace_id=trace_id,
+                entry_type="golden",
+                input_text=input_text,
+                output_text=output_text,
+                metadata={"confirmed": False},
+            )
+    except Exception:
+        logger.exception("Failed to curate trace %s to dataset", trace_id)
+```
+
+<Callout variant="tip" title="Tags filtrables">
+Los failures se guardan con tags como `guardrail:no_pii` o `category:weather`. Esto permite filtrar el dataset por tipo de fallo y por categoría de intent, útil para analizar patrones.
+</Callout>
+
+## Invocación: Al Final de Cada Request
+
+La curación se dispara como background task al final de `_run_normal_flow`:
+
+```python
+# app/webhook/router.py — al final del procesamiento
+if trace_ctx and settings.eval_auto_curate:
+    _track_task(
+        asyncio.create_task(
+            maybe_curate_to_dataset(
+                trace_id=trace_ctx.trace_id,
+                input_text=user_text,
+                output_text=reply,
+                repository=repository,
+                failed_check_names=failed_checks_for_curation or None,
+                trace_recorder=recorder,
+                primary_category=pre_classified[0]
+                    if pre_classified and pre_classified[0] != "none"
+                    else None,
+            )
+        )
+    )
+```
+
+<Callout variant="warning" title="eval_auto_curate">
+La curación solo se ejecuta si `settings.eval_auto_curate = True`. Es un feature flag que permite desactivar la curación automática en desarrollo o cuando Langfuse no está configurado.
+</Callout>
+
+## Sync a Langfuse Datasets
+
+Para entries confirmados como golden, el sistema también sincroniza a Langfuse Datasets (si está disponible):
+
+```python
+if trace_recorder is not None:
+    try:
+        await trace_recorder.sync_dataset_to_langfuse(
+            dataset_name="localforge-eval",
+            input_text=input_text,
+            expected_output=output_text,
+            metadata={
+                "entry_type": "golden",
+                "trace_id": trace_id,
+                "confirmed": True,
+            },
+        )
+    except Exception:
+        logger.debug("Failed to sync golden trace to Langfuse")
+```
+
+## El Tercer Tipo: Correction Pairs
+
+Además de los 3 tiers automáticos, existe un tipo especial: **correction pairs**. Cuando el usuario corrige una respuesta mala, se guarda el par (input, bad_output, correction):
+
+```python
+async def add_correction_pair(
+    previous_trace_id: str,
+    input_text: str,
+    bad_output: str | None,
+    correction_text: str,
+    repository: object,
+    trace_recorder: object | None = None,
+) -> None:
+    """Save a correction pair: previous (bad) trace + user correction."""
+    await repository.add_dataset_entry(
+        trace_id=previous_trace_id,
+        entry_type="correction",
+        input_text=input_text,
+        output_text=bad_output,
+        expected_output=correction_text,  # La respuesta correcta
+    )
+```
+
+<Concept title="Correction pairs son oro">
+Los correction pairs son el tipo de dato más valioso del dataset. Tienen tanto la respuesta mala como la correcta — son perfectos para eval porque tienen `expected_output` definido por el usuario.
+</Concept>
+
+## Exportar a JSONL
+
+El dataset se puede exportar para evaluación offline:
+
+```python
+# app/eval/exporter.py
+async def export_to_jsonl(
+    repository: object,
+    output_path: Path,
+    entry_type: str | None = None,
+    limit: int = 1000,
+) -> int:
+    entries = await repository.get_dataset_entries(entry_type=entry_type, limit=limit)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fh:
+        for entry in entries:
+            record = {
+                "id": entry["id"],
+                "trace_id": entry["trace_id"],
+                "entry_type": entry["entry_type"],
+                "input": entry["input_text"],
+                "output": entry["output_text"],
+                "expected_output": entry["expected_output"],
+                "metadata": entry["metadata"],
+                "created_at": entry["created_at"],
+            }
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return len(entries)
+```
+
+<Quiz
+  question="¿Cuál es la prioridad más alta en el pipeline de curación?"
+  options={[
+    "Golden (confirmado por el usuario)",
+    "Candidate (sin señal del usuario)",
+    "Failure (cualquier score < 0.3 de guardrails o usuario)",
+    "Correction pairs"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué diferencia hay entre un golden confirmed y un golden candidate?"
+  options={[
+    "El confirmed tiene más datos",
+    "El confirmed tiene señal positiva del usuario además de guardrails OK; el candidate solo guardrails OK",
+    "El candidate se borra después de 30 días",
+    "No hay diferencia funcional"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué tipo de dataset entry tiene 'expected_output' definido por el usuario?"
+  options={[
+    "Golden",
+    "Failure",
+    "Candidate",
+    "Correction pair"
+  ]}
+  correct={3}
+/>
+
+En la siguiente lección veremos cómo las señales del usuario (reacciones, /rate, /feedback) alimentan este pipeline.

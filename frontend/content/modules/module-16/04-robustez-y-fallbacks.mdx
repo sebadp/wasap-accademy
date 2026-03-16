@@ -1,0 +1,239 @@
+---
+title: "Robustez y Fallbacks"
+description: "JSON parsing tolerante, fallback plan, y planner → reactivo degradation"
+xpReward: 125
+---
+
+## El LLM No Siempre Produce JSON Perfecto
+
+Pedirle JSON a un LLM es como pedirle a un humano que escriba código — a veces funciona perfecto, a veces hay errores sutiles. El parser del planner necesita ser **extremadamente tolerante**.
+
+## Problemas Comunes del LLM
+
+```python
+# Problema 1: Markdown code fences
+"```json\n{\"tasks\": [...]}\n```"
+
+# Problema 2: IDs como strings
+{"id": "#3-reader", "description": "..."}
+
+# Problema 3: IDs como floats
+{"id": 3.0, "description": "..."}
+
+# Problema 4: depends_on con strings
+{"depends_on": ["#1", "task_2"]}
+
+# Problema 5: Texto extra antes/después del JSON
+"Here is my plan:\n{...}\nI hope this helps!"
+
+# Problema 6: Array vacío de tareas
+{"context_summary": "...", "tasks": []}
+```
+
+## El Parser Robusto
+
+```python
+# app/agent/planner.py
+def _parse_plan_json(raw: str, objective: str) -> AgentPlan:
+    # 1. Limpiar markdown fences
+    raw = re.sub(r"```(?:json|python)?\s*", "", raw)
+    raw = raw.replace("```", "")
+
+    # 2. Intentar parsear JSON
+    try:
+        data = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        # Intentar extraer JSON del texto
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                return _fallback_plan(objective)
+        else:
+            return _fallback_plan(objective)
+
+    # 3. Parsear tareas con coerción de tipos
+    tasks = []
+    for t in data.get("tasks", []):
+        task_id = _coerce_id(t.get("id", len(tasks) + 1))
+        deps = _coerce_deps(t.get("depends_on", []))
+        worker = t.get("worker_type", "general")
+
+        # Validar worker type
+        if worker not in VALID_WORKER_TYPES:
+            worker = "general"
+
+        tasks.append(TaskStep(
+            id=task_id,
+            description=t.get("description", f"Task {task_id}"),
+            worker_type=worker,
+            depends_on=deps,
+        ))
+
+    # 4. Fallback si no hay tareas
+    if not tasks:
+        return _fallback_plan(objective)
+
+    return AgentPlan(
+        objective=objective,
+        context_summary=data.get("context_summary", ""),
+        tasks=tasks,
+    )
+```
+
+## Coerción de IDs
+
+```python
+def _coerce_id(raw_id) -> int:
+    """Convertir cualquier cosa a int."""
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, float):
+        return int(raw_id)
+    # String: extraer primer número
+    match = re.search(r"\d+", str(raw_id))
+    return int(match.group()) if match else 1
+
+
+def _coerce_deps(raw_deps) -> list[int]:
+    """Convertir lista de dependencias a list[int]."""
+    if not isinstance(raw_deps, list):
+        return []
+    deps = []
+    for d in raw_deps:
+        if isinstance(d, (int, float)):
+            deps.append(int(d))
+        elif isinstance(d, str):
+            match = re.search(r"\d+", d)
+            if match:
+                deps.append(int(match.group()))
+    return deps
+```
+
+<Concept title="Extraer primer número">
+`re.search(r"\d+", "#3-reader")` encuentra "3". Esto maneja la mayoría de los casos: el LLM puede poner prefijos, sufijos, o texto decorativo alrededor del ID, pero siempre hay un número en algún lugar.
+</Concept>
+
+## El Fallback Plan
+
+Cuando el parsing falla completamente:
+
+```python
+def _fallback_plan(objective: str) -> AgentPlan:
+    """Create a single-task plan when structured planning fails."""
+    return AgentPlan(
+        objective=objective,
+        context_summary="(fallback: planner could not generate structured plan)",
+        tasks=[
+            TaskStep(
+                id=1,
+                description=objective,
+                worker_type="general",
+            )
+        ],
+    )
+```
+
+<Callout variant="tip" title="General worker como fallback">
+El fallback plan tiene una sola tarea "general" con el objetivo original como descripción. Esto convierte efectivamente al planner mode en un loop reactivo — el "general" worker tiene acceso a todas las tools y trabaja sin restricción.
+</Callout>
+
+## Degradation: Planner → Reactivo
+
+Si el planner falla en crear o ejecutar un plan, el sistema degrada gracefully al loop reactivo:
+
+```python
+# app/agent/loop.py — _run_agent_body
+async def _run_agent_body(session, ...):
+    if use_planner:
+        try:
+            await _run_planner_session(session, ...)
+        except Exception as e:
+            logger.warning(
+                "Planner failed, retrying once: %s", e
+            )
+            try:
+                # Retry: a veces el LLM produce mejor JSON la segunda vez
+                await _run_planner_session(session, ...)
+            except Exception:
+                logger.warning(
+                    "Planner failed twice, falling back to reactive"
+                )
+                # Fallback al loop reactivo
+                await _run_reactive_session(session, ...)
+    else:
+        await _run_reactive_session(session, ...)
+```
+
+<Step number={1} title="Primer intento del planner">
+Se intenta crear y ejecutar el plan. Si falla (JSON inválido, error en worker, etc.), se captura la excepción.
+</Step>
+
+<Step number={2} title="Retry (1 vez)">
+A veces el LLM produce mejor JSON en el segundo intento (especialmente con prompts que tienen ejemplos). Se reintenta una vez.
+</Step>
+
+<Step number={3} title="Fallback a reactivo">
+Si falla dos veces, se abandona el planner y se ejecuta el loop reactivo normal. El usuario no nota la diferencia — solo tarda un poco más.
+</Step>
+
+## Resumen: Cadena de Fallbacks
+
+```
+[Planner crea plan JSON]
+  ├─ JSON válido → ejecutar plan
+  ├─ JSON inválido → extraer JSON de texto → ejecutar
+  ├─ No se encuentra JSON → fallback plan (1 tarea general)
+  └─ Todo falla → retry 1 vez
+       ├─ Retry exitoso → ejecutar
+       └─ Retry falla → fallback a reactive loop
+```
+
+| Nivel | Qué pasó | Acción |
+|-------|----------|--------|
+| 1 | JSON perfecto | Ejecutar plan normalmente |
+| 2 | JSON con quirks | Coercer IDs/deps, ejecutar |
+| 3 | JSON parcial en texto | Regex extract + parse |
+| 4 | No hay JSON | Fallback plan (1 tarea general) |
+| 5 | Planner exception | Retry 1 vez |
+| 6 | Retry falla | Reactive loop |
+
+<Callout variant="warning" title="Nunca fallar silenciosamente">
+En cada nivel de fallback se loguea un warning. El usuario siempre recibe un resultado — puede ser parcial, puede ser del loop reactivo en vez del planner, pero nunca hay un error sin respuesta.
+</Callout>
+
+<Quiz
+  question="¿Qué hace el parser cuando el LLM retorna un ID como '#3-reader'?"
+  options={[
+    "Falla con error",
+    "Lo ignora y genera un ID nuevo",
+    "Extrae el primer número con regex: 3",
+    "Lo convierte a string"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué es el fallback plan?"
+  options={[
+    "Un plan con muchas tareas simples",
+    "Un plan de una sola tarea 'general' con el objetivo original, que efectivamente convierte al planner en un loop reactivo",
+    "Un plan que solo lee archivos",
+    "Un plan vacío"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántos niveles de degradation tiene el sistema planner?"
+  options={[
+    "2 (planner o reactivo)",
+    "3 (planner, retry, reactivo)",
+    "6 (JSON perfecto → coerción → regex → fallback plan → retry → reactivo)",
+    "1 (solo reactivo)"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo Planner-Orchestrator. Ahora entendés cómo LocalForge descompone tareas complejas en planes estructurados con workers especializados, replanificación, y degradation graceful.

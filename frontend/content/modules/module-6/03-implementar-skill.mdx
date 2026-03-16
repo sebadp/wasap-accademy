@@ -1,0 +1,153 @@
+---
+title: "Implementar un Skill"
+description: "Guía paso a paso para crear un skill completo desde cero"
+xpReward: 100
+---
+
+## Vamos a Crear un Skill
+
+En esta lección vamos a construir un skill completo: **unit converter** (conversor de unidades). Seguiremos los 5 pasos que WasAP usa para cada skill.
+
+<Callout variant="tip" title="Hands-on">
+Seguí estos pasos para crear tu propio skill. Al final, tendrás una herramienta funcional que el LLM puede usar.
+</Callout>
+
+## Paso 1: Crear SKILL.md
+
+```markdown
+---
+name: converter
+description: Convierte unidades de medida (temperatura, distancia, peso)
+version: 1.0.0
+tools:
+  - name: convert_units
+    description: Convierte un valor de una unidad a otra
+    parameters:
+      value:
+        type: number
+        description: El valor numérico a convertir
+        required: true
+      from_unit:
+        type: string
+        description: "Unidad de origen (ej: km, miles, celsius, kg)"
+        required: true
+      to_unit:
+        type: string
+        description: "Unidad de destino (ej: miles, km, fahrenheit, lb)"
+        required: true
+---
+```
+
+## Paso 2: Crear el Handler
+
+```python
+# app/skills/tools/converter_tools.py
+
+CONVERSIONS = {
+    ("km", "miles"): lambda v: v * 0.621371,
+    ("miles", "km"): lambda v: v * 1.60934,
+    ("celsius", "fahrenheit"): lambda v: v * 9/5 + 32,
+    ("fahrenheit", "celsius"): lambda v: (v - 32) * 5/9,
+    ("kg", "lb"): lambda v: v * 2.20462,
+    ("lb", "kg"): lambda v: v * 0.453592,
+    ("m", "ft"): lambda v: v * 3.28084,
+    ("ft", "m"): lambda v: v * 0.3048,
+}
+
+def register(registry, **dependencies):
+    async def convert_units(
+        value: float, from_unit: str, to_unit: str
+    ) -> str:
+        key = (from_unit.lower(), to_unit.lower())
+        if key not in CONVERSIONS:
+            return f"Conversión no soportada: {from_unit} → {to_unit}"
+
+        result = CONVERSIONS[key](value)
+        return f"{value} {from_unit} = {result:.4f} {to_unit}"
+
+    registry.register_tool(
+        name="convert_units",
+        handler=convert_units,
+        schema=_build_schema(),
+        metadata=SkillMetadata(name="converter", version="1.0.0"),
+    )
+```
+
+## Paso 3: Registrar en el Router
+
+```python
+# En app/skills/router.py — agregar la categoría
+TOOL_CATEGORIES = {
+    "math": ["calculate", "convert_units"],  # Agregar acá
+    # ... otras categorías
+}
+```
+
+<Step number={1} title="SKILL.md → define el contrato">
+Qué herramientas ofrece y qué parámetros acepta.
+</Step>
+
+<Step number={2} title="Handler → implementa la lógica">
+La función async que ejecuta la herramienta.
+</Step>
+
+<Step number={3} title="Router → mapea categorías">
+En qué contextos el LLM puede acceder a esta herramienta.
+</Step>
+
+## Paso 4: El Schema para Ollama
+
+```python
+def _build_schema():
+    return {
+        "type": "function",
+        "function": {
+            "name": "convert_units",
+            "description": "Convierte un valor de una unidad a otra",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "number", "description": "Valor a convertir"},
+                    "from_unit": {"type": "string", "description": "Unidad origen"},
+                    "to_unit": {"type": "string", "description": "Unidad destino"},
+                },
+                "required": ["value", "from_unit", "to_unit"],
+            },
+        },
+    }
+```
+
+## Paso 5: El Resultado
+
+Cuando el usuario dice "convertí 100 km a millas":
+
+```
+Usuario: "convertí 100 km a millas"
+LLM → tool_call: convert_units(value=100, from_unit="km", to_unit="miles")
+Handler → "100 km = 62.1371 miles"
+LLM → "100 kilómetros equivalen a 62.14 millas."
+```
+
+<Quiz
+  question="¿En qué orden se crean las partes de un skill?"
+  options={[
+    "Handler → SKILL.md → Router",
+    "SKILL.md → Handler → Router (TOOL_CATEGORIES)",
+    "Router → SKILL.md → Handler",
+    "No importa el orden"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Dónde se mapea un tool nuevo a una categoría para el routing?"
+  options={[
+    "En SKILL.md",
+    "En el handler Python",
+    "En TOOL_CATEGORIES dentro de router.py",
+    "En la base de datos"
+  ]}
+  correct={2}
+/>
+
+En la última lección del módulo aprenderemos cómo testear skills.

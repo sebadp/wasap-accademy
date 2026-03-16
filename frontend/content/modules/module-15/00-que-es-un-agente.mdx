@@ -1,0 +1,201 @@
+---
+title: "¿Qué es un Agente?"
+description: "Diferencia entre chat reactivo y sesiones agénticas con tool loop iterativo"
+xpReward: 50
+---
+
+## Chat vs Agente
+
+En una conversación normal, el flujo es simple: usuario envía mensaje → bot responde → fin. Cada mensaje es independiente. Un **agente** es diferente: recibe un **objetivo** y trabaja autónomamente en múltiples iteraciones hasta completarlo.
+
+<Callout variant="info" title="Agente = objetivo + autonomía + iteración">
+Un agente no solo responde — planifica, ejecuta herramientas, evalúa resultados, y decide si necesita más pasos. Puede hacer 15 rondas de trabajo antes de responder al usuario.
+</Callout>
+
+## Cuándo se Activa el Modo Agente
+
+El modo agente se activa cuando la tarea es demasiado compleja para una sola iteración de tool calling:
+
+| Modo | Iteraciones | Ejemplo |
+|------|------------|---------|
+| **Chat** | 1 ronda, max 5 tool calls | "¿Qué hora es?" |
+| **Agente reactivo** | Hasta 15 rondas | "Analizá el repo y hacé un resumen" |
+| **Agente con planner** | 15 rondas + plan estructurado | "Creá un pipeline CI/CD para el backend" |
+
+## El Modelo: AgentSession
+
+```python
+# app/agent/models.py
+@dataclass
+class AgentSession:
+    session_id: str              # UUID hex
+    phone_number: str            # Identificador del usuario
+    objective: str               # "Analizá el repo X"
+    status: AgentStatus          # RUNNING | WAITING_USER | COMPLETED | ...
+    iteration: int               # Contador de rondas (0-based)
+    max_iterations: int          # Límite de seguridad (default 15)
+    started_at: datetime
+    context_messages: list       # Historial de mensajes acumulado
+    task_plan: str | None        # Checklist markdown (compat)
+    plan: AgentPlan | None       # Plan estructurado (planner mode)
+    scratchpad: str              # Notas persistentes entre rondas
+```
+
+<Concept title="AgentStatus">
+Los 5 estados posibles de una sesión agéntica:
+
+- **RUNNING**: El agente está ejecutando herramientas activamente
+- **WAITING_USER**: Pausado esperando aprobación humana (HITL)
+- **COMPLETED**: Objetivo cumplido exitosamente
+- **FAILED**: Error fatal
+- **CANCELLED**: Cancelado por el usuario o el sistema
+</Concept>
+
+## Scratchpad: Memoria de Trabajo
+
+El scratchpad es la memoria de trabajo del agente entre rondas. A diferencia de los mensajes del chat, es un espacio privado para notas:
+
+```python
+# El agente escribe en su scratchpad
+"<scratchpad>
+Encontré que el repo tiene Makefile pero no CI config.
+Próximo paso: analizar cobertura de tests.
+Notas: el usuario prefiere GitHub Actions.
+</scratchpad>"
+```
+
+El scratchpad se **inyecta** como system message al inicio de cada ronda y se **extrae** del reply al final:
+
+```python
+# Inyección (inicio de ronda)
+def _inject_scratchpad(messages, scratchpad):
+    if scratchpad:
+        msg = ChatMessage(
+            role="system",
+            content=f"<scratchpad_context>\n{scratchpad}\n</scratchpad_context>"
+        )
+        # Insertar después del system prompt principal
+        messages.insert(1, msg)
+
+# Extracción (fin de ronda)
+def _extract_scratchpad(reply):
+    match = re.search(r"<scratchpad>(.*?)</scratchpad>", reply, re.DOTALL)
+    if match:
+        scratchpad = match.group(1).strip()
+        clean_reply = reply[:match.start()] + reply[match.end():]
+        return scratchpad, clean_reply.strip()
+    return "", reply
+```
+
+<Callout variant="tip" title="Scratchpad no se envía al usuario">
+El contenido entre `<scratchpad>...</scratchpad>` se extrae del reply ANTES de enviar al usuario. Es información interna del agente — como las notas al margen de un investigador.
+</Callout>
+
+## Task Plan: Checklist de Progreso
+
+Además del scratchpad, el agente mantiene un task plan — una checklist markdown que se inyecta como system message:
+
+```python
+# Ejemplo de task plan
+task_plan = """
+- [x] Leer estructura del repositorio
+- [x] Analizar cobertura de tests
+- [ ] Escribir workflow de GitHub Actions
+- [ ] Generar reporte final
+"""
+
+def _inject_task_plan(messages, task_plan):
+    if task_plan:
+        msg = ChatMessage(
+            role="system",
+            content=f"Current task plan:\n{task_plan}\nMark completed steps with [x]."
+        )
+        messages.insert(1, msg)  # Después del system prompt
+```
+
+## El Entry Point
+
+```python
+# app/agent/loop.py
+async def run_agent_session(
+    session: AgentSession,
+    ollama_client: OllamaClient,
+    skill_registry: SkillRegistry,
+    wa_client: PlatformClient,
+    repository: Repository,
+    settings: Settings,
+    recorder: TraceRecorder | None = None,
+) -> None:
+    # Toda la sesión se ejecuta dentro de un TraceContext
+    async with TraceContext(
+        phone_number=session.phone_number,
+        input_text=session.objective,
+        recorder=recorder,
+        message_type="agent",  # Distinto de "chat"
+    ):
+        await _run_agent_body(...)
+```
+
+<Concept title="message_type='agent'">
+Las trazas de sesiones agénticas se marcan como tipo `"agent"` en vez de `"chat"`. Esto permite filtrar en Langfuse: dashboards separados para conversaciones normales vs sesiones agénticas.
+</Concept>
+
+## El Flujo General
+
+```
+[Usuario envía objetivo complejo]
+     ↓
+[Se crea AgentSession con objective + max_iterations=15]
+     ↓
+[¿Usar planner?]
+  ├─ SÍ → _run_planner_session() (3 fases)
+  │    Si falla → retry 1 vez → fallback a reactivo
+  └─ NO → _run_reactive_session()
+     ↓
+[Loop: hasta max_iterations o objetivo cumplido]
+  ├─ Inyectar scratchpad + task plan
+  ├─ execute_tool_loop() (1 ronda de tool calling)
+  ├─ Extraer scratchpad del reply
+  ├─ Detectar loops → inyectar warning si necesario
+  ├─ Enviar progreso al usuario via WhatsApp
+  └─ Persistir ronda en JSONL
+     ↓
+[Sesión COMPLETED | FAILED | CANCELLED]
+     ↓
+[Score de goal completion via LLM-as-judge (background)]
+```
+
+<Quiz
+  question="¿Cuál es la diferencia principal entre chat normal y modo agente?"
+  options={[
+    "El agente usa un modelo diferente",
+    "El agente puede hacer múltiples rondas de herramientas autónomamente hasta completar un objetivo",
+    "El agente no puede usar herramientas",
+    "El agente solo funciona con WhatsApp"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Para qué sirve el scratchpad?"
+  options={[
+    "Para enviar notas al usuario",
+    "Para persistir la memoria de trabajo del agente entre rondas, sin mostrarlo al usuario",
+    "Para guardar logs",
+    "Para cachear respuestas del LLM"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántas iteraciones máximas tiene una sesión agéntica por defecto?"
+  options={[
+    "5",
+    "10",
+    "15",
+    "Sin límite"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos el loop reactivo en detalle, incluyendo la detección de loops.

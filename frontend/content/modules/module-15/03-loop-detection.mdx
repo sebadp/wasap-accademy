@@ -1,0 +1,213 @@
+---
+title: "Loop Detection & Safety"
+description: "Circuit breaker, Fibonacci backoff, y goal completion scoring"
+xpReward: 100
+---
+
+## El Peligro: Loops Infinitos
+
+Un LLM no tiene conciencia de sus acciones previas. Si le pedís "buscá información sobre X" y la primera búsqueda no retorna resultados, puede intentar la misma búsqueda 50 veces con los mismos parámetros. Esto consume tokens, tiempo, y nunca avanza.
+
+<Callout variant="error" title="Costo real de un loop">
+A 9B parámetros, cada iteración del tool loop toma ~3-5 segundos. Un loop de 15 iteraciones × 5 tool calls = 75 llamadas al LLM = ~5 minutos de Ollama. Con múltiples usuarios, esto bloquea la GPU para todos.
+</Callout>
+
+## Los 3 Niveles de Protección
+
+LocalForge implementa una estrategia en capas para prevenir loops:
+
+### Nivel 1: Max Iterations (Hard Limit)
+
+```python
+# Límite absoluto de rondas por sesión
+session.max_iterations = 15  # Configurable via settings
+
+for iteration in range(session.max_iterations):
+    # ... ejecutar ronda ...
+    pass
+# Si llega acá sin completar → mark COMPLETED de todas formas
+```
+
+### Nivel 2: Loop Detection (Soft Warning → Hard Break)
+
+```python
+def _check_loop_detection(tool_history):
+    if len(tool_history) < 3:
+        return None
+
+    last_entry = tool_history[-1]  # (tool_name, params_hash)
+    same_count = sum(1 for t in tool_history if t == last_entry)
+
+    # CIRCUIT BREAKER: 5+ repeticiones idénticas → RuntimeError
+    if same_count >= 5:
+        raise RuntimeError(
+            f"CIRCUIT_BREAKER: tool '{last_entry[0]}' called "
+            f"{same_count} times with identical params"
+        )
+
+    # WARNING: 3+ repeticiones → system message
+    if same_count >= 3:
+        return (
+            f"WARNING: You've called '{last_entry[0]}' {same_count} times "
+            "with similar arguments. This is not making progress. "
+            "Try a fundamentally different approach or conclude with "
+            "what you have so far."
+        )
+
+    # PING-PONG: A→B→A→B → system message
+    if len(tool_history) >= 4:
+        last_4 = tool_history[-4:]
+        if (last_4[0] == last_4[2]) and (last_4[1] == last_4[3]):
+            return (
+                "WARNING: Detected ping-pong pattern. "
+                "You are alternating between two tools without progress. "
+                "Step back and reconsider your approach."
+            )
+
+    return None
+```
+
+<Concept title="Warning vs Circuit Breaker">
+El warning (3+ repeticiones) es **recuperable** — se inyecta como system message y el LLM puede cambiar de estrategia. El circuit breaker (5+) es **fatal** — lanza excepción y termina la sesión. La idea es dar al LLM oportunidad de corregirse antes de forzar la terminación.
+</Concept>
+
+### Nivel 3: Tool Result Cleanup
+
+A medida que se acumulan rondas, la ventana de contexto se llena de tool results viejos. Limpiarlos reduce noise y previene que el LLM se confunda:
+
+```python
+# Cada pocas rondas, limpiar resultados de herramientas viejas
+# Mantener solo los últimos 3 sets
+_clean_old_tool_results(session.context_messages, keep_last=3)
+```
+
+## Goal Completion: ¿Se Cumplió el Objetivo?
+
+Al final de la sesión, un LLM-as-judge evalúa si el agente realmente cumplió su objetivo:
+
+```python
+# Background task al final de la sesión
+async def _score_goal_completion(session, ollama_client, trace_ctx):
+    judge_prompt = (
+        f"User requested: {session.objective}\n"
+        f"Agent delivered: {final_summary[:500]}\n\n"
+        "Did the agent successfully accomplish the user's goal? "
+        "Reply ONLY 'yes' or 'no'."
+    )
+    judge_resp = await ollama_client.chat(
+        [ChatMessage(role="user", content=judge_prompt)],
+        think=False,
+    )
+    score = 1.0 if str(judge_resp).strip().lower().startswith("yes") else 0.0
+
+    if trace_ctx:
+        await trace_ctx.add_score(
+            name="goal_completion",
+            value=score,
+            source="llm_judge",
+            comment=f"Objective: {session.objective[:100]}",
+        )
+```
+
+<Callout variant="tip" title="Best-effort scoring">
+El goal completion score se ejecuta como background task. Si falla (LLM timeout, etc.), no afecta al resultado de la sesión. Pero cuando funciona, es invaluable para medir la eficacia del modo agente en Langfuse.
+</Callout>
+
+## Manejo de Cancelación
+
+```python
+async def _run_agent_body(session, ...):
+    try:
+        # ... ejecutar sesión ...
+        session.status = AgentStatus.COMPLETED
+    except asyncio.CancelledError:
+        # Graceful: no enviar mensajes duplicados
+        session.status = AgentStatus.CANCELLED
+        logger.info("Agent session %s cancelled", session.session_id)
+    except RuntimeError as e:
+        if "CIRCUIT_BREAKER" in str(e):
+            session.status = AgentStatus.FAILED
+            await wa_client.send_message(
+                session.phone_number,
+                "La sesión se detuvo porque detecté que estaba "
+                "repitiendo las mismas acciones sin avanzar. "
+                "Estos son los resultados parciales..."
+            )
+        else:
+            raise
+    except Exception:
+        session.status = AgentStatus.FAILED
+        logger.exception("Agent session %s failed", session.session_id)
+    finally:
+        # Cleanup: remover de sesiones activas
+        _active_sessions.pop(session.phone_number, None)
+        _active_tasks.pop(session.phone_number, None)
+```
+
+## Timeout de Sesión
+
+```python
+# app/config.py
+agent_session_timeout: int = 300  # 5 minutos
+
+# En run_agent_session
+try:
+    await asyncio.wait_for(
+        _run_agent_body(session, ...),
+        timeout=settings.agent_session_timeout,
+    )
+except asyncio.TimeoutError:
+    session.status = AgentStatus.FAILED
+    await wa_client.send_message(
+        session.phone_number,
+        "La sesión expiró después de 5 minutos. "
+        "Estos son los resultados parciales..."
+    )
+```
+
+## Resumen de Safety Nets
+
+| Protección | Umbral | Efecto |
+|-----------|--------|--------|
+| Max iterations | 15 rondas | Sesión termina con resultado parcial |
+| Loop warning | 3+ repeticiones | System message sugiriendo otro enfoque |
+| Circuit breaker | 5+ repeticiones | RuntimeError, sesión falla |
+| Ping-pong detection | A→B→A→B | System message de warning |
+| Session timeout | 300s (5 min) | asyncio.TimeoutError |
+| Tool cleanup | Cada N rondas | Reduce noise en contexto |
+| Goal scoring | Post-sesión | LLM-as-judge evalúa éxito |
+
+<Quiz
+  question="¿Cuál es la diferencia entre el loop warning (3+) y el circuit breaker (5+)?"
+  options={[
+    "No hay diferencia, ambos terminan la sesión",
+    "El warning inyecta un system message recuperable; el circuit breaker lanza RuntimeError y termina la sesión",
+    "El warning es más lento",
+    "El circuit breaker solo funciona con tools de lectura"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué mide el goal completion score?"
+  options={[
+    "Si el agente usó todas las herramientas",
+    "Si el agente completó todas las iteraciones",
+    "Si el resultado del agente realmente cumplió el objetivo original del usuario",
+    "Si el agente no excedió el timeout"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué el circuit breaker se activa a las 5 repeticiones y no a las 3?"
+  options={[
+    "Porque 5 es un número primo",
+    "Porque las primeras 3 repeticiones generan un warning, dando al LLM oportunidad de corregirse antes de forzar la terminación",
+    "Porque Ollama solo soporta 5 tool calls",
+    "Es arbitrario"
+  ]}
+  correct={1}
+/>
+
+En la última lección del módulo veremos el planner-orchestrator — el modo avanzado que estructura el trabajo en un plan formal.

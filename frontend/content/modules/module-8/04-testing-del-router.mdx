@@ -1,0 +1,128 @@
+---
+title: "Testing del Router"
+description: "Estrategias para testear clasificación, selección y edge cases"
+xpReward: 100
+---
+
+## Desafíos de Testear el Router
+
+El router depende de un LLM para classify_intent. Eso lo hace **no determinístico**. Para testing, necesitamos estrategias que aíslen cada componente.
+
+<Callout variant="info" title="3 niveles de testing">
+1. **Unit**: testear select_tools (determinístico) directamente. 2. **Integration**: mockear classify_intent, testear el flujo. 3. **Eval**: evaluar la calidad de clasificación con un dataset.
+</Callout>
+
+## Unit Test: select_tools
+
+```python
+def test_select_tools_basic():
+    tools = select_tools(["weather", "math"])
+    assert "get_weather" in tools
+    assert "calculate" in tools
+
+def test_select_tools_cap():
+    # Con muchas categorías, no supera max_tools
+    tools = select_tools(
+        ["weather", "notes", "projects", "search"],
+        max_tools=8,
+    )
+    assert len(tools) <= 8
+
+def test_select_tools_unknown_category():
+    tools = select_tools(["nonexistent"])
+    assert tools == []  # Categoría desconocida → sin tools
+```
+
+## Integration Test: _bypass_router()
+
+```python
+from unittest.mock import patch, AsyncMock
+
+def _bypass_router(categories=None, tools=None):
+    """Parchea classify y select para tests controlados."""
+    patches = []
+    if categories is not None:
+        patches.append(patch(
+            "app.skills.router.classify_intent",
+            new_callable=AsyncMock,
+            return_value=categories,
+        ))
+    if tools is not None:
+        patches.append(patch(
+            "app.skills.router.select_tools",
+            return_value=tools,
+        ))
+    return patches
+
+# Uso
+async def test_none_skips_tools(mock_ollama):
+    with _bypass_router(categories=["none"]):
+        mock_ollama.chat.return_value = ChatResponse(content="Hola!")
+        result = await process_message(message)
+        assert "Hola" in result
+        # Verificar que NO se llamó chat_with_tools
+        mock_ollama.chat_with_tools.assert_not_called()
+```
+
+## Edge Cases Críticos
+
+| Caso | Input | Comportamiento esperado |
+|------|-------|------------------------|
+| Categoría vacía | `[]` | Usar DEFAULT_CATEGORIES |
+| JSON inválido | `"weather"` (no array) | Fallback a defaults |
+| Todas unknown | `["foo", "bar"]` | Sin tools, plain chat |
+| Categoría "none" | `["none"]` | Skip tool loop |
+| Mixed | `["none", "weather"]` | Ignorar "none", usar "weather" |
+
+```python
+async def test_invalid_classification_uses_defaults(mock_ollama):
+    mock_ollama.chat.return_value = ChatResponse(
+        content="this is not valid json"
+    )
+    categories = await classify_intent(messages)
+    assert categories == DEFAULT_CATEGORIES
+```
+
+## Eval: Medir Calidad de Clasificación
+
+```python
+# scripts/run_eval.py --mode classify
+CLASSIFY_DATASET = [
+    ("¿Qué hora es?", ["time"]),
+    ("Calculá 15% de 200", ["math"]),
+    ("Hola", ["none"]),
+    ("Guardá una nota sobre Python", ["notes"]),
+]
+
+def eval_classify(dataset):
+    correct = 0
+    for message, expected in dataset:
+        result = await classify_intent([{"role": "user", "content": message}])
+        if set(result) == set(expected):
+            correct += 1
+    return correct / len(dataset)
+```
+
+<Quiz
+  question="¿Qué hace _bypass_router() en los tests?"
+  options={[
+    "Desactiva el routing completamente",
+    "Parchea classify_intent y select_tools con valores controlados",
+    "Conecta directamente al LLM",
+    "Usa un router alternativo"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando classify_intent retorna JSON inválido?"
+  options={[
+    "La app crashea",
+    "Se usa DEFAULT_CATEGORIES como fallback",
+    "Se reintenta 3 veces",
+    "Se envía un error al usuario"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Intent Classification & Smart Routing. Ahora entendés el pipeline completo de routing de herramientas.

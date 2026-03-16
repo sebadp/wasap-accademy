@@ -1,0 +1,205 @@
+---
+title: "Audio: faster-whisper"
+description: "Transcripción de audio local con faster-whisper, CTranslate2 y async patterns"
+xpReward: 50
+---
+
+## El Problema: Mensajes de Voz
+
+En WhatsApp y Telegram, muchos usuarios prefieren enviar audios antes que escribir. Para que el bot los entienda, necesitamos transcribir el audio a texto — y hacerlo **localmente**, sin enviar datos a APIs externas.
+
+<Callout variant="info" title="Sin APIs externas, sin costos">
+LocalForge transcribe todo localmente con faster-whisper. Sin enviar audio a OpenAI, Google, ni ningún servidor. Sin costos por minuto, sin límites de uso, y con total privacidad.
+</Callout>
+
+## ¿Qué es faster-whisper?
+
+**faster-whisper** es una reimplementación de OpenAI Whisper usando CTranslate2 (un runtime optimizado para modelos Transformer). Es 3-4x más rápido que la implementación original, con menor uso de memoria.
+
+| Aspecto | OpenAI Whisper | faster-whisper |
+|---------|---------------|----------------|
+| Runtime | PyTorch | CTranslate2 |
+| Velocidad | 1x | 3-4x |
+| Memoria | Alta | ~50% menos |
+| Quantización | No nativa | `int8` nativa |
+| API | Compatible | Compatible |
+
+## La Clase Transcriber
+
+```python
+# app/audio/transcriber.py
+import asyncio
+import os
+import tempfile
+
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+from faster_whisper import WhisperModel
+
+class Transcriber:
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "cpu",
+        compute_type: str = "int8",
+    ):
+        logger.info(
+            "Loading Whisper model: %s (device=%s, compute=%s)",
+            model_size, device, compute_type,
+        )
+        self._model = WhisperModel(
+            model_size, device=device, compute_type=compute_type
+        )
+
+    def transcribe(self, audio_bytes: bytes) -> str:
+        """Transcribe audio bytes to text (synchronous)."""
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
+            f.write(audio_bytes)
+            f.flush()
+            segments, _info = self._model.transcribe(f.name)
+            result = " ".join(seg.text.strip() for seg in segments)
+            return result
+
+    async def transcribe_async(self, audio_bytes: bytes) -> str:
+        """Transcribe audio bytes without blocking the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self.transcribe, audio_bytes
+        )
+```
+
+<Concept title="asyncio.run_in_executor">
+faster-whisper es código C/C++ que bloquea el thread mientras procesa el audio. Si lo llamaras directamente con `await`, bloquearía el event loop y el bot no podría procesar otros mensajes. `run_in_executor(None, ...)` lo ejecuta en el thread pool por defecto, liberando el event loop.
+</Concept>
+
+## Detalles del Diseño
+
+### 1. Temp file con `NamedTemporaryFile`
+
+faster-whisper necesita un **path** al archivo, no bytes crudos. El patrón:
+1. Crear archivo temporal con sufijo `.ogg`
+2. Escribir los bytes del audio
+3. Flush para asegurar que los datos están en disco
+4. Transcribir desde el path
+5. El `with` block auto-elimina el archivo al salir
+
+```python
+with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
+    f.write(audio_bytes)
+    f.flush()  # Forzar write a disco
+    segments, _info = self._model.transcribe(f.name)
+```
+
+### 2. Quantización `int8`
+
+El parámetro `compute_type="int8"` reduce los pesos del modelo de float32 a int8, usando 4x menos memoria con mínima pérdida de calidad. Ideal para correr en CPU sin GPU.
+
+### 3. Telemetría deshabilitada
+
+```python
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+```
+Se ejecuta **antes** de importar `faster_whisper` para evitar que HuggingFace Hub reporte telemetría al descargar el modelo.
+
+## Configuración
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    whisper_model: str = "base"         # tiny, base, small, medium, large
+    whisper_device: str = "cpu"         # cpu o cuda
+    whisper_compute_type: str = "int8"  # float32, float16, int8
+```
+
+| Modelo | Parámetros | VRAM | Velocidad relativa |
+|--------|-----------|------|-------------------|
+| tiny | 39M | ~1 GB | Muy rápido |
+| base | 74M | ~1 GB | Rápido |
+| small | 244M | ~2 GB | Medio |
+| medium | 769M | ~5 GB | Lento |
+| large | 1550M | ~10 GB | Muy lento |
+
+<Callout variant="tip" title="El modelo 'base' es el sweet spot">
+Para un chatbot, `base` ofrece buena calidad de transcripción con baja latencia (~2-5 segundos para un audio de 30s en CPU). `tiny` es más rápido pero pierde calidad. `small` es mejor pero puede ser lento sin GPU.
+</Callout>
+
+## Flujo Completo: Audio → Texto → LLM
+
+```
+┌──────────────┐    ┌──────────────┐    ┌───────────┐    ┌─────────┐
+│  WhatsApp    │───▶│  download_   │───▶│  Whisper   │───▶│  LLM    │
+│  voice msg   │    │  media()     │    │  transcribe│    │  (qwen) │
+│  (OGG/Opus)  │    │  → bytes     │    │  → text    │    │  → reply│
+└──────────────┘    └──────────────┘    └───────────┘    └─────────┘
+```
+
+En `_handle_message` (router.py):
+
+```python
+# Handle audio: transcribe to text
+if msg.type == "audio" and msg.media_id:
+    try:
+        audio_bytes = await platform_client.download_media(msg.media_id)
+        transcription = await transcriber.transcribe_async(audio_bytes)
+        logger.info("Transcribed audio [%s]: %s", msg.user_id, transcription[:80])
+        msg = msg.model_copy(update={"text": transcription})
+    except Exception:
+        logger.exception("Audio transcription failed")
+        await platform_client.send_message(
+            msg.user_id,
+            "Sorry, I couldn't process that audio. Please try again.",
+        )
+        return
+```
+
+<Concept title="model_copy(update=...)">
+Pydantic v2 permite crear una copia del modelo con campos actualizados. En vez de mutar `msg.text` directamente (que violaría la inmutabilidad), se crea un nuevo `IncomingMessage` con el texto transcrito. El resto del pipeline no sabe que vino de audio.
+</Concept>
+
+## Después de la Transcripción
+
+El audio transcrito se marca con `[Audio]` en el historial:
+
+```python
+# Normal message flow (text or transcribed audio)
+user_text = msg.text
+if msg.type == "audio":
+    user_text = f"[Audio] {msg.text}"
+```
+
+Esto permite al LLM saber que el texto vino de un audio (puede haber errores de transcripción) y ajustar su respuesta.
+
+<Quiz
+  question="¿Por qué se usa run_in_executor para la transcripción de audio?"
+  options={[
+    "Para paralelizar múltiples transcripciones simultáneas",
+    "Porque faster-whisper es código bloqueante (C/C++) que detendría el event loop si se llama directamente",
+    "Para comprimir el audio antes de transcribir",
+    "Para enviar el audio a un servidor remoto"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué hace tempfile.NamedTemporaryFile en el flujo de transcripción?"
+  options={[
+    "Comprime el audio",
+    "Crea un archivo temporal con los bytes del audio porque faster-whisper necesita un file path, no bytes en memoria",
+    "Encripta el audio",
+    "Convierte el formato de OGG a WAV"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué significa compute_type='int8' en faster-whisper?"
+  options={[
+    "Usa 8 threads de CPU",
+    "Procesa audio de 8 bits",
+    "Quantiza los pesos del modelo de float32 a int8, usando 4x menos memoria con mínima pérdida de calidad",
+    "Limita el output a 8 tokens"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo LocalForge maneja imágenes con vision models.

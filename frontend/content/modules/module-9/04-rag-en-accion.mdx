@@ -1,0 +1,131 @@
+---
+title: "RAG en Acción"
+description: "El pipeline completo: query → embed → search → inject → generate"
+xpReward: 125
+---
+
+## RAG: Retrieval-Augmented Generation
+
+RAG es el patrón de **buscar información relevante** antes de que el LLM genere una respuesta. En vez de depender solo de lo que el modelo sabe, le inyectamos contexto real.
+
+<Concept title="RAG">
+**R**etrieval (buscar) **A**ugmented (enriquecido) **G**eneration (generación). El LLM genera mejores respuestas porque tiene información relevante en el contexto.
+</Concept>
+
+## El Pipeline Completo
+
+<Step number={1} title="Phase A: Embed el query">
+El mensaje del usuario se convierte en un vector de 768 dimensiones.
+</Step>
+
+<Step number={2} title="Phase B: Buscar (en paralelo)">
+Con ese vector se buscan memorias similares, notas similares, y proyectos relevantes simultáneamente.
+</Step>
+
+<Step number={3} title="Inject: ContextBuilder">
+Los resultados se inyectan en el system prompt dentro de tags XML.
+</Step>
+
+<Step number={4} title="Generate: LLM">
+El LLM genera la respuesta usando el contexto inyectado.
+</Step>
+
+## Code: Las 4 Fases en router.py
+
+```python
+async def _handle_message(phone, text, ...):
+    # Phase A: embed + save (paralelo)
+    query_embedding, _ = await asyncio.gather(
+        ollama_client.embed(text),           # Embed query
+        repository.save_message(conv_id, "user", text),
+    )
+
+    # Phase B: search (paralelo)
+    memories, notes, summary, history = await asyncio.gather(
+        repository.search_similar_memories_with_distance(
+            phone, query_embedding, top_k=10, threshold=1.0
+        ),
+        repository.search_similar_notes(phone, query_embedding, top_k=5),
+        repository.get_latest_summary(conv_id),
+        repository.get_recent_messages(conv_id, limit=8),
+    )
+
+    # Inject: construir contexto
+    context = _build_context(
+        memories=memories,
+        notes=notes,
+        summary=summary,
+        history=history,
+    )
+
+    # Generate: LLM con contexto
+    response = await execute_tool_loop(
+        messages=[{"role": "system", "content": context}] + history,
+    )
+```
+
+## El System Prompt con RAG
+
+```xml
+<system_prompt>Sos un asistente personal...</system_prompt>
+
+<user_memories>
+- Es desarrollador Python senior
+- Trabaja en fintech, Buenos Aires
+- Prefiere respuestas técnicas
+</user_memories>
+
+<relevant_notes>
+- [Nota: API v2] Endpoints: /users, /payments, /auth
+- [Nota: Deploy] Usar Docker Compose en producción
+</relevant_notes>
+
+<conversation_summary>
+El usuario estuvo trabajando en la API v2, definiendo endpoints
+y discutiendo estrategias de autenticación...
+</conversation_summary>
+```
+
+## Sin RAG vs Con RAG
+
+```
+Pregunta: "¿Cómo iba lo del deploy?"
+
+Sin RAG:
+LLM → "No tengo información sobre un deploy. ¿Podés darme más contexto?"
+
+Con RAG:
+memories → "Trabaja en fintech"
+notes → "[Deploy] Usar Docker Compose"
+summary → "Discutimos autenticación para la API"
+LLM → "Tu nota sobre deploy dice usar Docker Compose. Para la API v2
+        que venimos armando, recomendaría..."
+```
+
+<Callout variant="tip" title="Personalización automática">
+Con RAG, el asistente sabe quién sos, en qué trabajás, y qué discutiste antes. Sin que lo repitas cada vez.
+</Callout>
+
+<Quiz
+  question="¿Qué significa RAG?"
+  options={[
+    "Rapid AI Generation",
+    "Retrieval-Augmented Generation",
+    "Real-time Agent Gateway",
+    "Response and Grounding"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿En qué fase del pipeline se buscan memorias y notas?"
+  options={[
+    "Phase A (embed)",
+    "Phase B (search, en paralelo)",
+    "Phase C (classify)",
+    "Phase D (generate)"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Semantic Search & RAG. Ahora entendés el pipeline completo de recuperación y generación aumentada.

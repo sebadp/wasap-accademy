@@ -1,0 +1,110 @@
+---
+title: "Vector Search"
+description: "Búsqueda por similitud semántica en sqlite-vec"
+xpReward: 100
+---
+
+## Búsqueda Semántica
+
+En vez de buscar por palabras clave (LIKE '%python%'), buscamos por **significado**. "Lenguaje de programación" encontraría memorias sobre "Python developer" aunque no compartan palabras.
+
+```python
+async def search_similar_memories_with_distance(
+    self,
+    phone_number: str,
+    query_vector: list[float],
+    top_k: int = 10,
+    threshold: float = 1.0,
+) -> list[tuple[str, float]]:
+    blob = struct.pack(f"{len(query_vector)}f", *query_vector)
+
+    cursor = await self.conn.execute("""
+        SELECT m.content, v.distance
+        FROM vec_memories v
+        JOIN memories m ON m.id = v.memory_id
+        WHERE v.embedding MATCH ?
+          AND m.phone_number = ?
+          AND m.active = 1
+          AND v.distance < ?
+        ORDER BY v.distance
+        LIMIT ?
+    """, (blob, phone_number, threshold, top_k))
+
+    return [(row[0], row[1]) for row in await cursor.fetchall()]
+```
+
+<Concept title="embedding MATCH ?">
+Esta es la sintaxis especial de sqlite-vec. `MATCH` busca los vectores más cercanos al query vector usando distancia L2. El resultado incluye una columna `distance`.
+</Concept>
+
+## Parámetros Clave
+
+| Parámetro | Default | Significado |
+|-----------|---------|-------------|
+| `top_k` | 10 | Máximo de resultados |
+| `threshold` | 1.0 | Distancia L2 máxima |
+| `query_vector` | 768 floats | El embedding de la pregunta del usuario |
+
+```python
+# Threshold 1.0 es un buen balance:
+# < 0.5: solo matches muy cercanos (puede perder resultados relevantes)
+# 1.0: balance entre precisión y recall
+# > 1.5: incluye matches débiles (puede traer ruido)
+```
+
+## Query Embedding: Calcular Una Vez, Usar Varias
+
+```python
+# En Phase A del critical path
+query_embedding = await ollama_client.embed(user_message)
+
+# En Phase B: reusar el mismo embedding
+memories = await repository.search_similar_memories_with_distance(
+    phone, query_embedding, top_k=10
+)
+notes = await repository.search_similar_notes(
+    phone, query_embedding, top_k=5
+)
+```
+
+<Callout variant="tip" title="Calcular una vez">
+El embedding del mensaje del usuario se calcula en Phase A y se reutiliza en Phase B para buscar memorias Y notas. Una sola llamada a Ollama, dos búsquedas.
+</Callout>
+
+## Fallback sin sqlite-vec
+
+```python
+if vec_available:
+    memories = await repository.search_similar_memories_with_distance(
+        phone, embedding, top_k=settings.semantic_search_top_k
+    )
+else:
+    # Fallback: todas las memorias activas, limitadas
+    memories = await repository.get_active_memories(
+        phone, limit=settings.semantic_search_top_k
+    )
+```
+
+<Quiz
+  question="¿Qué significa un threshold de 1.0 en búsqueda vectorial?"
+  options={[
+    "Solo retorna resultados exactos",
+    "Solo retorna memorias con distancia L2 menor a 1.0 (similares)",
+    "Retorna todos los resultados",
+    "Busca en 100% de la base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántas veces se calcula el embedding del mensaje del usuario?"
+  options={[
+    "Una vez por cada búsqueda",
+    "Una sola vez en Phase A, reutilizado en Phase B para memorias y notas",
+    "Dos veces: una para memorias, otra para notas",
+    "No se calcula, se usa el texto directo"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos el patrón best-effort y backfill.

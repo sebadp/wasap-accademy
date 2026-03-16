@@ -1,0 +1,208 @@
+---
+title: "Tipos de Acciones"
+description: "notify_user, notify_admin, run_task y log: las acciones que ejecuta el rule engine"
+xpReward: 100
+---
+
+## Qué Puede Hacer una Regla
+
+Cuando una condición se cumple, el engine ejecuta una acción. Hay cuatro tipos:
+
+```
+Condición TRUE
+    │
+    ├── notify_user ──► Mensaje al usuario via WhatsApp/Telegram
+    ├── notify_admin ──► Mensaje al admin (phone de config)
+    ├── run_task ──► Ejecutar tarea de mantenimiento
+    └── log ──► Solo registrar en logs (silencioso)
+```
+
+## 1. notify_user: Alertar al Usuario
+
+Envía un mensaje al usuario a través del PlatformClient activo:
+
+```python
+# app/automation/actions.py
+
+async def _action_notify_user(config: dict, **clients) -> None:
+    """
+    config = {
+        "phone": "5491112345678",  # o "tg_123456" para Telegram
+        "message": "Tu proyecto '{project}' lleva 7 días sin actividad."
+    }
+    """
+    phone = config["phone"]
+    message = config["message"]
+
+    # Seleccionar client según prefijo
+    if phone.startswith("tg_"):
+        client = clients.get("telegram")
+    else:
+        client = clients.get("whatsapp")
+
+    if client:
+        await client.send_message(phone, message)
+        logger.info("Automation notification sent to %s", phone)
+```
+
+<Callout variant="info" title="Multi-platform">
+La acción `notify_user` usa el mismo patrón multi-plataforma de LocalForge: detecta si el destinatario es Telegram (`tg_` prefix) o WhatsApp, y usa el client correspondiente.
+</Callout>
+
+## 2. notify_admin: Alertar al Administrador
+
+Similar a `notify_user`, pero el destinatario es el admin configurado en settings:
+
+```python
+async def _action_notify_admin(config: dict, **clients) -> None:
+    """
+    config = {
+        "message": "Guardrail pass rate cayó a {value}%"
+    }
+    """
+    from app.config import get_settings
+    settings = get_settings()
+
+    admin_phone = settings.admin_phone
+    if not admin_phone:
+        logger.warning("notify_admin: no admin_phone configured")
+        return
+
+    message = f"[AUTOMATION ALERT] {config['message']}"
+
+    if admin_phone.startswith("tg_"):
+        client = clients.get("telegram")
+    else:
+        client = clients.get("whatsapp")
+
+    if client:
+        await client.send_message(admin_phone, message)
+```
+
+<Callout variant="warning" title="Configurar admin_phone">
+Si `admin_phone` no está configurado en `.env`, las notificaciones de admin se pierden silenciosamente (solo un warning en logs). Siempre configurar este valor en producción.
+</Callout>
+
+## 3. run_task: Ejecutar Tareas de Mantenimiento
+
+Ejecuta tareas predefinidas del sistema:
+
+```python
+TASK_REGISTRY = {
+    "backfill_embeddings": _task_backfill_embeddings,
+    "consolidate_memories": _task_consolidate_memories,
+    "vacuum_db": _task_vacuum_db,
+}
+
+async def _action_run_task(config: dict, **clients) -> None:
+    """
+    config = {
+        "task": "backfill_embeddings"
+    }
+    """
+    task_name = config["task"]
+    task_fn = TASK_REGISTRY.get(task_name)
+
+    if not task_fn:
+        logger.warning("Unknown automation task: %s", task_name)
+        return
+
+    try:
+        await task_fn(**clients)
+        logger.info("Automation task completed: %s", task_name)
+    except Exception as e:
+        logger.error("Automation task failed: %s - %s", task_name, e)
+
+
+async def _task_backfill_embeddings(**clients) -> None:
+    """Re-indexar memorias sin embedding."""
+    repository = clients["repository"]
+    ollama = clients["ollama_client"]
+    await backfill_embeddings(repository, ollama)
+
+async def _task_consolidate_memories(**clients) -> None:
+    """Correr el consolidador de memorias."""
+    repository = clients["repository"]
+    ollama = clients["ollama_client"]
+    await consolidate_memories(repository, ollama)
+
+async def _task_vacuum_db(**clients) -> None:
+    """VACUUM la base de datos para recuperar espacio."""
+    repository = clients["repository"]
+    await repository.vacuum()
+```
+
+<Concept title="Task registry">
+Las tareas están en un diccionario `TASK_REGISTRY` para evitar ejecución arbitraria de código. Solo las tareas pre-registradas pueden ejecutarse via automatización. Es el mismo principio que el `SELECT-only` de las queries.
+</Concept>
+
+## 4. log: Registro Silencioso
+
+La acción más simple: solo registra en logs, sin efecto externo:
+
+```python
+def _action_log(config: dict) -> None:
+    """
+    config = {
+        "level": "warning",
+        "message": "DB size exceeded 500MB: {value}MB"
+    }
+    """
+    level = config.get("level", "info")
+    message = config.get("message", "Automation rule triggered")
+
+    log_fn = getattr(logger, level, logger.info)
+    log_fn("AUTOMATION: %s", message)
+```
+
+<Callout variant="tip" title="¿Para qué una acción que no hace nada?">
+`log` es útil para monitoreo pasivo: querés saber cuándo una condición se cumple sin tomar acción automática. Los logs se pueden agregar en dashboards (Langfuse, ELK) para detectar tendencias.
+</Callout>
+
+## Cooldown: Previniendo Spam
+
+Cada regla tiene un `cooldown_minutes` que previene ejecución repetida:
+
+```python
+from datetime import datetime, timedelta
+
+def _cooldown_expired(rule: AutomationRule) -> bool:
+    """Verificar si pasó suficiente tiempo desde la última ejecución."""
+    if not rule.last_triggered_at:
+        return True  # Nunca se ejecutó
+
+    last = datetime.fromisoformat(rule.last_triggered_at)
+    cooldown = timedelta(minutes=rule.cooldown_minutes)
+    return datetime.utcnow() > last + cooldown
+```
+
+| Acción | Cooldown típico | Razón |
+|--------|----------------|-------|
+| notify_user | 24h | No molestar al usuario |
+| notify_admin | 4h | Admin necesita enterarse rápido |
+| run_task | 6-24h | Las tareas son pesadas |
+| log | 1h | Los logs son baratos |
+
+<Quiz
+  question="¿Qué pasa si la acción notify_admin se dispara pero admin_phone no está configurado?"
+  options={[
+    "La app crashea",
+    "Se envía al primer usuario registrado",
+    "Se loguea un warning y la notificación se pierde silenciosamente",
+    "Se reintenta cada minuto"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué run_task usa un TASK_REGISTRY en vez de ejecutar código arbitrario?"
+  options={[
+    "Por performance",
+    "Para evitar ejecución de código no autorizado; solo tareas pre-registradas pueden correr",
+    "Porque Python no permite ejecutar funciones por nombre",
+    "Para poder hacer rollback de las tareas"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos las 5 reglas built-in que LocalForge incluye de fábrica.

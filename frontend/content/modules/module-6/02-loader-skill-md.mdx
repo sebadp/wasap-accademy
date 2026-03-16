@@ -1,0 +1,137 @@
+---
+title: "Loader de SKILL.md"
+description: "Parsear frontmatter con regex para cargar definiciones de skills"
+xpReward: 75
+---
+
+## El Parser de SKILL.md
+
+WasAP parsea los archivos SKILL.md usando **regex** en vez de una librería YAML como PyYAML. ¿Por qué? Simplicidad y cero dependencias.
+
+<Callout variant="tip" title="Trade-off consciente">
+PyYAML agrega una dependencia, puede tener vulnerabilidades (YAML bombs), y es overkill para parsear frontmatter simple. Regex es más rápido, sin deps, y suficiente para el formato que necesitamos.
+</Callout>
+
+## El Formato Frontmatter
+
+```markdown
+---
+name: datetime
+description: Herramientas de fecha y hora
+version: 1.0.0
+tools:
+  - name: get_current_datetime
+    description: Obtiene la fecha y hora actual
+    parameters: {}
+  - name: convert_timezone
+    description: Convierte hora entre zonas horarias
+    parameters:
+      time:
+        type: string
+        required: true
+      from_tz:
+        type: string
+        required: true
+      to_tz:
+        type: string
+        required: true
+---
+```
+
+## El Loader
+
+```python
+# app/skills/loader.py
+import re
+
+def parse_skill_md(content: str) -> SkillMetadata | None:
+    # Extraer frontmatter entre ---
+    match = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
+    if not match:
+        return None
+
+    frontmatter = match.group(1)
+
+    # Parsear campos simples
+    name = _extract_field(frontmatter, "name")
+    description = _extract_field(frontmatter, "description")
+    version = _extract_field(frontmatter, "version")
+
+    # Parsear lista de tools
+    tools = _extract_tools(frontmatter)
+
+    if not name or not tools:
+        return None
+
+    return SkillMetadata(
+        name=name,
+        description=description,
+        version=version,
+        tools=tools,
+    )
+
+def _extract_field(text: str, field: str) -> str | None:
+    match = re.search(rf'^{field}:\s*(.+)$', text, re.MULTILINE)
+    return match.group(1).strip() if match else None
+```
+
+## Flujo de Carga
+
+<Step number={1} title="Buscar SKILL.md files">
+Escanear el directorio `skills/` recursivamente buscando archivos `SKILL.md`.
+</Step>
+
+<Step number={2} title="Parsear frontmatter">
+Extraer metadata con regex: nombre, descripción, versión, tools.
+</Step>
+
+<Step number={3} title="Validar">
+Verificar que tiene nombre y al menos un tool definido.
+</Step>
+
+<Step number={4} title="Registrar">
+Llamar a `register()` del handler correspondiente en `app/skills/tools/`.
+</Step>
+
+## Error Handling: Graceful Degradation
+
+```python
+def load_all_skills(skills_dir: str, registry: SkillRegistry):
+    for skill_path in Path(skills_dir).rglob("SKILL.md"):
+        try:
+            content = skill_path.read_text()
+            metadata = parse_skill_md(content)
+            if metadata:
+                _register_skill(metadata, registry)
+        except Exception as e:
+            logger.warning("Failed to load skill %s: %s", skill_path, e)
+            # Continuar con los demás skills
+```
+
+<Callout variant="warning" title="Nunca fallar por un skill roto">
+Si un SKILL.md tiene formato inválido, se loguea un warning y se continúa. Los otros skills se cargan normalmente. Esto sigue el patrón best-effort de WasAP.
+</Callout>
+
+<Quiz
+  question="¿Por qué WasAP usa regex en vez de PyYAML para parsear SKILL.md?"
+  options={[
+    "Porque regex es más rápido",
+    "Simplicidad, cero dependencias extra, y suficiente para frontmatter simple",
+    "Porque PyYAML no soporta el formato",
+    "Por seguridad (evitar YAML bombs)"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si un SKILL.md tiene formato inválido?"
+  options={[
+    "La app no inicia",
+    "Se lanza una excepción y se detiene la carga",
+    "Se loguea un warning y se continúa con los demás skills",
+    "Se borra el archivo automáticamente"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección vamos a implementar un skill completo desde cero.

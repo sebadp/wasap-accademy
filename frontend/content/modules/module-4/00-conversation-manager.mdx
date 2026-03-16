@@ -1,0 +1,96 @@
+---
+title: "ConversationManager"
+description: "Wrapper async sobre Repository para el lifecycle de conversaciones"
+xpReward: 50
+---
+
+## Qué es ConversationManager
+
+El `ConversationManager` es la capa que orquesta el **ciclo de vida** de una conversación: crear, agregar mensajes, obtener historial, resumir, y limpiar. Es un wrapper async sobre el Repository.
+
+<Callout variant="info" title="Separación de responsabilidades">
+Repository sabe **cómo** hablar con SQLite. ConversationManager sabe **cuándo** y **en qué orden** hacerlo.
+</Callout>
+
+## El Lifecycle de una Conversación
+
+<Step number={1} title="get_or_create_conversation()">
+Cuando llega un mensaje, se obtiene o crea la conversación para ese phone_number.
+</Step>
+
+<Step number={2} title="add_message()">
+Se guarda el mensaje del usuario en la tabla `messages`.
+</Step>
+
+<Step number={3} title="get_context()">
+Se obtiene historial + memorias + resumen para construir el prompt del LLM.
+</Step>
+
+<Step number={4} title="add_message() (respuesta)">
+Se guarda la respuesta del asistente.
+</Step>
+
+<Step number={5} title="maybe_summarize() (background)">
+Si hay muchos mensajes, se genera un resumen y se limpian los viejos.
+</Step>
+
+## Cache de Conversation IDs
+
+Cada mensaje necesita el `conversation_id`. Sin cache, haríamos una query por cada mensaje:
+
+```python
+class ConversationManager:
+    def __init__(self, repository: Repository):
+        self.repository = repository
+        self._conv_id_cache: dict[str, int] = {}
+
+    async def _get_conv_id(self, phone_number: str) -> int:
+        if phone_number not in self._conv_id_cache:
+            conv_id = await self.repository.get_or_create_conversation(
+                phone_number
+            )
+            self._conv_id_cache[phone_number] = conv_id
+        return self._conv_id_cache[phone_number]
+```
+
+<Concept title="Cache en memoria">
+`_conv_id_cache` es un dict simple. Como cada phone_number siempre mapea al mismo conversation_id, nunca se invalida. Es el cache más simple y efectivo posible.
+</Concept>
+
+## Flujo Principal en el Webhook
+
+En el critical path de `_handle_message`, WasAP **bypasea** ConversationManager para llamar al Repository directamente:
+
+```python
+# En router.py — flujo optimizado
+conv_id = await conversation._get_conv_id(phone_number)
+await repository.save_message(conv_id, "user", user_text)  # Directo, sin wrapper
+```
+
+<Callout variant="warning" title="Optimización de producción">
+En el hot path, WasAP llama al Repository directamente para ahorrar overhead. ConversationManager se usa en flujos menos críticos como `/clear` y el summarizer.
+</Callout>
+
+<Quiz
+  question="¿Cuál es la responsabilidad principal de ConversationManager?"
+  options={[
+    "Ejecutar queries SQL",
+    "Orquestar el ciclo de vida de una conversación",
+    "Formatear mensajes para WhatsApp",
+    "Conectarse a la base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se cachea el conversation_id en memoria?"
+  options={[
+    "Para soportar múltiples bases de datos",
+    "Porque el mapeo phone_number → conv_id nunca cambia, evitando una query por mensaje",
+    "Para permitir conversaciones offline",
+    "Porque SQLite no soporta UNIQUE constraints"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo el historial con ventana evita saturar el contexto del LLM.

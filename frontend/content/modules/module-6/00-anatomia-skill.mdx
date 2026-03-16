@@ -1,0 +1,119 @@
+---
+title: "Anatomía de un Skill"
+description: "SKILL.md, ToolDefinition, y la estructura de una herramienta en WasAP"
+xpReward: 50
+---
+
+## Qué es un Skill
+
+Un **skill** en WasAP es un paquete que le da al LLM la capacidad de **hacer cosas** en el mundo real: consultar el clima, hacer cálculos, buscar en la web, guardar notas. Sin skills, el LLM solo puede generar texto.
+
+<Callout variant="info" title="Tool calling">
+Los skills implementan el patrón de **tool calling**: el LLM decide qué herramienta usar, con qué argumentos, y WasAP la ejecuta y le devuelve el resultado.
+</Callout>
+
+## Estructura de un Skill
+
+Cada skill tiene dos partes: una **definición** (SKILL.md) y un **handler** (Python):
+
+<FileTree>
+  skills/
+  ├── calculator/
+  │   └── SKILL.md          # Definición: nombre, tools, schemas
+  ├── datetime/
+  │   └── SKILL.md
+  ├── weather/
+  │   └── SKILL.md
+  └── notes/
+      └── SKILL.md
+  app/skills/tools/
+  ├── calculator_tools.py   # Handler: lógica Python
+  ├── datetime_tools.py
+  ├── weather_tools.py
+  └── notes_tools.py
+</FileTree>
+
+## SKILL.md: La Definición
+
+```markdown
+---
+name: calculator
+description: Herramientas matemáticas y de cálculo
+version: 1.0.0
+tools:
+  - name: calculate
+    description: Evalúa una expresión matemática de forma segura
+    parameters:
+      expression:
+        type: string
+        description: La expresión a evaluar (ej: "sqrt(144) + 2**3")
+        required: true
+---
+
+## Calculator Skill
+
+Evaluación segura de expresiones matemáticas usando AST.
+Soporta: +, -, *, /, **, sqrt, sin, cos, log, abs, round, min, max.
+```
+
+## Modelos de Datos
+
+```python
+# app/skills/models.py
+class ToolDefinition(BaseModel):
+    name: str
+    description: str
+    parameters: dict  # JSON Schema
+
+class ToolCall(BaseModel):
+    name: str
+    arguments: dict
+
+class ToolResult(BaseModel):
+    tool_name: str
+    content: str
+    success: bool = True
+```
+
+<Concept title="JSON Schema para parámetros">
+Los parámetros se definen con JSON Schema. Esto permite al LLM generar los argumentos correctos automáticamente. Ollama convierte estos schemas al formato que el modelo entiende.
+</Concept>
+
+## 15+ Skills Activos
+
+| Skill | Tools | Uso |
+|-------|-------|-----|
+| **calculator** | `calculate` | Matemáticas seguras (AST) |
+| **datetime** | `get_current_datetime`, `convert_timezone` | Hora y zonas horarias |
+| **weather** | `get_weather` | Clima via wttr.in |
+| **notes** | `save_note`, `list_notes`, `search_notes`, `delete_note` | Notas personales |
+| **projects** | 10 tools | Gestión de proyectos y tareas |
+| **search** | `web_search` | DuckDuckGo |
+| **news** | `search_news` | Noticias |
+| **scheduler** | `schedule_task`, `create_cron` | Recordatorios |
+| **shell** | `run_command` | Ejecución de comandos |
+| **eval** | 7 tools | Evaluación y datasets |
+
+<Quiz
+  question="¿Cuáles son las dos partes de un skill?"
+  options={[
+    "Frontend y backend",
+    "SKILL.md (definición) y handler Python (lógica)",
+    "API y database",
+    "Tests y documentación"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Para qué sirve el JSON Schema en los parámetros de un tool?"
+  options={[
+    "Para validar la respuesta del LLM",
+    "Para que el LLM sepa qué argumentos generar automáticamente",
+    "Para documentar el código",
+    "Para tests automatizados"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo el Registry Pattern organiza todos estos skills.

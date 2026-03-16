@@ -1,0 +1,77 @@
+---
+title: "Embeddings 101"
+description: "Qué son los embeddings, cómo se generan, y para qué sirven"
+xpReward: 50
+---
+
+## Qué es un Embedding
+
+Un **embedding** es una representación numérica del significado de un texto. Convierte palabras y frases en vectores (listas de números) donde textos similares están **cerca** en el espacio vectorial.
+
+<Concept title="Vector = Lista de números">
+"Python es un lenguaje de programación" → `[0.12, -0.45, 0.78, ..., 0.33]` (768 números). Textos sobre programación tendrán vectores parecidos. Textos sobre cocina tendrán vectores lejanos.
+</Concept>
+
+## nomic-embed-text via Ollama
+
+WasAP usa `nomic-embed-text` — un modelo de embeddings que corre **localmente** via Ollama:
+
+```python
+class OllamaClient:
+    async def embed(self, text: str) -> list[float]:
+        response = await self._post("/api/embed", {
+            "model": "nomic-embed-text",
+            "input": text,
+        })
+        return response["embeddings"][0]  # 768 floats
+```
+
+<Callout variant="tip" title="768 dimensiones">
+Cada embedding tiene exactamente 768 números. Cada número captura un aspecto del significado. Más dimensiones = más matices, pero más memoria y cómputo.
+</Callout>
+
+## Distancia L2 (Euclidiana)
+
+Para medir qué tan similares son dos textos, se calcula la distancia entre sus vectores:
+
+```python
+import math
+
+def l2_distance(a: list[float], b: list[float]) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+# Textos similares → distancia pequeña
+d1 = l2_distance(embed("Python dev"), embed("programador Python"))  # ~0.5
+# Textos diferentes → distancia grande
+d2 = l2_distance(embed("Python dev"), embed("receta de torta"))    # ~1.8
+```
+
+`memory_similarity_threshold = 1.0` — si la distancia L2 es mayor que 1.0, los textos no son suficientemente similares.
+
+## Para Qué los Usa WasAP
+
+| Uso | Cómo |
+|-----|------|
+| **Buscar memorias relevantes** | Embed la pregunta → buscar memorias cercanas |
+| **Buscar notas** | Embed el query → encontrar notas similares |
+| **Dedup de memorias** | Si dos memorias tienen vectores muy cercanos, probablemente son duplicadas |
+| **RAG** | Encontrar contexto relevante para inyectar al LLM |
+
+<Quiz
+  question="¿Cuántas dimensiones tiene un embedding de nomic-embed-text?"
+  options={["128", "256", "512", "768"]}
+  correct={3}
+/>
+
+<Quiz
+  question="Si dos textos tienen distancia L2 de 0.3, ¿qué significa?"
+  options={[
+    "Son completamente diferentes",
+    "Son muy similares semánticamente",
+    "Tienen exactamente las mismas palabras",
+    "Están en idiomas diferentes"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo se indexan los embeddings en sqlite-vec.

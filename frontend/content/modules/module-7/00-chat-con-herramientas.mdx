@@ -1,0 +1,112 @@
+---
+title: "Chat con Herramientas"
+description: "OllamaClient.chat_with_tools() y el parámetro think"
+xpReward: 50
+---
+
+## Tool Calling: El LLM Decide
+
+En un chat normal, el LLM genera texto. Con **tool calling**, el LLM puede decidir que necesita ejecutar una herramienta para responder. En vez de texto, retorna un `ToolCall` con nombre y argumentos.
+
+<Callout variant="info" title="El LLM no ejecuta nada">
+El LLM solo *decide* qué herramienta usar. WasAP la ejecuta y le devuelve el resultado. El LLM luego genera la respuesta final usando ese resultado.
+</Callout>
+
+## chat_with_tools()
+
+```python
+class OllamaClient:
+    async def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],     # Schemas de herramientas disponibles
+        temperature: float = 0.7,
+        think: bool | None = None,
+    ) -> ChatResponse:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+
+        if think is not None:
+            payload["think"] = think
+
+        response = await self._post("/api/chat", payload)
+        return self._parse_response(response)
+```
+
+## ChatResponse: Texto o Tool Calls
+
+```python
+class ChatResponse(BaseModel):
+    content: str | None      # Texto de respuesta (si no hay tools)
+    tool_calls: list[ToolCall] = []  # Herramientas a ejecutar
+
+# Ejemplo: respuesta con tool call
+ChatResponse(
+    content=None,
+    tool_calls=[
+        ToolCall(name="get_weather", arguments={"city": "Buenos Aires"})
+    ]
+)
+
+# Ejemplo: respuesta con texto (sin tools)
+ChatResponse(content="Hola, ¿en qué puedo ayudarte?", tool_calls=[])
+```
+
+## El Parámetro think
+
+<Concept title="think: True | False | None">
+`think=True`: el modelo razona paso a paso antes de responder (chain-of-thought). `think=False`: respuesta directa sin razonamiento. `think=None`: comportamiento default del modelo.
+</Concept>
+
+```python
+# ⚠️ REGLA CRÍTICA: think=False cuando hay tools
+# qwen3 con tools + think=True genera outputs rotos
+response = await client.chat_with_tools(
+    messages=messages,
+    tools=tool_schemas,
+    think=False,  # OBLIGATORIO con tools en qwen3
+)
+```
+
+<Callout variant="error" title="Incompatibilidad qwen3 + tools + think">
+qwen3 con `think=True` y tools genera outputs inconsistentes. WasAP siempre usa `think=False` cuando hay tools en el payload. `think=True` solo se usa para chat puro sin herramientas.
+</Callout>
+
+## Cuándo Usar think
+
+| Escenario | think | Por qué |
+|-----------|-------|---------|
+| Chat con tools | `False` | Incompatibilidad qwen3 |
+| Guardrails (binary) | `False` | Solo necesita sí/no |
+| Summarizer | `False` | Respuesta estructurada |
+| Chat libre sin tools | `True` o `None` | Razonamiento mejora calidad |
+| Problemas complejos | `True` | Chain-of-thought ayuda |
+
+<Quiz
+  question="¿Qué retorna chat_with_tools cuando el LLM quiere usar una herramienta?"
+  options={[
+    "Un string con el nombre de la herramienta",
+    "Un ChatResponse con content=None y tool_calls con la herramienta y argumentos",
+    "Un error indicando que debe ejecutar el tool",
+    "El resultado de la herramienta directamente"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa think=False cuando hay tools en el payload?"
+  options={[
+    "Para ahorrar tokens",
+    "Porque qwen3 con think=True y tools genera outputs inconsistentes",
+    "Porque el thinking es incompatible con JSON",
+    "Para mejorar la velocidad de respuesta"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos el loop completo de ejecución de herramientas.

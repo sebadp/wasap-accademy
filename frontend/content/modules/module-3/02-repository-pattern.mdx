@@ -1,0 +1,128 @@
+---
+title: "Repository Pattern"
+description: "Separar acceso a datos de lógica de negocio con 100+ métodos async"
+xpReward: 75
+---
+
+## Qué es el Repository Pattern
+
+El Repository Pattern separa la **lógica de acceso a datos** de la **lógica de negocio**. En vez de escribir SQL en tus handlers de webhook, delegás a un objeto `Repository` que encapsula todas las queries.
+
+<Callout variant="tip" title="¿Por qué importa?">
+Sin este patrón, tendrías SQL mezclado con lógica de LLM, formato de mensajes, y envío a WhatsApp. El Repository centraliza todo el acceso a datos en un solo lugar.
+</Callout>
+
+## Repository en WasAP
+
+`app/database/repository.py` tiene **más de 100 métodos async**. Aquí los más importantes:
+
+```python
+class Repository:
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    async def save_message(
+        self, conversation_id: int, role: str, content: str
+    ) -> int:
+        cursor = await self.conn.execute(
+            "INSERT INTO messages (conversation_id, role, content) "
+            "VALUES (?, ?, ?)",
+            (conversation_id, role, content),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid
+
+    async def get_active_memories(
+        self, phone_number: str, limit: int | None = None
+    ) -> list[dict]:
+        query = (
+            "SELECT id, content, created_at FROM memories "
+            "WHERE phone_number = ? AND active = 1 "
+            "ORDER BY id DESC"
+        )
+        if limit:
+            query += f" LIMIT {limit}"
+        cursor = await self.conn.execute(query, (phone_number,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+```
+
+## Dependency Injection
+
+El Repository se crea una sola vez al inicio y se inyecta via `app.state`:
+
+```python
+# En main.py (lifespan)
+conn, vec_available = await init_db(settings.database_path)
+repository = Repository(conn)
+app.state.repository = repository
+
+# En dependencies.py
+def get_repository(request: Request) -> Repository:
+    return request.app.state.repository
+```
+
+<Concept title="app.state">
+FastAPI permite guardar objetos en `app.state` durante el lifespan. Esto evita crear una nueva conexión a la DB por cada request — una sola conexión compartida, serializada por aiosqlite.
+</Concept>
+
+## Métodos Clave por Subsistema
+
+| Subsistema | Métodos | Ejemplo |
+|------------|---------|---------|
+| **Messages** | save, get_recent, count | `save_message(conv_id, role, content)` |
+| **Memories** | add, remove, list, search | `search_similar_memories_with_distance()` |
+| **Notes** | save, get, search, delete | `search_notes(phone, query)` |
+| **Projects** | create, tasks, progress | `get_projects_with_progress(phone)` |
+| **Embeddings** | save, search, delete | `save_embedding(table, id, vector)` |
+| **Traces** | add, query, cleanup | `get_failure_trend(phone, days)` |
+| **Eval** | curate, export, stats | `add_eval_entry(input, output, tags)` |
+
+## Operaciones Atómicas
+
+Un patrón crítico es `get_or_create_conversation()`:
+
+```python
+async def get_or_create_conversation(self, phone_number: str) -> int:
+    # INSERT OR IGNORE: no falla si ya existe
+    await self.conn.execute(
+        "INSERT OR IGNORE INTO conversations (phone_number) VALUES (?)",
+        (phone_number,),
+    )
+    # SELECT: siempre retorna el id (nuevo o existente)
+    cursor = await self.conn.execute(
+        "SELECT id FROM conversations WHERE phone_number = ?",
+        (phone_number,),
+    )
+    row = await cursor.fetchone()
+    await self.conn.commit()
+    return row["id"]
+```
+
+<Callout variant="warning" title="Sin race conditions">
+`INSERT OR IGNORE` + `SELECT` es atómico a nivel de SQLite. No necesitás locks ni try/except para manejar inserciones concurrentes.
+</Callout>
+
+<Quiz
+  question="¿Cuál es la ventaja principal del Repository Pattern?"
+  options={[
+    "Hace las queries más rápidas",
+    "Separa el acceso a datos de la lógica de negocio",
+    "Permite usar múltiples bases de datos simultáneamente",
+    "Reemplaza la necesidad de índices"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo se inyecta el Repository en los endpoints de FastAPI?"
+  options={[
+    "Se crea uno nuevo por cada request",
+    "Se importa como variable global",
+    "Se guarda en app.state durante el lifespan y se accede via dependency injection",
+    "Se pasa como parámetro del constructor de FastAPI"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo WasAP previene el procesamiento duplicado de mensajes sin locks.

@@ -1,0 +1,120 @@
+---
+title: "Flush Pre-Compactación"
+description: "Extraer hechos importantes de mensajes antes de borrarlos"
+xpReward: 75
+---
+
+## No Perder Información
+
+Cuando el Summarizer borra mensajes viejos para liberar contexto, **podría perderse información importante**. El flush pre-compactación previene esto.
+
+<Callout variant="warning" title="Prevención de pérdida de datos">
+Sin flush, si el usuario dijo "Me mudé a Barcelona" en un mensaje viejo que se borra, el asistente olvida ese hecho. Con flush, se extrae como memoria permanente antes de borrar.
+</Callout>
+
+## El Flujo Completo
+
+<Step number={1} title="Threshold alcanzado">
+La conversación tiene más de 20 mensajes (configurable).
+</Step>
+
+<Step number={2} title="Flush: extraer facts">
+El LLM analiza los mensajes que van a ser borrados y extrae hechos relevantes.
+</Step>
+
+<Step number={3} title="Crear memorias">
+Cada hecho se guarda como memoria permanente (con dedup).
+</Step>
+
+<Step number={4} title="Embeddings">
+Las nuevas memorias se indexan vectorialmente.
+</Step>
+
+<Step number={5} title="Borrar mensajes">
+Los mensajes viejos se eliminan de la tabla.
+</Step>
+
+<Step number={6} title="Consolidar">
+El consolidador revisa si las nuevas memorias duplican las existentes.
+</Step>
+
+## El Prompt de Extracción
+
+```python
+FLUSH_PROMPT = """Analyze these conversation messages and extract important
+facts about the user. Return ONLY a JSON array of strings.
+
+Focus on:
+- Personal information (name, location, job, preferences)
+- Decisions made
+- Important events mentioned
+- Preferences expressed
+
+Messages:
+{messages}
+
+Return format: ["fact 1", "fact 2", ...]"""
+```
+
+## Dedup Antes de Guardar
+
+```python
+async def flush_to_memory(self, phone_number: str, messages: list[dict]):
+    facts = await self._extract_facts(messages)
+
+    existing = await self.repository.get_active_memories(phone_number)
+    existing_contents = [m["content"] for m in existing]
+
+    for fact in facts:
+        # No guardar si ya existe una memoria similar
+        is_dup = any(
+            _is_duplicate(existing, fact) for existing in existing_contents
+        )
+        if not is_dup:
+            memory_id = await self.repository.add_memory(phone_number, fact)
+            await embed_memory(
+                self.repository, self.ollama_client, memory_id, fact
+            )
+            existing_contents.append(fact)  # Para check contra las nuevas
+```
+
+<Concept title="Dedup incremental">
+Cada hecho nuevo se compara contra las memorias existentes Y contra los hechos que acabamos de agregar. Esto evita duplicados tanto con el pasado como dentro del mismo batch.
+</Concept>
+
+## Configuración
+
+```python
+class Settings(BaseSettings):
+    memory_flush_enabled: bool = True     # Activar/desactivar flush
+    conversation_max_messages: int = 20   # Threshold del summarizer
+    history_verbatim_count: int = 8       # Mensajes a mantener verbatim
+```
+
+<Callout variant="tip" title="Configurable via .env">
+Todo es configurable. En desarrollo podés desactivar el flush (`MEMORY_FLUSH_ENABLED=false`) para que no consuma recursos del LLM.
+</Callout>
+
+<Quiz
+  question="¿Qué hace el flush pre-compactación?"
+  options={[
+    "Comprimir los mensajes en formato ZIP",
+    "Extraer hechos importantes de mensajes antes de borrarlos y guardarlos como memorias",
+    "Enviar los mensajes al usuario por email",
+    "Mover los mensajes a otra tabla"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo evita el flush guardar memorias duplicadas?"
+  options={[
+    "Usa un hash MD5 de cada memoria",
+    "Compara cada hecho nuevo contra memorias existentes con difflib (ratio > 0.8)",
+    "Pide al LLM que verifique duplicados",
+    "No los evita, el consolidador se encarga después"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo de Memory System. Ahora entendés el ciclo completo: crear → indexar → inyectar → consolidar → flush.

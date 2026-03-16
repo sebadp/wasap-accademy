@@ -1,0 +1,106 @@
+---
+title: "Dedup Atómico"
+description: "Prevenir procesamiento duplicado de mensajes sin locks ni race conditions"
+xpReward: 50
+---
+
+## El Problema: Mensajes Duplicados
+
+WhatsApp envía el mismo webhook **múltiples veces** si no recibió un HTTP 200 a tiempo. Si procesás cada uno, el usuario recibe la misma respuesta 2 o 3 veces.
+
+<Callout variant="warning" title="No es un bug, es by design">
+WhatsApp Cloud API reintenta webhooks si no recibe acknowledgment en ~5 segundos. Esto es un patrón estándar en sistemas event-driven: "at-least-once delivery".
+</Callout>
+
+## La Solución: INSERT OR IGNORE
+
+WasAP usa una tabla con UNIQUE constraint y la operación `INSERT OR IGNORE`:
+
+```sql
+CREATE TABLE IF NOT EXISTS processed_messages (
+    message_id TEXT PRIMARY KEY,
+    processed_at TIMESTAMP DEFAULT (datetime('now'))
+);
+```
+
+```python
+async def is_message_processed(self, message_id: str) -> bool:
+    """Marca como procesado y retorna True si YA estaba procesado."""
+    cursor = await self.conn.execute(
+        "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
+        (message_id,),
+    )
+    await self.conn.commit()
+    # Si rowcount == 0, el INSERT fue ignorado → ya existía
+    return cursor.rowcount == 0
+```
+
+<Concept title="INSERT OR IGNORE">
+Si el `message_id` ya existe (viola el PRIMARY KEY), SQLite **ignora** la inserción silenciosamente sin error. Si no existe, lo inserta. Esto es una operación atómica — no hay ventana para race conditions.
+</Concept>
+
+## Uso en el Webhook Handler
+
+```python
+async def process_message(message: WhatsAppMessage, ...):
+    # Primer paso: dedup
+    if await repository.is_message_processed(message.message_id):
+        logger.info("Duplicate message ignored", message_id=message.message_id)
+        return
+
+    # Si llegamos acá, es la primera vez que vemos este mensaje
+    await _handle_message(message, ...)
+```
+
+## Por qué NO usar try/except
+
+Una alternativa sería:
+
+```python
+# ❌ MAL: Race condition entre SELECT y INSERT
+exists = await repository.check_if_exists(message_id)
+if exists:
+    return
+await repository.mark_as_processed(message_id)  # Otro request puede llegar aquí
+```
+
+<Callout variant="error" title="Race condition">
+Entre el `SELECT` y el `INSERT`, otro request puede llegar con el mismo message_id. Ambos pasan el check y procesan el mensaje dos veces. `INSERT OR IGNORE` elimina esta ventana.
+</Callout>
+
+## El Patrón Completo
+
+<Step number={1} title="Recibir webhook">
+WhatsApp envía el payload al endpoint POST /webhook.
+</Step>
+
+<Step number={2} title="Responder 200 inmediatamente">
+Antes de procesar, respondemos HTTP 200 para evitar reintentos.
+</Step>
+
+<Step number={3} title="INSERT OR IGNORE">
+Intentamos insertar el message_id. Si ya existe, paramos.
+</Step>
+
+<Step number={4} title="Procesar si es nuevo">
+Solo si el INSERT fue exitoso (rowcount == 1), procesamos el mensaje.
+</Step>
+
+<Quiz
+  question="¿Qué retorna cursor.rowcount cuando INSERT OR IGNORE encuentra un duplicado?"
+  options={["1", "0", "-1", "Lanza una excepción"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué INSERT OR IGNORE es mejor que SELECT + INSERT para dedup?"
+  options={[
+    "Es más rápido",
+    "Es una operación atómica sin ventana para race conditions",
+    "Usa menos memoria",
+    "Soporta más tipos de datos"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección exploraremos sqlite-vec para almacenar y buscar vectores de embeddings.

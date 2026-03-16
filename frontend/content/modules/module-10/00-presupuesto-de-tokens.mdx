@@ -1,0 +1,84 @@
+---
+title: "El Presupuesto de Tokens"
+description: "Estimar y monitorear el uso de tokens para no exceder la ventana de contexto"
+xpReward: 50
+---
+
+## Cada Token Cuenta
+
+Los LLMs tienen una ventana de contexto finita. qwen3.5:9b tiene ~32K tokens. Todo lo que envías — system prompt, memorias, historial, tools — compite por ese espacio.
+
+<Callout variant="warning" title="Si excedés el límite">
+Si el contexto supera 32K tokens, el modelo trunca silenciosamente la entrada. Puede perder instrucciones del system prompt o historial reciente.
+</Callout>
+
+## Estimación: chars/4
+
+WasAP usa una heurística simple: **1 token ≈ 4 caracteres**.
+
+```python
+# app/context/token_estimator.py
+def estimate_tokens(text: str) -> int:
+    return len(text) // 4
+
+def log_context_budget(estimated_tokens: int, max_tokens: int = 32000):
+    fill_rate = estimated_tokens / max_tokens
+    if fill_rate > 1.0:
+        logger.error("Context OVER budget: %d/%d (%.0f%%)",
+                     estimated_tokens, max_tokens, fill_rate * 100)
+    elif fill_rate > 0.8:
+        logger.warning("Context near budget: %d/%d (%.0f%%)",
+                       estimated_tokens, max_tokens, fill_rate * 100)
+```
+
+<Concept title="chars/4 proxy">
+No es exacto (los tokenizers varían por modelo), pero es rápido y suficiente para presupuestar. Si necesitás precisión, usarías el tokenizer del modelo, pero eso agrega latencia.
+</Concept>
+
+## Monitoreo en ConversationContext
+
+```python
+class ConversationContext:
+    token_estimate: int = 0
+
+    @classmethod
+    async def build(cls, ...) -> "ConversationContext":
+        ctx = cls()
+        # ... fetch all data ...
+        ctx.token_estimate = estimate_tokens(
+            system_prompt + memories_text + notes_text + history_text
+        )
+        log_context_budget(ctx.token_estimate)
+        return ctx
+```
+
+## Budget por Sección
+
+| Sección | Budget aproximado | Prioridad |
+|---------|-------------------|-----------|
+| System prompt | ~2K tokens | Siempre presente |
+| Memorias | ~1-2K tokens | Alta (top-K semántico) |
+| Historial | ~4-6K tokens | Alta (últimos 8 mensajes) |
+| Notas relevantes | ~1K tokens | Media |
+| Daily logs | ~1K tokens | Media |
+| Tool schemas | ~2-3K tokens | Solo si hay tools |
+| Conversación summary | ~0.5-1K tokens | Baja |
+| **Total** | **~12-16K** | **≤50% del contexto** |
+
+<Callout variant="tip" title="Dejar margen para la respuesta">
+El modelo necesita tokens para generar su respuesta. Si usás 30K de los 32K en contexto, solo quedan 2K para la respuesta.
+</Callout>
+
+<Quiz
+  question="¿Cuántos tokens estima la heurística chars/4 para un texto de 4000 caracteres?"
+  options={["500", "1000", "2000", "4000"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿A qué porcentaje del budget se emite un WARNING?"
+  options={["50%", "70%", "80%", "95%"]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo ContextBuilder ensambla todo en un solo mensaje.

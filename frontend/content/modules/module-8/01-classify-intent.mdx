@@ -1,0 +1,99 @@
+---
+title: "classify_intent"
+description: "Clasificación rápida de intención con LLM sin herramientas"
+xpReward: 75
+---
+
+## Cómo Funciona la Clasificación
+
+`classify_intent()` es una llamada LLM **rápida**: sin tools, sin chain-of-thought, solo texto. Le pedimos al modelo que clasifique el mensaje del usuario en categorías predefinidas.
+
+```python
+async def classify_intent(
+    messages: list[dict],
+    context: str = "",
+) -> list[str]:
+    prompt = f"""Classify the user's message into categories.
+Available categories: time, math, weather, search, news, notes,
+files, memory, github, tools, knowledge, none.
+
+Return ONLY a JSON array of category names.
+If the message is plain chat, return ["none"].
+
+Context: {context}
+"""
+    response = await ollama_client.chat(
+        messages=[{"role": "system", "content": prompt}] + messages[-3:],
+        think=False,  # Rápido, sin reasoning
+    )
+
+    return _parse_categories(response.content)
+```
+
+<Callout variant="info" title="Solo los últimos 3 mensajes">
+Para clasificar, no necesitamos toda la conversación. Los últimos 3 mensajes dan suficiente contexto y mantienen la llamada rápida.
+</Callout>
+
+## Las 12 Categorías
+
+| Categoría | Ejemplos de mensajes |
+|-----------|---------------------|
+| `time` | "¿Qué hora es?", "¿Qué día es hoy?" |
+| `math` | "Cuánto es 15% de 200", "Calculá sqrt(144)" |
+| `weather` | "¿Cómo está el clima?", "¿Va a llover?" |
+| `search` | "Buscá información sobre X" |
+| `news` | "¿Qué noticias hay?", "Novedades de tech" |
+| `notes` | "Guardá una nota", "¿Qué notas tengo?" |
+| `files` | "Leé el archivo X", "Buscá en el código" |
+| `memory` | "Recordá que soy dev", "¿Qué sabés de mí?" |
+| `tools` | "¿Qué herramientas tenés?", "Listá tus skills" |
+| `knowledge` | "¿Qué sabés sobre el proyecto?" |
+| `github` | "Creá un PR", "Buscá issues" |
+| **`none`** | "Hola", "Gracias", "Contame un chiste" |
+
+## El Caso Especial: ["none"]
+
+Cuando el usuario hace chat casual, no necesita herramientas:
+
+```python
+if categories == ["none"]:
+    # Plain chat: ir directo al LLM sin tool loop
+    response = await ollama_client.chat(messages=full_history)
+    return response.content
+```
+
+## Fallback: DEFAULT_CATEGORIES
+
+Si la clasificación falla (output inválido, timeout), WasAP usa un set seguro:
+
+```python
+DEFAULT_CATEGORIES = ["time", "math", "weather", "search"]
+```
+
+<Callout variant="tip" title="Fail-safe">
+Las categorías default cubren los casos más comunes. El usuario puede que no obtenga la herramienta exacta, pero no se queda sin herramientas.
+</Callout>
+
+<Quiz
+  question="¿Por qué classify_intent usa think=False?"
+  options={[
+    "Para reducir costos",
+    "Porque necesita una respuesta rápida y determinística, sin chain-of-thought",
+    "Porque el modelo no soporta thinking",
+    "Para evitar errores"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué retorna classify_intent cuando el usuario dice 'Hola'?"
+  options={[
+    "['chat']",
+    "['none']",
+    "[]",
+    "['greeting']"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo select_tools mapea categorías a herramientas.

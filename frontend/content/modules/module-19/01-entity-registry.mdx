@@ -1,0 +1,157 @@
+---
+title: "EntityRegistry: CRUD y Extracción"
+description: "Registro de entidades, auto-extracción con regex, y upsert automático en memorias y notas"
+xpReward: 100
+---
+
+## El Registro Central
+
+`EntityRegistry` es la interfaz principal para crear, leer, actualizar y eliminar entidades y relaciones. Centraliza toda la lógica del knowledge graph.
+
+```python
+# app/ontology/registry.py
+
+class EntityRegistry:
+    def __init__(self, repository: Repository):
+        self._repo = repository
+
+    async def upsert_entity(
+        self, name: str, entity_type: str, metadata: dict | None = None
+    ) -> int:
+        """Crear o actualizar una entidad. Retorna el ID."""
+        existing = await self._repo.get_entity_by_name_type(name, entity_type)
+        if existing:
+            if metadata:
+                merged = {**json.loads(existing["metadata"]), **metadata}
+                await self._repo.update_entity(existing["id"], metadata=merged)
+            return existing["id"]
+        return await self._repo.create_entity(name, entity_type, metadata or {})
+
+    async def add_relation(
+        self, source_id: int, target_id: int, relation_type: str
+    ) -> None:
+        """Agregar relación (idempotente por UNIQUE constraint)."""
+        await self._repo.create_relation(source_id, target_id, relation_type)
+
+    async def get_relations(self, entity_id: int) -> list[dict]:
+        """Todas las relaciones de una entidad (entrantes y salientes)."""
+        return await self._repo.get_entity_relations(entity_id)
+```
+
+<Concept title="Upsert pattern">
+`upsert_entity` primero busca si existe. Si existe, mergea metadata. Si no, crea. Esto evita duplicados y permite enriquecer entidades incrementalmente: la primera mención crea la entidad, las siguientes agregan metadata.
+</Concept>
+
+## Extracción Automática con Regex
+
+`extractor.py` detecta entidades en texto sin necesidad del LLM:
+
+```python
+# app/ontology/extractor.py
+import re
+
+# Patrones para detectar tipos de entidades
+PATTERNS = {
+    "person": [
+        r"(?:con|de|para|por)\s+([A-Z][a-záéíóú]+(?:\s+[A-Z][a-záéíóú]+)?)",
+        r"([A-Z][a-záéíóú]+)\s+(?:dijo|trabaja|es|fue|está)",
+    ],
+    "tool": [
+        r"\b(Docker|PostgreSQL|Redis|FastAPI|Python|TypeScript|React|Ollama)\b",
+    ],
+    "topic": [
+        r"(?:sobre|de|en)\s+(machine learning|deep learning|NLP|API|backend|frontend)",
+    ],
+}
+
+def extract_entities(text: str) -> list[tuple[str, str]]:
+    """Extraer (name, type) del texto usando regex."""
+    entities = []
+    for entity_type, patterns in PATTERNS.items():
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                name = match.group(1).strip()
+                if len(name) > 2:  # Filtrar matches muy cortos
+                    entities.append((name, entity_type))
+    return list(set(entities))  # Deduplicar
+```
+
+<Callout variant="warning" title="Sin LLM">
+La extracción usa regex puro, no LLM. Es rápida (microsegundos) y predecible, pero no detecta entidades ambiguas. Es un trade-off consciente: velocidad sobre precisión.
+</Callout>
+
+## Upsert Automático en el Flujo
+
+Las entidades se extraen y registran automáticamente en tres momentos:
+
+```python
+# En add_memory (simplificado)
+async def add_memory_with_entities(
+    content: str, registry: EntityRegistry
+) -> int:
+    memory_id = await repository.add_memory(content)
+
+    # Extraer y registrar entidades
+    entities = extract_entities(content)
+    for name, entity_type in entities:
+        entity_id = await registry.upsert_entity(name, entity_type)
+        # Relacionar la entidad con la memoria
+        await registry.link_to_source("memory", memory_id, entity_id)
+
+    return memory_id
+```
+
+| Trigger | Funcion | Qué extrae |
+|---------|---------|------------|
+| `add_memory` | `/remember` o flush | Personas, tools, topics del texto |
+| `save_note` | Notas nuevas/editadas | Tools, topics mencionados |
+| `create_project` | Nuevo proyecto | Nombre como entity tipo `project` |
+
+## Detección de Topics sin LLM
+
+```python
+# Topic detection basada en frecuencia de co-ocurrencia
+TOPIC_KEYWORDS = {
+    "backend": ["api", "server", "endpoint", "rest", "graphql"],
+    "frontend": ["react", "css", "html", "component", "ui"],
+    "devops": ["docker", "ci", "deploy", "kubernetes", "pipeline"],
+    "data": ["sql", "database", "query", "migration", "schema"],
+}
+
+def detect_topics(text: str) -> list[str]:
+    text_lower = text.lower()
+    detected = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        matches = sum(1 for kw in keywords if kw in text_lower)
+        if matches >= 2:  # Al menos 2 keywords del topic
+            detected.append(topic)
+    return detected
+```
+
+<Callout variant="tip" title="Threshold de 2 keywords">
+Exigir al menos 2 keywords reduce falsos positivos. Un texto que menciona "api" una vez no se clasifica como "backend", pero uno que dice "api" y "endpoint" si.
+</Callout>
+
+<Quiz
+  question="¿Qué hace upsert_entity si la entidad ya existe?"
+  options={[
+    "La borra y recrea",
+    "Lanza una excepción",
+    "Mergea la metadata nueva con la existente y retorna el ID",
+    "No hace nada"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué la extracción de entidades usa regex en vez de LLM?"
+  options={[
+    "Porque el LLM no puede detectar entidades",
+    "Porque regex es más rápido y predecible, aunque menos preciso",
+    "Porque regex detecta más entidades que el LLM",
+    "Porque no se puede llamar al LLM desde Python"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo traversar el grafo para enriquecer el contexto del LLM.

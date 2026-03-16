@@ -1,0 +1,91 @@
+---
+title: "Indexing Pipeline"
+description: "De texto a vector almacenado en sqlite-vec"
+xpReward: 75
+---
+
+## El Pipeline de Indexación
+
+Cuando se crea una memoria o nota, WasAP la convierte en un embedding y la almacena:
+
+```
+Texto → OllamaClient.embed() → [768 floats] → struct.pack → blob → sqlite-vec
+```
+
+<Callout variant="info" title="Indexación automática">
+No necesitás indexar manualmente. WasAP indexa automáticamente cada `/remember`, nota nueva, y hecho extraído por flush.
+</Callout>
+
+## embed_memory()
+
+```python
+# app/embeddings/indexer.py
+import struct
+
+async def embed_memory(
+    repository: Repository,
+    ollama_client: OllamaClient,
+    memory_id: int,
+    content: str,
+) -> None:
+    try:
+        vector = await ollama_client.embed(content)
+        blob = struct.pack(f"{len(vector)}f", *vector)
+        await repository.save_embedding("vec_memories", memory_id, blob)
+    except Exception as e:
+        logger.warning("Failed to embed memory %d: %s", memory_id, e)
+        # Best-effort: no propagar el error
+```
+
+<Concept title="struct.pack para serialización">
+`struct.pack(f"768f", *vector)` convierte 768 floats de Python a un blob binario de 3072 bytes (768 × 4 bytes por float). Es el formato que sqlite-vec espera.
+</Concept>
+
+## Triggers de Indexación
+
+| Evento | Acción | Código |
+|--------|--------|--------|
+| `/remember texto` | Embed la nueva memoria | `cmd_remember` → `embed_memory()` |
+| `/forget query` | Borrar embedding | `repository.delete_embedding()` |
+| Flush pre-compactación | Embed cada fact nuevo | `flush_to_memory` → `embed_memory()` |
+| Consolidación | Borrar embeddings de memorias mergeadas | `consolidator` → `delete_embedding()` |
+| Startup | Backfill memorias sin embedding | `backfill_embeddings()` |
+
+## backfill_embeddings()
+
+Al iniciar, WasAP indexa memorias que no tienen embedding (ej: creadas antes de activar embeddings):
+
+```python
+async def backfill_embeddings(repository, ollama_client):
+    """Indexar memorias que no tienen embedding."""
+    memories = await repository.get_memories_without_embedding()
+    for memory in memories:
+        await embed_memory(
+            repository, ollama_client,
+            memory["id"], memory["content"]
+        )
+        await asyncio.sleep(0.1)  # No saturar Ollama
+```
+
+<Callout variant="warning" title="Background task">
+El backfill corre como background task al inicio. No bloquea el arranque de la app. Si Ollama no está disponible, simplemente loguea warnings.
+</Callout>
+
+<Quiz
+  question="¿Cuántos bytes ocupa un embedding serializado con struct.pack?"
+  options={["768 bytes", "1536 bytes", "3072 bytes (768 × 4)", "6144 bytes"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué pasa si embed_memory() falla?"
+  options={[
+    "La memoria no se guarda",
+    "Se reintenta 3 veces",
+    "Se loguea un warning y la memoria se guarda sin embedding (best-effort)",
+    "La app crashea"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo buscar usando estos vectores.

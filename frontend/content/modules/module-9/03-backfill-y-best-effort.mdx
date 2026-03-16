@@ -1,0 +1,110 @@
+---
+title: "Backfill & Best-Effort"
+description: "Embeddings que nunca bloquean la app aunque fallen"
+xpReward: 75
+---
+
+## El Patrón Best-Effort
+
+En WasAP, los embeddings son **best-effort**: si fallan, la app sigue funcionando. Nunca se propaga un error de embedding al usuario.
+
+<Callout variant="info" title="Filosofía">
+Los embeddings mejoran la calidad de búsqueda, pero no son esenciales. Sin ellos, WasAP usa búsqueda por recencia. Con ellos, usa búsqueda semántica. Ambos caminos funcionan.
+</Callout>
+
+## Patrones de Best-Effort
+
+```python
+# Patrón 1: try/except con warning
+async def embed_memory(repo, client, memory_id, content):
+    try:
+        vector = await client.embed(content)
+        await repo.save_embedding("vec_memories", memory_id, vector)
+    except Exception as e:
+        logger.warning("Embed failed for memory %d: %s", memory_id, e)
+        # NO raise — la memoria existe sin embedding
+
+# Patrón 2: Flag de disponibilidad
+conn, vec_available = await init_db(path)
+# vec_available controla qué path de búsqueda usar
+
+# Patrón 3: Fallback graceful
+if vec_available and query_embedding:
+    results = await search_similar(phone, query_embedding)
+else:
+    results = await get_active_memories(phone, limit=10)
+```
+
+## Backfill al Startup
+
+```python
+async def backfill_embeddings(repository, ollama_client):
+    """Background task: indexar memorias sin embedding."""
+    unindexed = await repository.get_memories_without_embedding()
+    logger.info("Backfilling %d memories", len(unindexed))
+
+    success = 0
+    for memory in unindexed:
+        try:
+            await embed_memory(
+                repository, ollama_client,
+                memory["id"], memory["content"],
+            )
+            success += 1
+            await asyncio.sleep(0.1)  # Rate limiting
+        except Exception:
+            continue  # Skip y seguir con la siguiente
+
+    logger.info("Backfilled %d/%d memories", success, len(unindexed))
+```
+
+<Callout variant="warning" title="Rate limiting en backfill">
+`asyncio.sleep(0.1)` entre cada embedding evita saturar Ollama. Con 100 memorias, el backfill toma ~10 segundos en vez de saturar la API.
+</Callout>
+
+## Cuándo Corre el Backfill
+
+| Momento | Qué indexa |
+|---------|------------|
+| **Startup** | Memorias y notas que no tienen embedding |
+| **Después de import** | Si se importaron datos sin embeddings |
+| **Automation rule** | Si `embeddings_desync > 10` → trigger backfill |
+
+## Degradación Grácil
+
+```
+Con sqlite-vec + embeddings:
+  Búsqueda semántica → Resultados por relevancia de significado
+
+Sin sqlite-vec:
+  get_active_memories(limit=10) → Últimas 10 memorias por recencia
+
+Sin Ollama:
+  get_active_memories(limit=10) → Mismas últimas 10 memorias
+```
+
+La app funciona en los 3 escenarios. La calidad mejora con cada capa.
+
+<Quiz
+  question="¿Qué significa 'best-effort' para los embeddings?"
+  options={[
+    "Se hacen con el mejor algoritmo posible",
+    "Se intentan generar, pero si fallan la app sigue funcionando sin ellos",
+    "Se generan con máxima prioridad",
+    "Se reintenta hasta que funcionen"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué hay un sleep(0.1) en el backfill?"
+  options={[
+    "Para dar tiempo al garbage collector",
+    "Para no saturar Ollama con demasiadas requests de embedding seguidas",
+    "Para esperar que la DB termine de escribir",
+    "Por un bug que requiere delay"
+  ]}
+  correct={1}
+/>
+
+En la última lección armamos el pipeline RAG completo.

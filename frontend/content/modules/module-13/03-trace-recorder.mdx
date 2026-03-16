@@ -1,0 +1,180 @@
+---
+title: "TraceRecorder"
+description: "Singleton que persiste trazas en Langfuse y SQLite con best-effort"
+xpReward: 100
+---
+
+## El Recorder: Puente entre WasAP y Langfuse
+
+`TraceRecorder` es un **singleton** que envuelve el SDK de Langfuse y agrega persistencia local en SQLite. Es el punto central de toda la instrumentación.
+
+```python
+# app/tracing/recorder.py
+class TraceRecorder:
+    _instance: "TraceRecorder | None" = None
+
+    def __init__(self, langfuse: Langfuse | None, repository: Repository):
+        self.langfuse = langfuse
+        self.repository = repository
+        self._active_spans: dict[str, Any] = {}
+        self._root_spans: dict[str, Any] = {}
+
+    @classmethod
+    def get_instance(cls) -> "TraceRecorder | None":
+        return cls._instance
+
+    @classmethod
+    def initialize(cls, langfuse, repository) -> "TraceRecorder":
+        cls._instance = cls(langfuse, repository)
+        return cls._instance
+```
+
+<Concept title="Singleton pattern">
+Solo hay UNA instancia de TraceRecorder en toda la app. Esto garantiza que todos los spans se registran en el mismo Langfuse client y repository, sin duplicados ni conexiones perdidas.
+</Concept>
+
+## Dual Storage
+
+```python
+async def start_span(self, trace_id: str, name: str, kind: str = "span"):
+    span_data = SpanData(
+        trace_id=trace_id,
+        name=name,
+        kind=kind,
+        start_time=datetime.utcnow(),
+    )
+
+    # 1. Registrar en Langfuse (si disponible)
+    if self.langfuse:
+        try:
+            if kind == "generation":
+                lf_span = self._get_trace(trace_id).start_generation(name=name)
+            else:
+                lf_span = self._get_trace(trace_id).start_span(name=name)
+            self._active_spans[span_data.id] = lf_span
+        except Exception as e:
+            logger.warning("Langfuse span failed: %s", e)
+
+    # 2. Registrar en SQLite (siempre, como backup)
+    try:
+        await self.repository.add_trace_span(
+            trace_id=trace_id,
+            span_name=name,
+            span_kind=kind,
+        )
+    except Exception as e:
+        logger.warning("SQLite span failed: %s", e)
+
+    return span_data
+```
+
+<Callout variant="info" title="Dual storage">
+Las trazas se guardan en dos lugares: Langfuse cloud (para dashboards y análisis) y SQLite local (como backup y para offline). Si uno falla, el otro sigue funcionando.
+</Callout>
+
+## Best-Effort: Warning, No Error
+
+Un punto crítico en el diseño del recorder:
+
+```python
+# ❌ MAL: logger.debug (invisible en producción)
+except Exception as e:
+    logger.debug("Trace failed: %s", e)
+
+# ✅ BIEN: logger.warning (visible en producción)
+except Exception as e:
+    logger.warning("Trace failed: %s", e)
+```
+
+<Callout variant="error" title="Bug aprendido">
+Originalmente todos los errores del TraceRecorder se logueaban como `debug`. En producción (nivel INFO), eran invisibles. Fallos de persistencia pasaban desapercibidos por semanas. Lección: siempre `warning` para fallos de I/O en best-effort.
+</Callout>
+
+## _active_spans y _root_spans
+
+```python
+# _active_spans: spans actualmente en ejecución
+# Key: span_id → Value: Langfuse span object
+self._active_spans: dict[str, Any] = {}
+
+# _root_spans: el primer span de cada trace (para update_trace)
+# Key: trace_id → Value: Langfuse span object
+self._root_spans: dict[str, Any] = {}
+```
+
+`_root_spans` es necesario porque en Langfuse v3, para actualizar metadata del trace se usa `root_span.update_trace()`.
+
+## End Span y Cleanup
+
+```python
+async def end_span(self, span_data: SpanData):
+    span_data.end_time = datetime.utcnow()
+    span_data.duration_ms = (
+        (span_data.end_time - span_data.start_time).total_seconds() * 1000
+    )
+
+    # Cerrar en Langfuse
+    lf_span = self._active_spans.pop(span_data.id, None)
+    if lf_span:
+        try:
+            lf_span.end()
+        except Exception as e:
+            logger.warning("Langfuse end_span failed: %s", e)
+
+    # Actualizar duración en SQLite
+    try:
+        await self.repository.update_trace_span(
+            span_data.id, duration_ms=span_data.duration_ms
+        )
+    except Exception as e:
+        logger.warning("SQLite end_span failed: %s", e)
+```
+
+## Testing: Mockear Langfuse
+
+```python
+# En tests
+with patch(
+    "app.tracing.recorder.Langfuse.create_trace_id",
+    return_value="a" * 32,  # 32 hex chars
+):
+    recorder = TraceRecorder.initialize(
+        langfuse=None,  # Sin Langfuse en tests
+        repository=mock_repository,
+    )
+```
+
+<Quiz
+  question="¿Por qué TraceRecorder es un singleton?"
+  options={[
+    "Para mejorar el rendimiento",
+    "Para garantizar que todos los spans usen la misma conexión a Langfuse y repository",
+    "Porque Python solo permite una instancia de cada clase",
+    "Para soportar multithreading"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué los errores del recorder se loguean como WARNING y no como DEBUG?"
+  options={[
+    "Porque WARNING es más rápido de escribir",
+    "Porque en producción (nivel INFO) los DEBUG son invisibles, y fallos de persistencia pasarían desapercibidos",
+    "Porque Langfuse requiere nivel WARNING",
+    "No hay razón particular"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿En cuántos lugares se persisten las trazas?"
+  options={[
+    "Solo Langfuse",
+    "Solo SQLite",
+    "Dos: Langfuse cloud + SQLite local (dual storage)",
+    "Tres: Langfuse + SQLite + archivo"
+  ]}
+  correct={2}
+/>
+
+En la última lección del módulo veremos scores y métricas.

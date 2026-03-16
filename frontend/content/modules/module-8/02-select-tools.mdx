@@ -1,0 +1,111 @@
+---
+title: "select_tools"
+description: "Mapeo determinístico de categorías a herramientas con budget proporcional"
+xpReward: 75
+---
+
+## De Categorías a Herramientas
+
+`select_tools()` es una función **determinística** (sin LLM). Toma las categorías de classify_intent y retorna las herramientas específicas.
+
+```python
+TOOL_CATEGORIES = {
+    "time": ["get_current_datetime", "convert_timezone"],
+    "math": ["calculate"],
+    "weather": ["get_weather"],
+    "search": ["web_search"],
+    "news": ["search_news", "add_news_preference"],
+    "notes": ["save_note", "list_notes", "search_notes", "delete_note"],
+    "memory": ["save_memory", "list_memories", "forget_memory"],
+    "files": ["read_lines", "get_file_outline", "search_source_code"],
+    "projects": [
+        "create_project", "list_projects", "get_project",
+        "add_task", "update_task", "delete_task",
+        "project_progress", "add_project_note",
+    ],
+    "github": ["create_pr", "list_issues", "search_code"],
+    "tools": ["list_tool_categories", "list_category_tools"],
+    "knowledge": ["search_knowledge_graph"],
+}
+```
+
+## Distribución Proporcional
+
+```python
+def select_tools(
+    categories: list[str],
+    max_tools: int = 8,
+) -> list[str]:
+    all_tools = []
+    for cat in categories:
+        all_tools.extend(TOOL_CATEGORIES.get(cat, []))
+
+    # Si caben todas, retornar todas
+    if len(all_tools) <= max_tools:
+        return all_tools
+
+    # Distribución proporcional por categoría
+    per_cat = max(1, max_tools // len(categories))
+    selected = []
+    for cat in categories:
+        tools = TOOL_CATEGORIES.get(cat, [])
+        selected.extend(tools[:per_cat])
+
+    return selected[:max_tools]
+```
+
+<Concept title="max_tools_per_call = 8">
+Configurable en Settings. El default de 8 es el sweet spot para qwen3.5:9b: suficientes tools para ser útil, pocas para que el modelo no se confunda.
+</Concept>
+
+## Ejemplo Concreto
+
+```
+Mensaje: "Guardá una nota sobre el clima en Buenos Aires"
+classify_intent → ["notes", "weather"]
+
+select_tools(["notes", "weather"], max_tools=8):
+  notes: save_note, list_notes, search_notes, delete_note (4 tools)
+  weather: get_weather (1 tool)
+  Total: 5 tools (< 8, retornar todas)
+
+→ [save_note, list_notes, search_notes, delete_note, get_weather]
+```
+
+## MCP Tools se Incluyen
+
+Las herramientas de MCP servers también están en `TOOL_CATEGORIES`:
+
+```python
+# Al registrar un MCP server, sus tools se agregan al mapping
+def register_mcp_tools(server_name: str, tools: list[str], category: str):
+    TOOL_CATEGORIES.setdefault(category, []).extend(tools)
+```
+
+<Callout variant="info" title="Unificado">
+Desde la perspectiva del router, no hay diferencia entre skills builtin y MCP tools. Ambos viven en el mismo `TOOL_CATEGORIES` dict.
+</Callout>
+
+<Quiz
+  question="¿select_tools usa LLM para elegir herramientas?"
+  options={[
+    "Sí, hace otra llamada al LLM",
+    "No, es un mapeo determinístico con un diccionario",
+    "Depende de la categoría",
+    "Solo si hay más de 8 tools"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Si classify retorna ['notes', 'weather'] y max_tools=8, ¿cuántas herramientas se seleccionan?"
+  options={[
+    "8 (siempre el máximo)",
+    "5 (4 de notes + 1 de weather, < 8 así que todas)",
+    "2 (una por categoría)",
+    "Depende del LLM"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo las sticky categories mantienen continuidad.
