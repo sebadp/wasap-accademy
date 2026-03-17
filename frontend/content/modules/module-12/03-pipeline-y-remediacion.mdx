@@ -127,7 +127,7 @@ async def _run_with_guardrails(response, context, trace_ctx):
     if not report.all_passed:
         with trace_ctx.span("guardrails:remediation") as span:
             span.set_attribute("failures", [r.check_name for r in report.results if not r.passed])
-            response = await _handle_guardrail_failure(response, report, context)
+            response = await _handle_guardrail_failure(response, report, context, ollama_client)
 
     return response
 ```

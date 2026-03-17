@@ -163,7 +163,7 @@ with anyio.CancelScope(shield=True):
 ```
 
 <Callout variant="warning" title="CancelScope shield">
-`anyio.CancelScope(shield=True)` protege el cierre de la DB y el cliente HTTP de cancelaciones de anyio. Sin esto, un restart rapido podria dejar conexiones abiertas y causar "address already in use".
+`anyio.CancelScope(shield=True)` protege el cierre de la DB y el cliente HTTP de cancelaciones de anyio. Sin esto, un restart rapido podria dejar conexiones abiertas causando leaks de file descriptors y potencial perdida de datos.
 </Callout>
 
 <Quiz

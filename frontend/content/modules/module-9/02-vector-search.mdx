@@ -101,12 +101,14 @@ async def _get_memories_with_threshold(
         threshold = settings.memory_similarity_threshold
         passed = [content for content, dist in results if dist < threshold]
 
-        if not passed and results:
+        if passed:
+            stats["search_mode"] = "semantic"
+        elif results:
             # Fallback: nada pasó el threshold → tomar las 3 más cercanas
             passed = [content for content, _ in results[:3]]
             stats["search_mode"] = "fallback_threshold"
         else:
-            stats["search_mode"] = "semantic"
+            stats["search_mode"] = "full_fallback"
 
         return passed, stats
 

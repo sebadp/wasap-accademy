@@ -104,7 +104,7 @@ def _try_json_extraction(text: str, max_length: int) -> str | None:
     if isinstance(data, dict) and "items" in data:
         return _extract_item_list(data["items"], max_length)
     # Lista directa: [{"name": "repo1"}, ...]
-    if isinstance(data, list) and isinstance(data[0], dict):
+    if isinstance(data, list) and data and isinstance(data[0], dict):
         return _extract_item_list(data, max_length)
     # Objeto unico: filtrar campos clave
     if isinstance(data, dict):
@@ -156,14 +156,14 @@ messages = [
     {role: tool, content: "... 2000 chars mas ..."},                 <-- actual
 ]
 
-DESPUES (con limpieza):
+DESPUES (con limpieza, keep_last_n=2):
 messages = [
     {role: user, content: "busca noticias de Argentina y el clima"},
     {role: assistant, tool_calls: [search("argentina"), weather("BA")]},
     {role: tool, content: "[Previous result processed -- summary: Results for argentina]"},
-    {role: tool, content: "[Previous result processed -- summary: Weather in Buenos Aires]"},
+    {role: tool, content: "... 500 chars de clima ..."},             <-- intacto (2do mas reciente)
     {role: assistant, tool_calls: [search("argentina economia")]},
-    {role: tool, content: "... 2000 chars mas ..."},                 <-- intacto
+    {role: tool, content: "... 2000 chars mas ..."},                 <-- intacto (mas reciente)
 ]
 ```
 

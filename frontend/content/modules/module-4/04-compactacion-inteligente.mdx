@@ -165,6 +165,7 @@ async def compact_tool_output(
         return structured
 
     # Step 2: LLM summarization
+    # messages built from prompt (see Nivel 2 section above)
     try:
         summary = await ollama_client.chat(messages, think=False)
         if summary and not summary.isspace():

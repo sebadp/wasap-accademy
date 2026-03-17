@@ -29,12 +29,15 @@ LocalForge transcribe todo localmente con faster-whisper. Sin enviar audio a Ope
 ```python
 # app/audio/transcriber.py
 import asyncio
+import logging
 import os
 import tempfile
 
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 from faster_whisper import WhisperModel
+
+logger = logging.getLogger(__name__)
 
 class Transcriber:
     def __init__(

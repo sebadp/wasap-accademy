@@ -89,7 +89,7 @@ async def consolidate_memories(
     if len(memories) < min_memories:
         return 0  # No vale la pena con pocas memorias
 
-    prompt = consolidate_template.format(
+    prompt = CONSOLIDATE_PROMPT.format(
         memories=_format_memories(memories)
     )
     messages = [ChatMessage(role="user", content=prompt)]

@@ -1,6 +1,6 @@
 # AgentCraft — Syllabus Completo v2
 
-> **115 lecciones · 23 módulos · 7 tiers · ~9,200 XP**
+> **115 lecciones · 23 módulos · 7 tiers · ~9,275 XP**
 > Última actualización: 2026-03-15
 
 ---
@@ -308,11 +308,11 @@
 | Foundation | 0-2 | 15 | 725 | 600 | 1,325 |
 | Core | 3-6 | 20 | 1,400 | 400 | 1,800 |
 | Intermediate | 7-10 | 20 | 1,600 | 500 | 2,100 |
-| Advanced | 11-14 | 20 | 1,600 | 500 | 2,100 |
+| Advanced | 11-14 | 20 | 1,700 | 500 | 2,200 |
 | Expert | 15-17 | 15 | 1,475 | 600 | 2,075 |
 | Specialist | 18-20 | 15 | 1,375 | 500 | 1,875 |
 | Production | 21-22 | 10 | 1,000 | 600 | 1,600 |
-| **TOTAL** | **23** | **115** | **9,175** | **3,700** | **12,875** |
+| **TOTAL** | **23** | **115** | **9,275** | **3,700** | **12,975** |
 
 ## Learning Paths Recomendados
 

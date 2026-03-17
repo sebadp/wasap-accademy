@@ -198,7 +198,7 @@ make dev
 
 ```makefile
 # Makefile
-.PHONY: lint format typecheck test check
+.PHONY: lint format format-check typecheck test check
 
 lint:
 	ruff check .
@@ -206,13 +206,16 @@ lint:
 format:
 	ruff format .
 
+format-check:
+	ruff format --check .
+
 typecheck:
 	mypy app/
 
 test:
 	.venv/bin/python -m pytest tests/ -v
 
-check: lint typecheck test
+check: lint format-check typecheck test
 	@echo "All checks passed!"
 ```
 

@@ -162,7 +162,7 @@ async def get_recent_self_corrections(self, hours: int = 2) -> list[Memory]:
     return [Memory(id=r[0], content=r[1], category=r[2], active=bool(r[3]), created_at=r[4]) for r in rows]
 ```
 
-Estas memorias se inyectan en el contexto para evitar que el LLM repita el mismo error, pero expiran automaticamente despues de 24 horas.
+Estas memorias se inyectan en el contexto para evitar que el LLM repita el mismo error, pero expiran automaticamente despues de 2 horas.
 
 <Quiz
   question="Que tipo de estructura es conversation_state?"

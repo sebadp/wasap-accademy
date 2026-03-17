@@ -14,7 +14,7 @@ Un LLM tardaría ~500ms por llamada y consumiría tokens del presupuesto. Los re
 
 ## Arquitectura de Patrones
 
-El extractor define pares de `(fact_key, compiled_pattern)` donde cada pattern tiene exactamente un capture group:
+El extractor define pares de `(fact_key, compiled_pattern)` donde cada pattern tiene un capture group para el valor extraído (excepto los boolean facts que solo detectan presencia):
 
 ```python
 # app/context/fact_extractor.py

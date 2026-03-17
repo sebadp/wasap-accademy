@@ -187,6 +187,9 @@ def _clean_old_tool_results(messages, keep_last=3):
             tool_result_groups.append(current_group)
             current_group = []
 
+    if current_group:
+        tool_result_groups.append(current_group)
+
     # Borrar todos excepto los últimos `keep_last` grupos
     to_remove = tool_result_groups[:-keep_last] if len(tool_result_groups) > keep_last else []
     for group in reversed(to_remove):

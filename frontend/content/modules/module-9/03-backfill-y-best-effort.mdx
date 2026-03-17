@@ -123,11 +123,11 @@ async def backfill_embeddings(
             embeddings = await ollama_client.embed(list(texts), model=model)
             for mem_id, emb in zip(ids, embeddings, strict=False):
                 await repository.save_embedding(mem_id, emb, auto_commit=False)
-                count += 1
             # Single commit per batch instead of per-row
             await repository.commit()
+            count += len(ids)
         except Exception:
-            logger.warning("Failed to backfill batch %d-%d", i, i + len(batch))
+            logger.warning("Failed to backfill batch %d-%d", i, i + len(batch), exc_info=True)
 
     if count:
         logger.info("Backfilled %d memory embeddings", count)

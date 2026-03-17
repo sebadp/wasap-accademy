@@ -184,7 +184,10 @@ async def backfill_embeddings(
     count = 0
     for i in range(0, len(unembedded), BATCH_SIZE):
         batch = unembedded[i : i + BATCH_SIZE]
-        ids, texts = zip(*[(mid, c[:_MAX_EMBED_CHARS]) for mid, c in batch if c])
+        filtered = [(mid, c[:_MAX_EMBED_CHARS]) for mid, c in batch if c]
+        if not filtered:
+            continue
+        ids, texts = zip(*filtered)
         try:
             embeddings = await ollama_client.embed(list(texts), model=model)
             for mem_id, emb in zip(ids, embeddings):

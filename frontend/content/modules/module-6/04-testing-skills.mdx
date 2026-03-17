@@ -203,8 +203,8 @@ async def test_executor_multi_iteration(mock_ollama, registry):
     mock_ollama.chat_with_tools.side_effect = [
         ChatResponse(
             content=None,
-            tool_calls=[{"function": {"name": "calculate",
-                         "arguments": {"expression": "2+2"}}}],
+            tool_calls=[ToolCall(name="calculate",
+                                 arguments={"expression": "2+2"})],
         ),
         ChatResponse(
             content="2 + 2 = 4",

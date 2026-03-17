@@ -129,10 +129,9 @@ async def test_index_usage(db_conn):
 Un covering index incluye todas las columnas que la query necesita, evitando acceder a la tabla:
 
 ```sql
--- Covering index: conversation_id + created_at + content en el index
+-- Covering index: todas las columnas en el index
 CREATE INDEX IF NOT EXISTS idx_messages_covering
-    ON messages(conversation_id, created_at DESC)
-    INCLUDE (role, content);
+    ON messages(conversation_id, created_at DESC, role, content);
 
 -- Con este index, la query:
 -- SELECT role, content FROM messages
@@ -141,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_covering
 ```
 
 <Concept title="Covering index">
-Un index normal tiene las columnas indexadas + un puntero a la fila. Un covering index incluye columnas extra (INCLUDE). Si la query solo necesita columnas del index, SQLite no necesita hacer el "table lookup". Es significativamente más rápido para queries frecuentes.
+Un index normal tiene las columnas indexadas + un puntero a la fila. En SQLite, un covering index incluye todas las columnas directamente en la definición del index (no existe INCLUDE como en PostgreSQL). Si la query solo necesita columnas del index, SQLite no necesita hacer el "table lookup". Es significativamente más rápido para queries frecuentes.
 </Concept>
 
 ## synchronous=NORMAL vs FULL

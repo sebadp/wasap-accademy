@@ -63,6 +63,7 @@ Veamos que hace cada PRAGMA:
 | `temp_store=MEMORY` | Temp tables en RAM | ORDER BY y JOINs mas rapidos |
 | `mmap_size=30000000` | Memory-mapped I/O | Bypass del page cache del OS |
 | `busy_timeout=5000` | Retry automatico | Evita errores "database is locked" |
+| `foreign_keys=ON` | Activar foreign keys | Garantiza integridad referencial entre tablas |
 
 <Concept title="WAL Mode">
 Sin WAL, SQLite usa un journal que bloquea toda la base de datos durante una escritura. Con WAL, las escrituras van a un archivo separado mientras los lectores siguen leyendo la version anterior. Es **critico** para una app async donde multiples coroutines acceden a la DB simultaneamente.

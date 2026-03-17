@@ -69,7 +69,8 @@ def extract_entities(text: str) -> list[tuple[str, str]]:
     entities = []
     for entity_type, patterns in PATTERNS.items():
         for pattern in patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
+            flags = re.IGNORECASE if entity_type != "person" else 0
+            for match in re.finditer(pattern, text, flags):
                 name = match.group(1).strip()
                 if len(name) > 2:  # Filtrar matches muy cortos
                     entities.append((name, entity_type))

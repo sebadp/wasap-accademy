@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_active
 ```
 
 <Concept title="Soft delete con active flag">
-Las memorias nunca se borran fisicamente. Se marcan como `active=0`. Esto permite auditoria, recovery, y es la base del sistema de provenance que rastrea quién creó o modificó cada memoria y por qué.
+Las memorias nunca se borran físicamente. Se marcan como `active=0`. Esto permite auditoría, recovery, y es la base del sistema de provenance que rastrea quién creó o modificó cada memoria y por qué.
 </Concept>
 
 El campo `category` permite clasificar memorias. Por ejemplo, `self_correction` se usa para memorias que el LLM genera cuando se autocorrige. Estas se excluyen del archivo MEMORY.md (como veremos en la leccion 02) pero se inyectan al contexto:
@@ -49,7 +49,7 @@ for m in memories:
 
 ## Comandos del Usuario
 
-El usuario interactua con memorias via comandos de chat:
+El usuario interactúa con memorias vía comandos de chat:
 
 | Comando | Acción | Ejemplo |
 |---------|--------|---------|
@@ -64,6 +64,8 @@ Cuando el usuario ejecuta `/remember`, el sistema hace tres cosas: guardar en SQ
 
 ```python
 async def cmd_remember(ctx: CommandContext, args: str) -> str:
+    # Note: the schema has phone_number NOT NULL, but the current codebase
+    # stores memories globally (phone_number is set internally by the repository).
     memory_id = await ctx.repository.add_memory(args)
 
     # Auto-indexar embedding para búsqueda semántica

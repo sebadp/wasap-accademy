@@ -108,7 +108,7 @@ Después de la synthesis, el resultado se guarda en el historial de conversació
 await repository.save_message(
     conv_id=conv_id,
     role="assistant",
-    content=f"[Sesión agéntica completada]\n{final_summary[:500]}",
+    content=f"[Sesión agéntica completada]\n{final_summary[:3000]}",
 )
 ```
 

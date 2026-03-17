@@ -16,6 +16,8 @@ Python tiene `contextvars.ContextVar` — variables que son automáticamente pro
 
 ```python
 # app/tracing/context.py
+from __future__ import annotations
+
 import contextvars
 from contextlib import asynccontextmanager
 

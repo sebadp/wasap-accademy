@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
 ```
 
 <Callout variant="warning" title="return_exceptions=True">
-Sin `return_exceptions=True`, si un task lanza una excepción, `gather` la propaga y cancela los demás. Con `return_exceptions=True`, todas las excepciones se capturan silenciosamente. En shutdown, queremos que todos los tasks terminen sin importar si algunos fallaron.
+Sin `return_exceptions=True`, si un task lanza una excepción, `gather` la propaga al caller — pero **no cancela los demás tasks**. Estos siguen corriendo en background como tasks huérfanos. Con `return_exceptions=True`, `gather` espera a que **todos** terminen y captura las excepciones como valores. En shutdown, queremos que todos los tasks terminen sin importar si algunos fallaron.
 </Callout>
 
 ## Model Warmup at Startup

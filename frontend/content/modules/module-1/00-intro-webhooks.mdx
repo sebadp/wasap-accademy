@@ -171,7 +171,7 @@ localhost:8000 --> ngrok tunnel --> https://tu-dominio.ngrok-free.app
 # En docker-compose.yml:
 ngrok:
   image: ngrok/ngrok
-  command: http --url=${NGROK_DOMAIN} --log=stdout http://localhost:8000
+  command: http --url=${NGROK_DOMAIN} --log=stdout http://app:8000
 ```
 
 <Callout variant="info" title="Dominio estático de ngrok">

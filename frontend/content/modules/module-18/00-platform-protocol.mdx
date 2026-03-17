@@ -59,7 +59,9 @@ class PlatformClient(Protocol):
 
 ```python
 # app/platforms/models.py
+from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 class Platform(StrEnum):
     WHATSAPP = "whatsapp"

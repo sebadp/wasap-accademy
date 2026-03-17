@@ -125,7 +125,7 @@ Los traces ocupan espacio. `trace_retention_days` limpia traces viejos:
 # app/main.py (scheduler job)
 async def cleanup_old_traces(repository: Repository, settings: Settings):
     """Borrar traces más viejos que retention_days."""
-    cutoff = datetime.utcnow() - timedelta(days=settings.trace_retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.trace_retention_days)
     deleted = await repository.delete_traces_before(cutoff)
     if deleted:
         logger.info("Cleaned up %d old traces", deleted)

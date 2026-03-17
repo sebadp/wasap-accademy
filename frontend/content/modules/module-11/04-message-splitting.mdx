@@ -125,12 +125,20 @@ Párrafo 2... (3000 chars)\n\n
 Párrafo 3... (3500 chars)
 ```
 
-Resultado:
+Resultado con `max_length=4096`:
 
 ```
-Chunk 1: "Párrafo 1... Párrafo 2..."  (5000 chars → corta en \n\n)
-         ↑ rfind("\n\n") en posición ~5000
-Chunk 2: "Párrafo 3..."               (3500 chars → cabe completo)
+Iteración 1: segment = text[:4096] → contiene P1 + inicio de P2
+             rfind("\n\n") encuentra el \n\n en posición ~2000
+Chunk 1: "Párrafo 1..."              (2000 chars)
+
+Iteración 2: texto restante = P2 + P3 (6500 chars)
+             segment = text[:4096] → contiene P2 + inicio de P3
+             rfind("\n\n") encuentra el \n\n en posición ~3000
+Chunk 2: "Párrafo 2..."              (3000 chars)
+
+Iteración 3: texto restante = P3 (3500 chars) ≤ 4096
+Chunk 3: "Párrafo 3..."              (3500 chars → cabe completo)
 ```
 
 ## Uso en el Pipeline

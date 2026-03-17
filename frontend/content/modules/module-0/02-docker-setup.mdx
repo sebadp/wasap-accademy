@@ -75,9 +75,12 @@ El Dockerfile de LocalForge sigue buenas prácticas de seguridad:
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \        # Para faster-whisper (transcripción de audio)
-    curl \          # Para healthchecks
-    nodejs npm \    # Para MCP servers (server-puppeteer, etc.)
+    # Para faster-whisper (transcripción de audio)
+    ffmpeg \
+    # Para healthchecks
+    curl \
+    # Para MCP servers (server-puppeteer, etc.)
+    nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

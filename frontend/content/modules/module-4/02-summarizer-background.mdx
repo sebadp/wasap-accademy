@@ -120,6 +120,7 @@ prompt_parts.append("\nConversation to summarize:")
 for msg in old_messages:
     prompt_parts.append(f"{msg.role}: {msg.content}")
 
+messages = [ChatMessage(role="user", content="\n".join(prompt_parts))]
 summary = await ollama_client.chat(messages, think=False)
 ```
 

@@ -1,18 +1,18 @@
 ---
 title: "Schema Design"
-description: "13 grupos de tablas que sostienen memoria, conversaciones, trazas y mas"
+description: "10 grupos de tablas que sostienen memoria, conversaciones, trazas y mas"
 xpReward: 75
 ---
 
 ## La Arquitectura de Datos de LocalForge
 
-LocalForge usa **mas de 50 tablas** organizadas en 13 grupos logicos. Cada grupo encapsula un subsistema del asistente. Todo el schema vive en `app/database/db.py` como strings SQL constantes.
+LocalForge usa **mas de 50 tablas** organizadas en 10 grupos logicos. Cada grupo encapsula un subsistema del asistente. Todo el schema vive en `app/database/db.py` como strings SQL constantes.
 
 <Callout variant="info" title="Idempotencia">
 Todas las tablas se crean con `CREATE TABLE IF NOT EXISTS`. Podes ejecutar `init_db()` multiples veces sin romper nada. Esto es fundamental para updates sin downtime.
 </Callout>
 
-## Los 13 Grupos de Schema
+## Los 10 Grupos de Schema
 
 <FileTree>
   database/

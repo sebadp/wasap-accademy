@@ -189,12 +189,12 @@ Con asyncio.gather (paralelo):
 ```
 
 <Quiz
-  question="Que hace return_exceptions=True en asyncio.gather (que usa el SkillRegistry)?"
+  question="Que pasa si un tool call falla durante asyncio.gather y no se usa return_exceptions=True?"
   options={[
-    "Ignora todas las excepciones silenciosamente",
-    "Retorna las excepciones como valores en vez de propagarlas, para que un error no cancele los demas",
-    "Lanza todas las excepciones juntas al final",
-    "Reintenta las tareas que fallaron automaticamente"
+    "Los demas tool calls se completan normalmente y el error se ignora",
+    "La excepcion se propaga inmediatamente y cancela los demas tool calls pendientes",
+    "asyncio.gather reintenta el tool call fallido automaticamente",
+    "Se retorna None en lugar del resultado fallido"
   ]}
   correct={1}
 />

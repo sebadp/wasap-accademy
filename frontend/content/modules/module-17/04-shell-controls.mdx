@@ -61,7 +61,7 @@ _SHELL_DENYLIST_PATTERNS = [
     r".*eval\s.*",    # eval command
     r".*exec\s.*",    # exec command
     r".*sudo\s.*",    # sudo
-    r".*chmod\s+[0-7]*7.*",  # World-writable permissions
+    r".*chmod\s+[0-7]{2}7.*",  # World-writable permissions
 ]
 
 def _matches_denylist(command: str) -> tuple[bool, str]:

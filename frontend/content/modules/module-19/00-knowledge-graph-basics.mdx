@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS entity_relations (
 ```
 
 <Callout variant="info" title="UNIQUE constraint">
-`UNIQUE(name, type)` en entities evita duplicados: puede haber un topic "Python" y un tool "Python", pero no dos topics "Python". En relations, `UNIQUE(source, target, relation_type)` previene aristas duplicadas.
+`UNIQUE(name, type)` en entities evita duplicados: puede haber un topic "Python" y un tool "Python", pero no dos topics "Python". En relations, `UNIQUE(source_id, target_id, relation_type)` previene aristas duplicadas.
 </Callout>
 
 ## Tipos de Entidades
@@ -87,7 +87,7 @@ Para enriquecer el contexto del LLM, LocalForge hace **BFS (Breadth-First Search
 
 ```python
 # Pseudocódigo del traversal
-async def traverse_graph(start_entity_id: int, max_hops: int = 2):
+async def traverse_graph(start_entity_id: int, registry: EntityRegistry, max_hops: int = 2):
     visited = set()
     queue = [(start_entity_id, 0)]  # (entity_id, depth)
     context_parts = []

@@ -86,8 +86,13 @@ Cada instrucción en el Dockerfile crea una capa. Docker cachea capas de arriba 
 Para reducir el tamaño de la imagen final:
 
 ```dockerfile
-# Stage 1: Build
+# Stage 1: Build (incluye herramientas de compilación)
 FROM python:3.11-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential libsqlite3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY requirements.txt .

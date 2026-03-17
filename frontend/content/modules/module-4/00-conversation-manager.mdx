@@ -140,6 +140,8 @@ async def get_context(
         self._repo.get_recent_messages(conv_id, self._max_messages),
     )
 
+    # Note: skills_summary, daily_logs, and relevant_notes are used by
+    # _build_context() in router.py for the optimized hot path, not shown here.
     context = [ChatMessage(role="system", content=system_prompt)]
     if memories:
         memory_block = "Important user information:\n" + "\n".join(f"- {m}" for m in memories)

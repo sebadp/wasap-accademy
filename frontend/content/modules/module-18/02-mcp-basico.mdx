@@ -194,23 +194,23 @@ async def _load_tools(self, server_name: str, session):
 <Quiz
   question="¿Cuál es el bug de 'closure over loop variable' que la factory previene?"
   options={[
+    "Stack overflow",
     "Memory leak",
     "Todas las lambdas en un loop capturan la misma variable (la última), no el valor de cada iteración",
-    "Stack overflow",
     "Type error"
   ]}
-  correct={1}
+  correct={2}
 />
 
 <Quiz
   question="¿Cuántos segundos tiene una tool MCP para responder antes de timeout?"
   options={[
-    "10 segundos",
-    "30 segundos",
     "60 segundos",
-    "Sin límite"
+    "10 segundos",
+    "Sin límite",
+    "30 segundos"
   ]}
-  correct={1}
+  correct={3}
 />
 
 En la siguiente lección veremos hot-reload de servidores MCP.

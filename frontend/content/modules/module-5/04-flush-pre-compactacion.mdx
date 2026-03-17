@@ -96,7 +96,7 @@ async def flush_to_memory(
     else:
         memories_text = "(none)"
 
-    prompt = flush_template.format(
+    prompt = FLUSH_PROMPT.format(
         existing_memories=memories_text,
         conversation=conversation_text,
     )

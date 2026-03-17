@@ -272,10 +272,10 @@ async def activate_with_eval(
 [activate_with_eval() corre eval con dataset existente]
      ↓
 [Score >= 70%?]
-  ├─ YES → activate_prompt_version() + invalidate_cache()
-  └─ NO → activar de todas formas (advisory, no blocking)
+  ├─ YES → Resultado guardado, humano decide activar
+  └─ NO → Resultado guardado, requiere revisión manual
      ↓
-[Sync a Langfuse con label "production"]
+[Humano ejecuta /approve-prompt → activate + invalidate_cache + sync Langfuse]
 ```
 
 <Quiz

@@ -141,7 +141,7 @@ La magia de `add_section` está en la primera línea: si `content` es falsy (Non
 
 ```python
 def add_section(self, tag: str, content: str | None) -> ContextBuilder:
-    if content:  # Skip si None, "", o solo whitespace
+    if content:  # Skip si None o vacío
         self._sections.append((tag, content))
     return self
 ```

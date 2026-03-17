@@ -141,7 +141,7 @@ Las tareas están en un diccionario `TASK_REGISTRY` para evitar ejecución arbit
 La acción más simple: solo registra en logs, sin efecto externo:
 
 ```python
-def _action_log(config: dict) -> None:
+async def _action_log(config: dict, **clients) -> None:
     """
     config = {
         "level": "warning",
@@ -164,7 +164,7 @@ def _action_log(config: dict) -> None:
 Cada regla tiene un `cooldown_minutes` que previene ejecución repetida:
 
 ```python
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 def _cooldown_expired(rule: AutomationRule) -> bool:
     """Verificar si pasó suficiente tiempo desde la última ejecución."""
@@ -173,7 +173,7 @@ def _cooldown_expired(rule: AutomationRule) -> bool:
 
     last = datetime.fromisoformat(rule.last_triggered_at)
     cooldown = timedelta(minutes=rule.cooldown_minutes)
-    return datetime.utcnow() > last + cooldown
+    return datetime.now(timezone.utc) > last + cooldown
 ```
 
 | Acción | Cooldown típico | Razón |

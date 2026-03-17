@@ -38,7 +38,7 @@ def check_excessive_length(
     return GuardrailResult(
         check_name="excessive_length",
         passed=passed,
-        message=f"Response too long: {len(response)} chars (max {max_chars})",
+        message="" if passed else f"Response too long: {len(response)} chars (max {max_chars})",
     )
 ```
 

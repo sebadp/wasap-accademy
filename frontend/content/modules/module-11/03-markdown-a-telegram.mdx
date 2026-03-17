@@ -51,6 +51,7 @@ def markdown_to_telegram_html(text: str) -> str:
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
 
     # ── Fase 3: Convertir markdown → HTML tags ──
