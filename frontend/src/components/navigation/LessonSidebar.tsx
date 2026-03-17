@@ -32,6 +32,13 @@ export function LessonSidebar({ moduleId, lessons, currentLessonId, completedLes
                   ? "text-muted-foreground/50 cursor-not-allowed"
                   : "text-muted-foreground hover:bg-secondary hover:text-foreground"
               }`}
+              {...(isLocked
+                ? {
+                    title: `Completa "${lessons[i - 1].title}" para desbloquear`,
+                    "aria-disabled": "true" as const,
+                    tabIndex: -1,
+                  }
+                : {})}
             >
               {isCompleted ? (
                 <CheckCircle className="h-4 w-4 flex-shrink-0 text-success" />

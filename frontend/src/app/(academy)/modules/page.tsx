@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { getModuleList } from "@/lib/content/loader";
 import { BookOpen, Lock, Zap } from "lucide-react";
+import { ContinueCard } from "@/components/gamification/ContinueCard";
 
 const TIER_COLORS: Record<string, string> = {
   Foundation:   "text-emerald-400 border-emerald-400/30 bg-emerald-400/10",
@@ -15,6 +16,14 @@ const TIER_COLORS: Record<string, string> = {
 export default function ModulesPage() {
   const modules = getModuleList();
 
+  // Serialize module info for the client component
+  const moduleInfoForClient = modules.map((mod) => ({
+    id: mod.id,
+    title: mod.title,
+    tier: mod.tier,
+    lessons: mod.lessons.map((l) => ({ lessonId: l.lessonId })),
+  }));
+
   return (
     <div className="mx-auto max-w-3xl">
       <div className="mb-8">
@@ -23,6 +32,8 @@ export default function ModulesPage() {
           {modules.length} modulos disponibles
         </p>
       </div>
+
+      <ContinueCard modules={moduleInfoForClient} />
 
       <div className="space-y-4">
         {modules.map((mod, i) => {

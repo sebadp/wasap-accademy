@@ -17,10 +17,10 @@ export function Quiz({ question, options = [], correct }: Props) {
   return (
     <div className="my-6 rounded-xl border border-border bg-card p-6">
       <p className="font-semibold text-foreground mb-4">{question}</p>
-      <div className="space-y-2">
+      <div className="space-y-2" role="radiogroup" aria-label={question}>
         {options.map((label, i) => {
           let classes =
-            "flex items-center gap-3 rounded-lg border px-4 py-3 text-sm transition-colors ";
+            "flex items-center gap-3 rounded-lg border px-4 py-3 min-h-[44px] text-sm transition-colors ";
           if (!answered) {
             classes += "border-border cursor-pointer hover:border-primary/50 hover:bg-secondary";
           } else if (i === selected) {
@@ -39,6 +39,8 @@ export function Quiz({ question, options = [], correct }: Props) {
               className={classes}
               disabled={answered}
               onClick={() => setSelected(i)}
+              role="radio"
+              aria-checked={selected === i}
             >
               <span className="flex-1 text-left">{label}</span>
               {answered && i === selected &&

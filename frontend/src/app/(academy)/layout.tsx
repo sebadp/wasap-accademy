@@ -12,7 +12,7 @@ export default function AcademyLayout({
       <Navbar />
       <XPBarClient />
       <Sidebar />
-      <main className="ml-56 min-h-[calc(100vh-6rem)] p-6">
+      <main className="ml-0 min-h-[calc(100vh-6rem)] p-4 md:ml-56 md:p-6">
         {children}
       </main>
     </div>

@@ -1,15 +1,40 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { useXP } from "@/hooks/useXP";
 import { useStreak } from "@/hooks/useStreak";
 import { useBadges } from "@/hooks/useBadges";
 import { BadgeGrid } from "@/components/gamification/BadgeGrid";
 import { StreakCalendar } from "@/components/gamification/StreakCalendar";
+import { createClient } from "@/lib/supabase/client";
 
 export default function ProfilePage() {
   const { data: xp, loading: xpLoading } = useXP();
   const { data: streak, loading: streakLoading } = useStreak();
   const { data: badges, loading: badgesLoading } = useBadges();
+
+  const [userInitials, setUserInitials] = useState("?");
+
+  useEffect(() => {
+    const supabase = createClient();
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) {
+        const name =
+          user.user_metadata?.display_name ||
+          user.user_metadata?.username ||
+          user.email ||
+          "";
+        const initials = name
+          .split(/[\s@]/)
+          .filter(Boolean)
+          .map((w: string) => w[0])
+          .join("")
+          .toUpperCase()
+          .slice(0, 2);
+        setUserInitials(initials || "?");
+      }
+    });
+  }, []);
 
   const loading = xpLoading || streakLoading || badgesLoading;
 
@@ -26,7 +51,7 @@ export default function ProfilePage() {
       {/* Header */}
       <div className="flex items-center gap-4">
         <div className="flex h-16 w-16 items-center justify-center rounded-full bg-primary/20 text-2xl font-bold text-primary">
-          ?
+          {userInitials}
         </div>
         <div>
           <h1 className="text-xl font-bold text-foreground">Mi Perfil</h1>
@@ -45,12 +70,12 @@ export default function ProfilePage() {
           <StatCard label="Nivel" value={String(xp.current_level)} color="text-primary" />
           <StatCard
             label="Racha actual"
-            value={streak ? `${streak.current_streak} días` : "—"}
+            value={streak ? `${streak.current_streak} dias` : "\u2014"}
             color="text-orange-400"
           />
           <StatCard
-            label="Racha máxima"
-            value={streak ? `${streak.longest_streak} días` : "—"}
+            label="Racha maxima"
+            value={streak ? `${streak.longest_streak} dias` : "\u2014"}
             color="text-emerald-400"
           />
         </div>
@@ -62,14 +87,14 @@ export default function ProfilePage() {
         {badges.length > 0 ? (
           <BadgeGrid badges={badges} />
         ) : (
-          <p className="text-sm text-muted-foreground">Aún no obtuviste badges. ¡Completá challenges!</p>
+          <p className="text-sm text-muted-foreground">Aun no obtuviste badges. Completa challenges!</p>
         )}
       </section>
 
       {/* Streak calendar */}
       {streak && streak.calendar.length > 0 && (
         <section className="space-y-3">
-          <h2 className="text-sm font-semibold text-foreground">Actividad (últimos 30 días)</h2>
+          <h2 className="text-sm font-semibold text-foreground">Actividad (ultimos 30 dias)</h2>
           <StreakCalendar calendar={streak.calendar} />
         </section>
       )}
