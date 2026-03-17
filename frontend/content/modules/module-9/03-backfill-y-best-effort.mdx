@@ -125,7 +125,7 @@ async def backfill_embeddings(
                 await repository.save_embedding(mem_id, emb, auto_commit=False)
             # Single commit per batch instead of per-row
             await repository.commit()
-            count += len(ids)
+            count += min(len(ids), len(embeddings))
         except Exception:
             logger.warning("Failed to backfill batch %d-%d", i, i + len(batch), exc_info=True)
 

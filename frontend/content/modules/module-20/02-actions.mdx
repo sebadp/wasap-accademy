@@ -172,6 +172,8 @@ def _cooldown_expired(rule: AutomationRule) -> bool:
         return True  # Nunca se ejecutó
 
     last = datetime.fromisoformat(rule.last_triggered_at)
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
     cooldown = timedelta(minutes=rule.cooldown_minutes)
     return datetime.now(timezone.utc) > last + cooldown
 ```

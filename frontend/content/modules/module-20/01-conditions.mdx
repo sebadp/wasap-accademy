@@ -58,7 +58,7 @@ def _compare(value: float, operator: str, threshold: float) -> bool:
 ```
 
 <Callout variant="error" title="Solo SELECT">
-Las queries de automatización SOLO pueden ser SELECT. El check `startswith("SELECT")` bloquea cualquier intento de INSERT, UPDATE, DELETE o DROP. Es una primera línea de defensa. En producción, complementar con roles read-only en la DB o prepared statements para protección robusta contra inyecciones como `SELECT 1; DROP TABLE`.
+Las queries de automatización SOLO pueden ser SELECT. El check `startswith("SELECT")` bloquea cualquier intento de INSERT, UPDATE, DELETE o DROP. Es una primera línea de defensa. En producción, complementar con roles read-only en la DB y deshabilitar ejecución multi-statement (SQLite `execute()` ya lo hace por defecto) para protección robusta contra inyecciones como `SELECT 1; DROP TABLE`.
 </Callout>
 
 ### Ejemplo de query condition

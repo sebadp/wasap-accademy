@@ -91,7 +91,7 @@ async def chat_with_tools(
     if tools:
         # think: True es incompatible con tools en qwen3
         payload["tools"] = tools
-        payload["options"] = {"think": False}
+        payload["think"] = False
     elif think is False:
         payload["think"] = False
     elif model is None:

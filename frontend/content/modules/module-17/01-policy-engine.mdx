@@ -141,7 +141,7 @@ class PolicyEngine:
 ```
 
 <Concept title="re.fullmatch, no re.search">
-La diferencia es crítica: `re.search(r"^ls", "ls && rm -rf /")` matchea (encuentra "ls" al inicio). Pero incluso con `re.fullmatch`, un patrón con `.*` como `^ls\\s.*` matchearía `"ls && rm -rf /"` porque `.*` acepta `&`, `;` y `|`. Para seguridad, SIEMPRE usar character classes restrictivas: `^ls\\s[^;&|]+$` — esto rechaza cualquier metacaracter de shell.
+La diferencia es crítica: `re.search(r"^ls", "ls && rm -rf /")` matchea (encuentra "ls" al inicio). Pero incluso con `re.fullmatch`, un patrón con `.*` como `^ls\\s.*` matchearía `"ls && rm -rf /"` porque `.*` acepta cualquier carácter. Para seguridad, SIEMPRE usar un allowlist de caracteres seguros: `^ls\\s[a-zA-Z0-9_./ -]+$` — esto solo permite caracteres explícitamente seguros y rechaza metacaracteres de shell como `;`, `&`, `|`, `` ` ``, `>`, `<`, `(`, `)`, `$`, etc.
 </Concept>
 
 ## Orden de Evaluación
