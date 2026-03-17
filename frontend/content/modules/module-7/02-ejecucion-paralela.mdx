@@ -192,7 +192,7 @@ Con asyncio.gather (paralelo):
   question="Que pasa si un tool call falla durante asyncio.gather y no se usa return_exceptions=True?"
   options={[
     "Los demas tool calls se completan normalmente y el error se ignora",
-    "La excepcion se propaga inmediatamente y cancela los demas tool calls pendientes",
+    "La excepcion se propaga inmediatamente, pero los demas tool calls siguen ejecutandose en segundo plano (no se cancelan automaticamente)",
     "asyncio.gather reintenta el tool call fallido automaticamente",
     "Se retorna None en lugar del resultado fallido"
   ]}

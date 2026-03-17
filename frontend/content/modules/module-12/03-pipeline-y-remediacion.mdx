@@ -121,7 +121,7 @@ El LLM que remedia puede no conocer el código de idioma "es". El prompt incluye
 Cada remediación se registra como un span en Langfuse:
 
 ```python
-async def _run_with_guardrails(response, context, trace_ctx):
+async def _run_with_guardrails(response, context, trace_ctx, ollama_client):
     report = await run_guardrails(response, context)
 
     if not report.all_passed:

@@ -53,11 +53,11 @@ async def traverse(
             if neighbor_id in visited:
                 continue
 
+            visited.add(neighbor_id)
+
             hop_count += 1
             if hop_count > max_per_hop:
                 break  # Cap por hop
-
-            visited.add(neighbor_id)
 
             entity = await registry.get_entity(neighbor_id)
             results.append({

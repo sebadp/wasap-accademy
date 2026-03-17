@@ -209,7 +209,7 @@ create_task()
   question="¿Por qué graceful_shutdown usa return_exceptions=True en asyncio.gather?"
   options={[
     "Para que los tasks se ejecuten más rápido",
-    "Para que si un task lanza una excepción, los demás sigan ejecutándose en vez de cancelarse",
+    "Para que gather espere a que todos los tasks terminen y retorne las excepciones como valores, en vez de propagarlas al caller apenas ocurre la primera",
     "Porque es un requisito de FastAPI",
     "Para loguear las excepciones automáticamente"
   ]}

@@ -89,7 +89,7 @@ def log_context_budget(
     model: str = "default",
 ) -> int:
     """Log estimated token usage and warn if nearing or exceeding limit."""
-    estimate = sum(estimate_tokens(m.content, model) for m in messages)
+    estimate = sum(estimate_tokens(m.content or "", model) for m in messages)
 
     if estimate > context_limit:
         logger.error("context.budget.exceeded: %d estimated tokens (limit=%d)",
