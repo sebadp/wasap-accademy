@@ -17,7 +17,7 @@ export default function Sidebar() {
   const { data: streak } = useStreak();
 
   return (
-    <aside className="fixed left-0 top-24 z-20 flex h-[calc(100vh-6rem)] w-56 flex-col border-r border-border bg-card">
+    <aside className="fixed left-0 top-24 z-20 hidden h-[calc(100vh-6rem)] w-56 flex-col border-r border-border bg-card md:flex">
       <nav className="flex-1 space-y-1 p-3">
         {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + "/");
@@ -25,7 +25,7 @@ export default function Sidebar() {
             <Link
               key={href}
               href={href}
-              className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+              className={`flex min-h-[44px] items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
                 active
                   ? "bg-primary/10 text-primary"
                   : "text-muted-foreground hover:bg-secondary hover:text-foreground"
@@ -44,6 +44,11 @@ export default function Sidebar() {
             <Flame className="h-3.5 w-3.5" />
             <span className="font-semibold">{streak.current_streak} días</span>
             <span className="text-muted-foreground">de racha</span>
+            {streak.freeze_tokens > 0 && (
+              <span className="ml-auto flex items-center gap-1 text-cyan-400" title="Freeze tokens: protegen tu racha">
+                <span aria-hidden="true">&#x1f6e1;&#xfe0f;</span> {streak.freeze_tokens}
+              </span>
+            )}
           </div>
         )}
         <div className="flex items-center gap-2 text-xs text-muted-foreground">

@@ -132,22 +132,22 @@ export function ChallengeRunner({ challengeId }: Props) {
       )}
 
       {/* Action bar */}
-      <div className="flex shrink-0 items-center gap-3 border-b border-border bg-zinc-900 px-4 py-2">
-        <span className="flex-1 text-sm font-semibold text-foreground">{challenge.title}</span>
+      <div className="sticky bottom-0 z-10 flex shrink-0 items-center gap-3 border-b border-border bg-zinc-900 px-4 py-2 md:static md:z-auto">
+        <span className="flex-1 truncate text-sm font-semibold text-foreground">{challenge.title}</span>
         <button
           onClick={handleRun}
           disabled={!canRun}
-          className="rounded-md bg-primary px-4 py-1.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+          className="min-h-[44px] rounded-md bg-primary px-4 py-2 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
         >
-          {running ? "Ejecutando..." : "▶ Ejecutar"}
+          {running ? "Ejecutando..." : "Ejecutar"}
         </button>
         {result?.passed && !submitResult && (
           <button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="rounded-md bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+            className="min-h-[44px] rounded-md bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
           >
-            {submitting ? "Enviando..." : "✓ Enviar solución"}
+            {submitting ? "Enviando..." : "Enviar solucion"}
           </button>
         )}
       </div>

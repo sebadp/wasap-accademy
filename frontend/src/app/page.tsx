@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Flame, Code, Zap, Trophy } from "lucide-react";
+import { ThemeToggle } from "@/components/navigation/ThemeToggle";
 
 const FEATURES = [
   {
@@ -28,7 +29,8 @@ export default function LandingPage() {
           <Flame className="h-7 w-7 text-primary" />
           <span className="text-xl font-bold">AgentCraft</span>
         </div>
-        <div className="flex gap-3">
+        <div className="flex items-center gap-3">
+          <ThemeToggle />
           <Link
             href="/login"
             className="rounded-lg px-4 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
