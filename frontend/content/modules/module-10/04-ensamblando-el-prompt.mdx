@@ -9,7 +9,7 @@ xpReward: 100
 `_build_context()` en `router.py` es la función que toma todos los datos recolectados por `ConversationContext.build()` y produce la lista de `ChatMessage` que se envía al LLM. Es **sincrónica** y no hace I/O -- solo formatea y ensambla strings.
 
 <Callout variant="info" title="Sin DB calls, sin await">
-`_build_context()` no hace ninguna query a la base de datos ni llamada a Ollama. Toda la I/O ya se completó en las fases anteriores. Esta función es puro string manipulation, lo que la hace predecible, testeable, y rápida (<1ms).
+`_build_context()` no hace ninguna query a la base de datos ni llamada a Ollama. Toda la I/O ya se completó en las fases anteriores. Esta función es puro string manipulation, lo que la hace predecible, testeable, y rápida (menos de 1ms).
 </Callout>
 
 ## _build_context(): El Código Completo
