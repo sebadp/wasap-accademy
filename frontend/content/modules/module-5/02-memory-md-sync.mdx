@@ -1,0 +1,243 @@
+---
+title: "MEMORY.md Bidireccional"
+description: "Sincronización de memorias entre SQLite y un archivo markdown editable"
+xpReward: 75
+---
+
+## La Idea: Un Archivo que Podés Editar
+
+LocalForge mantiene un archivo `data/MEMORY.md` que refleja las memorias de SQLite. Podés **editarlo manualmente** con cualquier editor de texto, y los cambios se sincronizan de vuelta a la base de datos.
+
+<Callout variant="tip" title="Bidireccional">
+SQLite -> MEMORY.md: cuando se agrega/borra una memoria via `/remember` o `/forget`. MEMORY.md -> SQLite: cuando editás el archivo manualmente. Ambos caminos están implementados.
+</Callout>
+
+## Sync SQLite -> Archivo: MemoryFile
+
+La clase `MemoryFile` en `app/memory/markdown.py` escribe el archivo cuando cambian las memorias:
+
+```python
+# app/memory/markdown.py
+class MemoryFile:
+    def __init__(self, path: str):
+        self._path = Path(path)
+        self._watcher: MemoryWatcher | None = None
+
+    def set_watcher(self, watcher: MemoryWatcher) -> None:
+        """Register the watcher so sync() can set the guard."""
+        self._watcher = watcher
+
+    async def sync(self, memories: list[Memory]) -> None:
+        import asyncio
+
+        if self._watcher:
+            self._watcher.set_sync_guard()
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lines = ["# Memories\n"]
+            for m in memories:
+                if m.category == "self_correction":
+                    continue  # No exportar autocorrecciones
+                if m.category:
+                    lines.append(f"- [{m.category}] {m.content}")
+                else:
+                    lines.append(f"- {m.content}")
+            content = "\n".join(lines) + "\n"
+            path = self._path
+            await asyncio.to_thread(path.write_text, content, "utf-8")
+        finally:
+            if self._watcher:
+                await asyncio.sleep(0.5)  # Delay para que watchdog ignore el evento
+                self._watcher.clear_sync_guard()
+```
+
+<Concept title="Filtro de self_correction">
+Las memorias con categoría `self_correction` se excluyen del archivo MEMORY.md. Son memorias internas que el LLM usa para autocorregirse, pero no son relevantes para el usuario que edita el archivo manualmente.
+</Concept>
+
+El archivo generado tiene este formato:
+
+```markdown
+# Memories
+
+- Es ingeniero de software senior
+- [preference] Prefiere respuestas en español
+- Trabaja en empresa fintech
+- Zona horaria: Buenos Aires (UTC-3)
+```
+
+## Sync Archivo -> SQLite: Watchdog
+
+`app/memory/watcher.py` usa la librería **watchdog** para detectar cambios en el filesystem en tiempo real:
+
+```python
+# app/memory/watcher.py
+MEMORY_LINE_RE = re.compile(r"^-\s+(?:\[([^\]]*)\]\s+)?(.+)$")
+
+def parse_memory_file(content: str) -> list[tuple[str, str | None]]:
+    """Parse MEMORY.md content into list of (content, category) tuples."""
+    results = []
+    for line in content.splitlines():
+        line = line.strip()
+        m = MEMORY_LINE_RE.match(line)
+        if m:
+            category = m.group(1) or None
+            memory_content = m.group(2).strip()
+            if memory_content:
+                results.append((memory_content, category))
+    return results
+```
+
+La regex `^-\s+(?:\[([^\]]*)\]\s+)?(.+)$` parsea líneas como:
+- `- Es desarrollador` -> `("Es desarrollador", None)`
+- `- [preference] Usa vim` -> `("Usa vim", "preference")`
+
+## El Handler de Filesystem
+
+```python
+class _MemoryFileHandler(FileSystemEventHandler):
+    def _is_target(self, event: FileSystemEvent) -> bool:
+        if event.is_directory:
+            return False
+        src_path = os.fsdecode(event.src_path)
+        target_name = Path(self._watcher._memory_file._path).name
+        return Path(src_path).name == target_name
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if self._is_target(event):
+            self._watcher._on_file_changed()
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        # Editors with atomic rename create a new file
+        if self._is_target(event):
+            self._watcher._on_file_changed()
+```
+
+<Callout variant="warning" title="on_created para editores atómicos">
+Vim, Emacs y otros editores no modifican el archivo directamente. Escriben uno nuevo y lo renombran (atomic rename). Por eso LocalForge escucha tanto `on_modified` como `on_created` -- sin esto, editar con vim no sincronizaría.
+</Callout>
+
+## La Sincronización: Diff de Conjuntos
+
+Cuando watchdog detecta un cambio, `_sync_from_file()` compara el archivo con la base de datos usando **set difference**:
+
+```python
+async def _sync_from_file(self) -> None:
+    content = path.read_text(encoding="utf-8")
+    file_memories = parse_memory_file(content)
+
+    all_db_memories = await self._repository.list_memories()
+    # Excluir self_correction para que no se sincronice
+    db_memories = [m for m in all_db_memories if m.category != "self_correction"]
+
+    # Build sets for comparison
+    file_set = {(c, cat) for c, cat in file_memories}
+    db_set = {(m.content, m.category) for m in db_memories}
+
+    # Memorias en archivo pero no en DB -> agregar
+    to_add = file_set - db_set
+    # Memorias en DB pero no en archivo -> desactivar
+    to_remove = db_set - file_set
+
+    for content_text, category in to_add:
+        await self._repository.add_memory(content_text, category)
+
+    for content_text, _category in to_remove:
+        await self._repository.remove_memory(content_text)
+```
+
+<Concept title="Set difference para sync bidireccional">
+Al comparar `file_set - db_set` obtenemos las memorias nuevas en el archivo. Con `db_set - file_set` obtenemos las que el usuario borró del archivo. No hay iteración compleja: es una operación de conjuntos.
+</Concept>
+
+## El Problema del Feedback Loop
+
+Sin el guard, se produce un loop infinito:
+
+```
+1. /remember "Soy developer"     -> SQLite INSERT
+2. sync_to_file()                -> escribe MEMORY.md
+3. Watchdog detecta cambio       -> dispara sync_from_file()
+4. sync_from_file()              -> lee MEMORY.md, re-inserta en SQLite
+5. Goto 2... loop infinito
+```
+
+Con el guard (`threading.Event`):
+
+```
+1. /remember "Soy developer"     -> SQLite INSERT
+2. watcher.set_sync_guard()      -> "yo estoy escribiendo"
+3. sync_to_file()                -> escribe MEMORY.md
+4. Watchdog detecta cambio       -> ve guard activo -> ignora
+5. await asyncio.sleep(0.5)      -> delay para que el evento pase
+6. watcher.clear_sync_guard()    -> listo
+```
+
+## El MemoryWatcher Completo
+
+```python
+class MemoryWatcher:
+    def __init__(self, memory_file, repository, loop):
+        self._memory_file = memory_file
+        self._repository = repository
+        self._loop = loop
+        self._observer: Observer | None = None
+        self._syncing = threading.Event()  # El guard
+
+    def start(self) -> None:
+        path = Path(self._memory_file._path)
+        handler = _MemoryFileHandler(self)
+        self._observer = Observer()
+        self._observer.daemon = True
+        self._observer.schedule(handler, str(path.parent), recursive=False)
+        self._observer.start()
+
+    def _on_file_changed(self) -> None:
+        """Called from watchdog thread when file changes."""
+        if self._syncing.is_set():
+            return  # Guard activo: ignorar
+
+        asyncio.run_coroutine_threadsafe(
+            self._sync_from_file(),
+            self._loop,  # Event loop de FastAPI
+        )
+```
+
+<Callout variant="info" title="Cross-thread communication">
+Watchdog corre en un thread separado. Para ejecutar código async desde ese thread, se usa `asyncio.run_coroutine_threadsafe()` que agenda la coroutine en el event loop de FastAPI. El `threading.Event` es thread-safe por diseño.
+</Callout>
+
+<Quiz
+  question="¿Qué previene el feedback loop entre sync_to_file y el watcher?"
+  options={[
+    "Un lock mutex que bloquea ambos threads",
+    "Un threading.Event que señala cuándo el writer está activo",
+    "Desactivar el watcher temporalmente y reiniciarlo",
+    "Un timer de cooldown de 5 segundos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el watcher escucha on_created además de on_modified?"
+  options={[
+    "Para detectar archivos nuevos en el directorio",
+    "Porque editores como vim usan atomic rename (escriben archivo nuevo + renombran)",
+    "Para detectar cuando se borra el archivo",
+    "Para soportar Windows que no tiene on_modified"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo determina _sync_from_file() qué memorias agregar y cuáles borrar?"
+  options={[
+    "Compara timestamps de cada memoria",
+    "Usa hashes MD5 de cada línea",
+    "Hace set difference entre el contenido del archivo y la base de datos",
+    "Borra todo y re-inserta desde el archivo"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo el consolidador limpia memorias duplicadas usando LLM.

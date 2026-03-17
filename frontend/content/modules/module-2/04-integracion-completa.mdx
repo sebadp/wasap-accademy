@@ -1,128 +1,247 @@
 ---
-title: "Integrando LLM en el webhook"
-description: "Conectar el pipeline de webhooks con el LLM: el sistema completo"
+title: "Integrando el LLM en el webhook"
+description: "Conectar el pipeline de webhooks con Ollama: el sistema completo de LocalForge"
 xpReward: 100
 ---
 
-## El momento de la verdad
+## El Momento de la Verdad
 
-Tenés el webhook funcionando (Módulo 1) y el cliente LLM listo (Módulo 2). Ahora los conectás.
+Tenes el webhook funcionando (Modulo 1) y el cliente LLM listo (este modulo). Ahora los conectas. Cuando envias "Hola" a tu numero de WhatsApp y recibis una respuesta generada por qwen3.5, todo el sistema esta funcionando.
 
-<Callout variant="tip">
-Este es el commit más satisfactorio del proyecto: cuando enviás "Hola" a tu número de WhatsApp y recibís una respuesta generada por Claude.
+<Callout variant="tip" title="El commit mas satisfactorio">
+Este es el punto donde el asistente cobra vida. De un webhook que solo loguea mensajes, pasas a un asistente que entiende y responde en lenguaje natural.
 </Callout>
 
-## El handler completo
+## Inicializacion en el Lifespan
 
-```python title="app/webhook/handler.py"
-from app.llm.client import LLMClient
-from app.whatsapp.client import WhatsAppClient
-from app.webhook.models import WhatsAppMessage
-from app.llm.prompts import build_system_prompt
-from app.database.session import get_db
+Todo comienza en `app/main.py`. El `lifespan` de FastAPI crea y conecta todos los componentes:
 
-SYSTEM_PROMPT = """Eres WasAP, un asistente de WhatsApp conciso y útil.
-Responde en el idioma del usuario. Sé breve."""
+```python
+# app/main.py (simplificado)
+from contextlib import asynccontextmanager
+import httpx
+from fastapi import FastAPI
+from app.config import Settings
+from app.llm.client import OllamaClient
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = Settings()
 
-async def process_message(
-    message: WhatsAppMessage,
-    llm: LLMClient,
-    wa: WhatsAppClient,
-) -> None:
-    # 1. Construir el historial (por ahora, solo el mensaje actual)
-    messages = [
-        {"role": "user", "content": message.text.body}
-    ]
-
-    # 2. Generar respuesta con el LLM
-    response_text = await llm.complete(
-        messages=messages,
-        system=SYSTEM_PROMPT,
+    # Un solo httpx client para toda la app
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=10.0)
     )
 
-    # 3. Marcar como leído (✓✓ azules)
-    await wa.mark_as_read(message.id)
-
-    # 4. Enviar respuesta
-    await wa.send_text(
-        to=message.from_,
-        text=response_text,
+    # Crear el cliente Ollama
+    app.state.ollama_client = OllamaClient(
+        http_client=http_client,
+        base_url=settings.ollama_base_url,  # "http://localhost:11435"
+        model=settings.ollama_model,         # "qwen3.5:9b"
     )
+
+    # Crear el cliente WhatsApp
+    app.state.whatsapp_client = WhatsAppClient(
+        http_client=http_client,
+        access_token=settings.whatsapp_access_token,
+        phone_number_id=settings.whatsapp_phone_number_id,
+    )
+
+    # ... DB, skills, scheduler, memory, etc.
+
+    yield  # La app corre aqui
+
+    # Cleanup
+    await http_client.aclose()
+
+app = FastAPI(title="LocalForge", lifespan=lifespan)
 ```
 
-## Inyección de dependencias con FastAPI
-
-```python title="app/dependencies.py"
-from functools import lru_cache
-from app.llm.client import LLMClient
-from app.whatsapp.client import WhatsAppClient
-from app.config import get_settings
-
-@lru_cache
-def get_llm_client() -> LLMClient:
-    return LLMClient(get_settings())
-
-@lru_cache
-def get_wa_client() -> WhatsAppClient:
-    return WhatsAppClient(get_settings())
-
-
-# En el router:
-@router.post("/webhook")
-async def receive_webhook(
-    payload: WebhookPayload,
-    llm: LLMClient = Depends(get_llm_client),
-    wa: WhatsAppClient = Depends(get_wa_client),
-) -> JSONResponse:
-    messages = await extract_messages(payload)
-    for msg in messages:
-        await process_message(msg, llm, wa)
-    return JSONResponse({"status": "ok"})
-```
-
-<Concept term="Depends()">
-El sistema de dependency injection de FastAPI. Define dependencias que se resuelven automáticamente en cada request. Facilita el testing (podés inyectar mocks) y evita estado global mutable.
+<Concept title="Lifespan pattern">
+FastAPI ejecuta el codigo antes del `yield` al inicio de la app, y el codigo despues del `yield` al apagar. Esto reemplaza los decoradores `@app.on_event("startup")` y `@app.on_event("shutdown")` que estan deprecados.
 </Concept>
 
-## Testear el sistema completo
+## El Flujo Completo de un Mensaje
 
-```python title="tests/test_integration.py"
-@pytest.mark.asyncio
-async def test_full_pipeline(
-    client: AsyncClient,
-    mock_llm: AsyncMock,
-    mock_wa: AsyncMock,
-):
-    """Test end-to-end: mensaje entrante → LLM → respuesta enviada."""
-    mock_llm.complete.return_value = "¡Hola! Soy WasAP, ¿en qué puedo ayudarte?"
+Cuando llega un mensaje de WhatsApp, pasa por varias etapas:
 
-    payload = build_whatsapp_payload("5491155556666", "Hola")
-    response = await client.post(
-        "/webhook",
-        json=payload,
-        headers={"X-Hub-Signature-256": sign(payload)},
-    )
+<Step number={1} title="Webhook recibe el payload">
+```python
+# app/webhook/router.py
+@router.post("/webhook")
+async def incoming_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> Response:
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
 
-    assert response.status_code == 200
-    mock_wa.send_text.assert_called_once_with(
-        to="5491155556666",
-        text="¡Hola! Soy WasAP, ¿en qué puedo ayudarte?",
-    )
+    if not validate_signature(body, signature, settings.whatsapp_app_secret):
+        return Response(status_code=200)  # No revelar que fallo
+
+    payload = await request.json()
+    messages = extract_messages(payload)
+```
+</Step>
+
+<Step number={2} title="Validaciones y dedup">
+```python
+    for msg in messages:
+        # Whitelist: solo numeros permitidos
+        if msg.from_number not in settings.allowed_phone_numbers:
+            continue
+
+        # Rate limiting: maximo N mensajes por ventana
+        if not rate_limiter.is_allowed(msg.from_number):
+            continue
+
+        # Dedup atomico: INSERT OR IGNORE evita duplicados
+        if await repository.try_claim_message(msg.message_id):
+            continue  # Ya procesado
+
+        background_tasks.add_task(process_message, msg=msg, ...)
+```
+</Step>
+
+<Step number={3} title="Procesamiento en background">
+El mensaje se procesa como background task para responder 200 inmediatamente a Meta:
+
+```python
+async def process_message_generic(
+    msg: IncomingMessage,
+    platform_client: PlatformClient,
+    ollama_client: OllamaClient,
+    ...
+) -> None:
+    # Indicador de typing (emoji reloj en WhatsApp)
+    await platform_client.send_typing_indicator(msg.user_id)
+
+    try:
+        # ... procesamiento completo
+        pass
+    finally:
+        # SIEMPRE remover el indicador de typing
+        await platform_client.remove_typing_indicator(msg.user_id)
+```
+</Step>
+
+<Callout variant="warning" title="Responder 200 inmediatamente">
+Meta reenvia el webhook si no recibis un 200 en 5 segundos. Por eso el procesamiento va en `background_tasks`: el endpoint retorna 200 al instante, y el mensaje se procesa despues.
+</Callout>
+
+## Las 4 Fases del Pipeline
+
+LocalForge paraleliza el procesamiento en 4 fases para minimizar latencia:
+
+```python
+# Fase A: operaciones iniciales en paralelo
+query_embedding, _, daily_logs = await asyncio.gather(
+    embed(query),           # Embedding para busqueda semantica
+    save_message(msg),      # Guardar mensaje en DB
+    load_daily_logs(),      # Cargar logs recientes
+)
+
+# Fase B: busquedas en paralelo (dependen de Phase A)
+memories, notes, summary, history = await asyncio.gather(
+    search_memories(query_embedding),    # Busqueda vectorial
+    search_notes(query_embedding),       # Notas relevantes
+    get_summary(phone),                  # Resumen de conversacion
+    get_recent_messages(phone),          # Ultimos N mensajes
+)
+
+# Fase C: clasificacion (ya kickeada como task antes de Phase A)
+categories = await classify_task  # ["time", "math", "none", ...]
+
+# Fase D: construir contexto y llamar al LLM
+context = _build_context(system_prompt, memories, notes, history, ...)
+response = await ollama_client.chat_with_tools(context, tools=selected_tools)
 ```
 
+<Concept title="Paralelizacion con asyncio.gather">
+`asyncio.gather()` ejecuta multiples coroutines en paralelo. En Fase A, el embedding, el guardado en DB, y la carga de logs corren al mismo tiempo. Esto reduce la latencia total de ~3 llamadas secuenciales a ~1 (la mas lenta).
+</Concept>
+
+## Dependency Injection via app.state
+
+Todos los componentes se acceden via funciones en `dependencies.py`:
+
+```python
+# app/dependencies.py
+from fastapi import Request
+from app.llm.client import OllamaClient
+
+def get_ollama_client(request: Request) -> OllamaClient:
+    return request.app.state.ollama_client
+
+def get_repository(request: Request) -> Repository:
+    return request.app.state.repository
+
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
+```
+
+<Callout variant="info" title="Por que no Depends()">
+LocalForge usa `get_*(request)` en lugar de `Depends(get_*)` de FastAPI en los handlers porque `process_message` corre como background task, no como endpoint directo. Las dependencias se resuelven en el endpoint y se pasan explicitamente.
+</Callout>
+
+## Testear el Sistema Completo
+
+Para tests de integracion, mockeas Ollama y WhatsApp:
+
+```python
+# tests/test_integration.py
+from unittest.mock import AsyncMock
+
+@pytest.fixture
+def mock_ollama():
+    client = AsyncMock(spec=OllamaClient)
+    client.chat_with_tools.return_value = ChatResponse(
+        content="Hola! En que puedo ayudarte?",
+        tool_calls=None,
+    )
+    return client
+
+async def test_full_pipeline(mock_ollama, mock_wa_client):
+    """Test end-to-end: mensaje entrante -> LLM -> respuesta."""
+    await process_message_generic(
+        msg=IncomingMessage(...),
+        platform_client=mock_wa_client,
+        ollama_client=mock_ollama,
+        ...
+    )
+    mock_wa_client.send_message.assert_called_once()
+```
+
+<Callout variant="tip" title="Mockear siempre Ollama en tests">
+Nunca llames a Ollama real en tests. Es lento (segundos por llamada), no determinista, y requiere que el modelo este descargado. Usa `AsyncMock(spec=OllamaClient)` para tests rapidos y reproducibles.
+</Callout>
+
+## Modulo 2 Completado
+
+Ahora tu LocalForge puede:
+
+- Recibir mensajes de WhatsApp/Telegram de forma segura
+- Generar respuestas inteligentes con qwen3.5 via Ollama
+- Manejar errores y operar en modo degradado
+- Paralelizar el pipeline para minima latencia
+- Enviar respuestas formateadas de vuelta al usuario
+
+En el **Modulo 3** anadimos **persistencia**: la base de datos SQLite que guarda conversaciones, memorias, notas y todo el estado del asistente.
+
 <Quiz
-  question="¿Qué ventaja tiene usar Depends() en FastAPI sobre instanciar los clientes directamente en el handler?"
-  options={["Depends() hace las llamadas más rápidas", "Permite reemplazar implementaciones en tests sin modificar el código del handler", "Depends() maneja automáticamente los errores HTTP", "Es necesario para poder usar async/await"]}
+  question="Por que el procesamiento del mensaje se ejecuta como background task?"
+  options={["Para poder procesar multiples mensajes en paralelo", "Porque Meta reenvia el webhook si no recibe un 200 en 5 segundos", "Porque FastAPI no soporta await en endpoints POST", "Para evitar bloquear el event loop"]}
   correct={1}
 />
 
-## Módulo 2 completado
+<Quiz
+  question="Que ventaja tiene usar asyncio.gather en las fases del pipeline?"
+  options={["Hace las queries mas seguras", "Ejecuta multiples operaciones en paralelo, reduciendo la latencia total", "Permite cancelar operaciones que tardan demasiado", "Es requerido por httpx para requests concurrentes"]}
+  correct={1}
+/>
 
-Ahora tu WasAP puede:
-
-- Recibir mensajes de WhatsApp de forma segura
-- Generear respuestas con Claude
-- Enviar respuestas de vuelta al usuario
-
-En el **Módulo 3** añadimos **memoria**: el historial de conversación que hace que el asistente recuerde lo que hablaron antes.
+<Quiz
+  question="Por que LocalForge usa un PlatformAdapter en lugar de llamar a WhatsAppClient directamente?"
+  options={["Porque el adapter es mas rapido", "Para soportar multiples plataformas (WhatsApp + Telegram) con el mismo codigo de procesamiento", "Porque FastAPI requiere adapters para background tasks", "Para facilitar el rate limiting por plataforma"]}
+  correct={1}
+/>

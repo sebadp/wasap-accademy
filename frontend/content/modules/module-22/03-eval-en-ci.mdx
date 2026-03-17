@@ -1,0 +1,236 @@
+---
+title: "Evaluaciones en CI"
+description: "scripts/run_eval.py como gate de calidad: seed golden cases, clasificación e2e, y threshold gates"
+xpReward: 150
+---
+
+## Tests No Son Suficientes
+
+Los tests verifican que el código funciona. Pero en una app de AI, el código puede funcionar perfectamente y aún así dar respuestas malas. Necesitamos **evaluaciones** que midan la calidad del LLM.
+
+<Concept title="Eval en CI">
+Una evaluación (eval) corre el LLM contra un dataset de casos conocidos y mide accuracy. Si el accuracy cae debajo de un umbral, el CI falla. Esto previene deployar cambios que degraden la calidad (ej: un cambio de prompt que rompe el 30% de las respuestas).
+</Concept>
+
+## El Dataset de Golden Cases
+
+LocalForge mantiene un dataset de 82 casos curados:
+
+```python
+# scripts/seed_eval.py
+
+GOLDEN_CASES = [
+    {
+        "input": "¿Qué hora es?",
+        "expected_category": "time",
+        "expected_tools": ["get_current_datetime"],
+    },
+    {
+        "input": "Calculá 15% de 2500",
+        "expected_category": "math",
+        "expected_tools": ["calculate"],
+    },
+    {
+        "input": "Recordá que mi cumpleaños es el 15 de marzo",
+        "expected_category": "none",  # Es un comando, no necesita tools
+        "expected_tools": [],
+    },
+    {
+        "input": "¿Cómo va el proyecto API?",
+        "expected_category": "memory",
+        "expected_tools": [],  # El contexto de proyectos se inyecta, no es un tool
+    },
+    # ... 78 casos más
+]
+```
+
+<Terminal title="Seedear los golden cases">
+make eval-seed
+</Terminal>
+
+<Callout variant="info" title="82 casos curados">
+Los 82 casos cubren: clasificación de intent (time, math, weather, notes, memory, none), selección de tools, edge cases (mensajes ambiguos, multi-intent), y casos negativos (mensajes que NO deben activar tools).
+</Callout>
+
+## scripts/run_eval.py
+
+El script de evaluación tiene dos modos:
+
+### Modo 1: Classification Eval
+
+Evalúa si `classify_intent` clasifica correctamente:
+
+```python
+# scripts/run_eval.py
+
+async def eval_classify(dataset: list[dict], ollama: OllamaClient) -> float:
+    """Evaluar accuracy de classify_intent."""
+    correct = 0
+    total = len(dataset)
+
+    for case in dataset:
+        predicted = await classify_intent(case["input"], ollama)
+
+        if case["expected_category"] in predicted:
+            correct += 1
+        else:
+            logger.warning(
+                "MISS: '%s' → predicted=%s, expected=%s",
+                case["input"][:50], predicted, case["expected_category"],
+            )
+
+    accuracy = correct / total
+    logger.info("Classification accuracy: %.1f%% (%d/%d)", accuracy * 100, correct, total)
+    return accuracy
+```
+
+### Modo 2: End-to-End Eval
+
+Evalúa el flujo completo (classify -> select tools -> execute):
+
+```python
+async def eval_e2e(dataset: list[dict], ollama: OllamaClient, registry: SkillRegistry) -> float:
+    """Evaluar el flujo end-to-end."""
+    correct = 0
+    total = 0
+
+    for case in dataset:
+        if not case.get("expected_tools"):
+            continue  # Solo evaluar casos con tools esperados
+
+        total += 1
+        categories = await classify_intent(case["input"], ollama)
+        tools = await select_tools(categories, registry)
+
+        # Verificar que los tools esperados estén en la selección
+        expected_set = set(case["expected_tools"])
+        selected_set = set(tools)
+        if expected_set.issubset(selected_set):
+            correct += 1
+        else:
+            logger.warning(
+                "MISS: '%s' → selected=%s, expected=%s",
+                case["input"][:50], selected_set, expected_set,
+            )
+
+    accuracy = correct / total if total > 0 else 0
+    logger.info("E2E accuracy: %.1f%% (%d/%d)", accuracy * 100, correct, total)
+    return accuracy
+```
+
+## Exit Codes
+
+```python
+import sys
+
+async def main():
+    dataset = load_dataset()
+    if not dataset:
+        print("No eval entries found")
+        sys.exit(2)  # Exit code 2: no entries
+
+    ollama = OllamaClient(settings)
+    classify_acc = await eval_classify(dataset, ollama)
+    e2e_acc = await eval_e2e(dataset, ollama, registry)
+
+    # Threshold gates
+    CLASSIFY_THRESHOLD = 0.85  # 85% mínimo
+    E2E_THRESHOLD = 0.80       # 80% mínimo
+
+    if classify_acc < CLASSIFY_THRESHOLD:
+        print(f"FAIL: Classification {classify_acc:.0%} < {CLASSIFY_THRESHOLD:.0%}")
+        sys.exit(1)
+
+    if e2e_acc < E2E_THRESHOLD:
+        print(f"FAIL: E2E {e2e_acc:.0%} < {E2E_THRESHOLD:.0%}")
+        sys.exit(1)
+
+    print(f"PASS: classify={classify_acc:.0%}, e2e={e2e_acc:.0%}")
+    sys.exit(0)
+```
+
+| Exit Code | Significado | Acción del CI |
+|-----------|-------------|---------------|
+| 0 | Todas las evals pasaron | Deploy habilitado |
+| 1 | Accuracy debajo del threshold | **Block deploy** |
+| 2 | No hay entries en el dataset | **Block deploy** (non-zero exit code) |
+
+## Integración en CI
+
+```yaml
+# .github/workflows/ci.yml (job adicional)
+  eval:
+    runs-on: ubuntu-latest
+    needs: [test]  # Solo correr si los tests pasan
+    services:
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pull model
+        run: curl -X POST http://localhost:11434/api/pull -d '{"name":"qwen3.5:9b"}'
+      - name: Seed eval dataset
+        run: make eval-seed
+      - name: Run evaluations
+        run: make eval
+```
+
+<Callout variant="warning" title="Threshold gates previenen regresiones">
+Si cambiás el system prompt y el accuracy de clasificación cae de 90% a 75%, el CI falla y bloquea el merge. Tenés que investigar qué rompió el cambio antes de deployar.
+</Callout>
+
+## Makefile
+
+```makefile
+eval-seed:
+	.venv/bin/python scripts/seed_eval.py
+
+eval:
+	.venv/bin/python scripts/run_eval.py
+```
+
+<Terminal title="Seedear y correr evaluaciones">
+make eval-seed && make eval
+</Terminal>
+
+<Quiz
+  question="¿Qué significa exit code 1 en scripts/run_eval.py?"
+  options={[
+    "No hay entries en el dataset",
+    "Error de conexión con Ollama",
+    "La accuracy está debajo del threshold — el deploy se bloquea",
+    "Los tests unitarios fallaron"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué el job de eval tiene 'needs: [test]'?"
+  options={[
+    "Porque eval necesita los resultados de test",
+    "Para no gastar recursos de CI corriendo evals si los tests básicos ya fallaron",
+    "Porque los tests seedean el dataset de eval",
+    "Es obligatorio en GitHub Actions"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué evalúa el modo end-to-end (e2e) que el modo classification no cubre?"
+  options={[
+    "Solo la velocidad de respuesta del LLM",
+    "El flujo completo: classify_intent → select_tools, verificando que los tools esperados estén en la selección final",
+    "La calidad gramatical de las respuestas del LLM",
+    "El consumo de tokens por request"
+  ]}
+  correct={1}
+/>
+
+En la última lección veremos cómo monitorear todo esto en producción con Langfuse.

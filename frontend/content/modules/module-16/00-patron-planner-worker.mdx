@@ -1,0 +1,202 @@
+---
+title: "Patrón Planner-Worker"
+description: "Separación de planificación y ejecución en sesiones agénticas complejas"
+xpReward: 50
+---
+
+## ¿Por Qué Separar Planificar de Ejecutar?
+
+En el módulo anterior vimos el loop reactivo: el agente ejecuta herramientas iterativamente sin un plan formal. Funciona para tareas simples, pero para objetivos complejos ("analizá este repo y creá un pipeline CI") es ineficiente — el agente gasta rondas explorando sin dirección.
+
+<Callout variant="info" title="Planner = estrategia antes de acción">
+El patrón planner-worker separa el **pensamiento** de la **acción**. Primero el LLM planifica (sin tools), después workers especializados ejecutan cada paso (con tools). Esto reduce el número total de iteraciones y mejora la calidad.
+</Callout>
+
+## Las 3 Fases
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  UNDERSTAND  │ →  │   EXECUTE    │ →  │  SYNTHESIZE  │
+│  (Planner)   │    │  (Workers)   │    │  (Planner)   │
+│              │    │              │    │              │
+│ Crear plan   │    │ Ejecutar     │    │ Resumir      │
+│ JSON con     │    │ tareas con   │    │ hallazgos    │
+│ tareas       │    │ tools        │    │ en texto     │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
+
+<Step number={1} title="UNDERSTAND — El Planner piensa">
+El LLM recibe solo el objetivo y contexto. Sin herramientas. Produce un plan JSON con tareas concretas, tipos de worker, y dependencias. Máximo 6 tareas.
+</Step>
+
+<Step number={2} title="EXECUTE — Los Workers ejecutan">
+Cada tarea se asigna a un worker especializado (reader, analyzer, coder, reporter, general). El worker tiene acceso a tools relevantes y ejecuta su tarea en un mini tool-loop.
+</Step>
+
+<Step number={3} title="SYNTHESIZE — El Planner resume">
+El planner ve todos los resultados y genera un resumen final. Si hay tareas fallidas, puede replannear (hasta 3 veces).
+</Step>
+
+## AgentPlan: El Modelo de Datos
+
+```python
+# app/agent/models.py
+@dataclass
+class AgentPlan:
+    objective: str              # "Creá un pipeline CI/CD"
+    context_summary: str        # "Backend repo con FastAPI..."
+    tasks: list[TaskStep]       # Lista de tareas ordenadas
+    current_task_idx: int = 0   # Tracking
+    replans: int = 0            # Intentos de replanificación
+    max_replans: int = 3        # Safety limit
+
+    def all_done(self) -> bool:
+        """¿Todas las tareas están completadas o falladas?"""
+        return all(
+            t.status in ("done", "failed") for t in self.tasks
+        )
+
+    def get_task(self, task_id: int) -> TaskStep | None:
+        """Buscar tarea por ID."""
+        return next((t for t in self.tasks if t.id == task_id), None)
+```
+
+```python
+@dataclass
+class TaskStep:
+    id: int                     # Único por plan (1-6)
+    description: str            # "Leer estructura del repo"
+    worker_type: str            # reader|analyzer|coder|reporter|general
+    tools: list[str] = field(default_factory=list)
+    status: str = "pending"     # pending|in_progress|done|failed
+    result: str | None = None   # Output del worker
+    depends_on: list[int] = field(default_factory=list)
+```
+
+<Concept title="Dependencias y orden">
+`depends_on: [1, 2]` significa que la tarea no puede empezar hasta que las tareas 1 Y 2 estén completadas. El método `next_task()` del plan respeta estas dependencias automáticamente.
+</Concept>
+
+## El Prompt del Planner
+
+```python
+# app/eval/prompt_registry.py
+_PLANNER_CREATE_PROMPT = """\
+You are a task planner. Your job is to decompose an objective into steps.
+
+OBJECTIVE: {objective}
+
+{context_block}
+
+Create a JSON plan with this exact structure:
+{{
+  "context_summary": "1-2 sentence summary of what you understand",
+  "tasks": [
+    {{
+      "id": 1,
+      "description": "Clear action to take",
+      "worker_type": "general",
+      "depends_on": []
+    }}
+  ]
+}}
+
+Worker types:
+- "reader": reads information (files, messages, logs, traces)
+- "analyzer": analyzes data, finds patterns, diagnoses issues
+- "coder": reads and modifies source code
+- "reporter": synthesizes findings into a report
+- "general": does anything (fallback)
+
+Rules:
+- Keep tasks small and specific (1-3 tool calls each)
+- Use depends_on to express ordering
+- Maximum 6 tasks per plan
+- Output ONLY valid JSON, nothing else
+"""
+```
+
+<Callout variant="warning" title="Output ONLY valid JSON">
+El prompt termina con "Output ONLY valid JSON, nothing else". Esto es crucial para la robustez del parsing. Sin esta instrucción, el LLM suele agregar explicaciones antes o después del JSON.
+</Callout>
+
+## Ejemplo de Plan Generado
+
+Para el objetivo "Analizá la cobertura de tests del backend":
+
+```json
+{
+  "context_summary": "Backend repo con FastAPI, pytest, y Makefile. Need to assess test coverage and identify gaps.",
+  "tasks": [
+    {
+      "id": 1,
+      "description": "Read repository structure: tests/, app/, Makefile, pyproject.toml",
+      "worker_type": "reader",
+      "depends_on": []
+    },
+    {
+      "id": 2,
+      "description": "Run test suite and capture coverage report",
+      "worker_type": "coder",
+      "depends_on": [1]
+    },
+    {
+      "id": 3,
+      "description": "Analyze coverage gaps by module",
+      "worker_type": "analyzer",
+      "depends_on": [2]
+    },
+    {
+      "id": 4,
+      "description": "Generate recommendations report",
+      "worker_type": "reporter",
+      "depends_on": [3]
+    }
+  ]
+}
+```
+
+## Planner vs Reactivo: Cuándo Usar Cada Uno
+
+| Criterio | Reactivo | Planner |
+|----------|----------|---------|
+| Tareas simples (1-3 pasos) | ✅ Ideal | Overkill |
+| Tareas complejas (4+ pasos) | Ineficiente | ✅ Ideal |
+| Necesita coordinación entre pasos | Difícil | ✅ Dependencias |
+| Tolerancia a fallos | Loop detection | ✅ Cascade failure + replan |
+| Overhead de planificación | Ninguno | 1 LLM call extra |
+
+<Quiz
+  question="¿Cuál es la ventaja principal del planner sobre el loop reactivo?"
+  options={[
+    "Usa menos tokens",
+    "Es más rápido",
+    "Separa planificación de ejecución, permitiendo estrategia antes de acción y workers especializados",
+    "Solo funciona con tools de lectura"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cuántas tareas máximas puede tener un plan?"
+  options={[
+    "3",
+    "6",
+    "10",
+    "Sin límite"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué worker type se usa para modificar código?"
+  options={[
+    "reader",
+    "analyzer",
+    "coder",
+    "general"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo los workers ejecutan sus tareas.

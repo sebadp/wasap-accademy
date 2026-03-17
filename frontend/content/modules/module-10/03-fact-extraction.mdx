@@ -1,0 +1,252 @@
+---
+title: "Fact Extraction"
+description: "Extraer datos del usuario con regex — sin LLM, rápido y determinístico"
+xpReward: 75
+---
+
+## Extracción sin LLM
+
+LocalForge extrae hechos estructurados del usuario a partir de sus memorias usando **regex puro**. No necesita llamar al LLM para saber que "Se llama Sebastián, trabaja en Buenos Aires" contiene un nombre y una ubicación.
+
+<Callout variant="tip" title="¿Por qué no usar el LLM?">
+Un LLM tardaría ~500ms por llamada y consumiría tokens del presupuesto. Los regex tardan **menos de 1ms** y son determinísticos (siempre producen el mismo resultado para el mismo input). Para patrones conocidos como nombre, username de GitHub, y idioma preferido, regex es suficiente y mucho más eficiente.
+</Callout>
+
+## Arquitectura de Patrones
+
+El extractor define pares de `(fact_key, compiled_pattern)` donde cada pattern tiene un capture group para el valor extraído (excepto los boolean facts que solo detectan presencia):
+
+```python
+# app/context/fact_extractor.py
+import re
+
+# Each entry: (fact_key, compiled_pattern)
+_FACT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # GitHub username — handles Spanish and English variations:
+    # "usuario de GitHub es sebadp", "GitHub username: sebadp",
+    # "mi cuenta de GitHub es sebadp", "GitHub: sebadp"
+    (
+        "github_username",
+        re.compile(
+            r"github[^\n,;.]{0,30}?(?:es|is|:)\s+"
+            r"([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})"
+            r"(?!\S)",  # not followed by non-space (end of word)
+            re.IGNORECASE,
+        ),
+    ),
+    # GitHub token / PAT — only detects presence, NOT the value
+    (
+        "github_token_configured",
+        re.compile(
+            r"(?:github\s+(?:token|pat|personal\s+access))\s+"
+            r"(?:configurad[oa]|is set|registrad[oa]|activ[oa])",
+            re.IGNORECASE,
+        ),
+    ),
+    # Name — "se llama Sebastián", "mi nombre es Juan", "me llamo Pedro"
+    (
+        "name",
+        re.compile(
+            r"(?:se\s+llama|(?:mi\s+)?nombre\s+es|me\s+llamo|my\s+name\s+is)\s+"
+            r"([A-ZÀ-Üa-zà-ü][a-zà-ü]+(?:\s+[A-ZÀ-Üa-zà-ü][a-zà-ü]+)?)",
+            re.IGNORECASE,
+        ),
+    ),
+    # Preferred language
+    (
+        "language",
+        re.compile(
+            r"(?:prefiere\s+(?:el\s+)?|habla\s+|idioma\s+(?:preferido\s+)?es\s+)"
+            r"(español|inglés|ingles|english|spanish|português|portuguese)",
+            re.IGNORECASE,
+        ),
+    ),
+]
+```
+
+<Concept title="Patrones compilados">
+Los regex se compilan una vez al importar el módulo con `re.compile()`. Esto evita recompilar el pattern en cada llamada a `extract_facts()`. En un hot path que corre para cada mensaje, esta optimización importa.
+</Concept>
+
+## La Función extract_facts()
+
+```python
+# app/context/fact_extractor.py
+# Facts booleanos: solo detectan presencia, no extraen un valor
+_BOOLEAN_FACTS: set[str] = {"github_token_configured"}
+
+def extract_facts(memories: list[str]) -> dict[str, str]:
+    """Extract key-value facts from a list of memory strings.
+
+    Returns a dict of fact_key -> fact_value. Only captures the first
+    occurrence of each fact type found across all memories.
+    """
+    facts: dict[str, str] = {}
+
+    for mem in memories:
+        for fact_key, pattern in _FACT_PATTERNS:
+            if fact_key in facts:
+                continue  # Already captured, skip
+
+            match = pattern.search(mem)
+            if match:
+                if fact_key in _BOOLEAN_FACTS:
+                    facts[fact_key] = "true"
+                else:
+                    facts[fact_key] = match.group(1).strip()
+
+    return facts
+```
+
+<Callout variant="info" title="First-match wins">
+Si hay dos memorias que mencionan el nombre ("Se llama Sebastián" y "Me llamo Seba"), solo se toma la primera. Esto evita conflictos cuando el usuario actualizó su nombre pero la memoria vieja sigue activa.
+</Callout>
+
+## Ejemplo de Extracción
+
+```python
+memories = [
+    "El usuario de GitHub del usuario es sebadp",
+    "Se llama Sebastián",
+    "GitHub token configurado",
+    "Prefiere español",
+]
+
+facts = extract_facts(memories)
+# {
+#     "github_username": "sebadp",
+#     "name": "Sebastián",
+#     "github_token_configured": "true",
+#     "language": "español",
+# }
+```
+
+## Boolean Facts: Presencia sin Valor
+
+El pattern de `github_token_configured` no tiene capture group para el valor del token (seria un riesgo de seguridad almacenarlo). Solo detecta que fue mencionado:
+
+```python
+_BOOLEAN_FACTS: set[str] = {"github_token_configured"}
+
+# Si el pattern matchea:
+if fact_key in _BOOLEAN_FACTS:
+    facts[fact_key] = "true"  # Solo presencia, no el valor
+else:
+    facts[fact_key] = match.group(1).strip()  # Extrae el capture group
+```
+
+<Callout variant="warning" title="Nunca extraer secrets">
+El extractor deliberadamente NO captura tokens, contraseñas, ni API keys. Solo detecta su presencia ("GitHub token configurado"). El valor real vive en variables de entorno, no en memorias.
+</Callout>
+
+## Formateo para el Prompt
+
+Los facts extraídos se formatean para inyección en el tool loop:
+
+```python
+# app/context/fact_extractor.py
+def format_facts_for_prompt(facts: dict[str, str]) -> str | None:
+    """Format extracted facts as a compact system message for the tool loop."""
+    if not facts:
+        return None
+
+    labels = {
+        "github_username": "GitHub username",
+        "github_token_configured": "GitHub token",
+        "name": "Name",
+        "language": "Preferred language",
+    }
+
+    lines = ["Known user facts (use these directly, do not ask the user again):"]
+    for key, value in facts.items():
+        label = labels.get(key, key)
+        if key == "github_token_configured":
+            lines.append(f"- {label}: configured")
+        else:
+            lines.append(f"- {label}: {value}")
+
+    return "\n".join(lines)
+```
+
+Resultado:
+
+```
+Known user facts (use these directly, do not ask the user again):
+- GitHub username: sebadp
+- Name: Sebastián
+- GitHub token: configured
+- Preferred language: español
+```
+
+<Concept title="Instrucción clave: 'do not ask the user again'">
+La línea "use these directly, do not ask the user again" es intencional. Sin ella, el LLM podría preguntar "¿Cuál es tu username de GitHub?" a pesar de tener el dato. Esta instrucción en el prompt evita preguntas redundantes y mejora la experiencia del usuario.
+</Concept>
+
+## Integración en ConversationContext.build()
+
+La extracción de facts se ejecuta **después** de obtener las memorias, como post-procesamiento:
+
+```python
+# app/context/conversation_context.py — dentro de build()
+memories_raw, search_stats = memories_and_stats
+
+# Extract user facts from memories (regex, deterministic, <1ms)
+user_facts = extract_facts(memories_raw)
+if user_facts:
+    logger.debug(
+        "ConversationContext: extracted %d user facts: %s",
+        len(user_facts), list(user_facts.keys()),
+    )
+
+return cls(
+    user_facts=user_facts,
+    memories=memories_raw,
+    # ... otros campos ...
+)
+```
+
+## Separación de Concerns
+
+La extracción de facts sigue un principio importante:
+
+| Aspecto | Detalle |
+|---------|---------|
+| **No modifica datos** | No crea ni edita memorias. Solo lee las existentes |
+| **Vista derivada** | Los facts son una transformación de las memorias, no una fuente nueva |
+| **Sin side effects** | Función pura: mismas memorias = mismos facts siempre |
+| **Sin LLM** | Determinístico, sin latencia de red, sin consumo de tokens |
+
+<Quiz
+  question="¿Por qué la extracción de facts usa regex en vez de LLM?"
+  options={[
+    "Porque el LLM no puede extraer datos de texto",
+    "Porque regex es rápido (<1ms), determinístico, y suficiente para patrones conocidos",
+    "Porque regex es siempre más preciso que un LLM",
+    "Porque el LLM está ocupado procesando otros mensajes"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si dos memorias mencionan nombres diferentes para el usuario?"
+  options={[
+    "Se guardan ambos nombres como una lista",
+    "Se usa solo la primera coincidencia encontrada (first-match wins)",
+    "Se le pregunta al usuario cuál es el correcto",
+    "Se descarta el fact porque hay conflicto"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué github_token_configured se trata como boolean fact?"
+  options={[
+    "Porque los tokens de GitHub son siempre true o false",
+    "Para no extraer ni almacenar el valor del token, que es un secret",
+    "Porque regex no puede capturar strings largos",
+    "Porque Ollama no soporta tokens en el contexto"
+  ]}
+  correct={1}
+/>
+
+En la última lección ensamblamos el prompt final completo y vemos cómo todas las piezas encajan.

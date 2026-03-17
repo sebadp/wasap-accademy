@@ -1,0 +1,193 @@
+---
+title: "PlatformClient Protocol"
+description: "Abstracción multi-plataforma con Protocol runtime_checkable"
+xpReward: 50
+---
+
+## El Problema: WhatsApp No Es la Única Plataforma
+
+LocalForge nació como bot de WhatsApp, pero ¿qué pasa cuando querés soportar Telegram? ¿Y Discord después? Copiar toda la lógica de procesamiento de mensajes para cada plataforma no escala.
+
+<Callout variant="info" title="Abstracción de plataforma">
+En lugar de hardcodear WhatsApp en el core, LocalForge define un **Protocol** que cualquier plataforma debe implementar. El core habla con el Protocol, y cada plataforma adapta su API al Protocol.
+</Callout>
+
+## El Protocol: 7 Métodos
+
+```python
+# app/platforms/base.py
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class PlatformClient(Protocol):
+    async def send_message(self, to_id: str, text: str) -> str | None:
+        """Enviar mensaje de texto. Retorna message_id."""
+        ...
+
+    async def download_media(self, media_id: str) -> bytes:
+        """Descargar audio/imagen por media_id."""
+        ...
+
+    async def mark_as_read(self, message_id: str) -> None:
+        """Marcar mensaje como leído."""
+        ...
+
+    async def send_typing_indicator(self, to_id: str) -> None:
+        """Mostrar indicador 'escribiendo...'."""
+        ...
+
+    async def remove_typing_indicator(
+        self, to_id: str, indicator_id: str | None = None
+    ) -> None:
+        """Remover indicador de typing."""
+        ...
+
+    def format_text(self, text: str) -> str:
+        """Markdown → formato de la plataforma."""
+        ...
+
+    def platform_name(self) -> str:
+        """Nombre: 'whatsapp' | 'telegram'."""
+        ...
+```
+
+<Concept title="runtime_checkable Protocol">
+`@runtime_checkable` permite usar `isinstance(obj, PlatformClient)` en runtime. Sin este decorador, los Protocols de Python son solo type hints estáticos — no se pueden verificar en runtime. Esto es útil para validar dinámicamente que un objeto cumple la interfaz.
+</Concept>
+
+## El Modelo Universal de Mensaje
+
+```python
+# app/platforms/models.py
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Literal
+
+class Platform(StrEnum):
+    WHATSAPP = "whatsapp"
+    TELEGRAM = "telegram"
+
+@dataclass
+class IncomingMessage:
+    platform: Platform            # WHATSAPP | TELEGRAM
+    user_id: str                  # "5491234567" o "tg_12345"
+    message_id: str               # Único por plataforma
+    timestamp: str                # ISO o Unix timestamp
+    text: str                     # Cuerpo del mensaje
+    type: Literal["text", "audio", "image"]
+    media_id: str | None          # Para audio/imagen
+    reply_to_message_id: str | None  # Si es respuesta a otro msg
+```
+
+<Callout variant="tip" title="Prefijo tg_ para Telegram">
+Los usuarios de Telegram se identifican con `tg_<chat_id>`. Este prefijo permite usar la misma columna `phone_number` en la base de datos para ambas plataformas — sin migración de schema.
+</Callout>
+
+## process_message_generic: Un Solo Procesador
+
+```python
+# app/webhook/router.py
+async def process_message_generic(
+    msg: IncomingMessage,
+    platform_client: PlatformClient,  # Protocol, no clase concreta
+    repository: Repository,
+    ollama_client: OllamaClient,
+    conversation: ConversationManager,
+    command_registry: CommandRegistry,
+    skill_registry: SkillRegistry,
+    settings: Settings,
+    ...
+) -> None:
+    """Procesar un mensaje de cualquier plataforma."""
+    # La lógica es IDÉNTICA para WhatsApp y Telegram:
+    # - Dedup, rate limit
+    # - Typing indicator
+    # - Parse commands
+    # - Classify intent
+    # - Tool loop
+    # - Guardrails
+    # - Format y send reply
+    ...
+```
+
+<Concept title="Función compartida, no duplicada">
+`process_message_generic` contiene toda la lógica de procesamiento. Los webhooks de WhatsApp y Telegram solo parsean el payload de su plataforma a `IncomingMessage` y llaman a esta función. Zero lógica duplicada.
+</Concept>
+
+## WhatsApp Adapter
+
+```python
+# Backward compatibility: wrap WhatsAppClient as PlatformClient
+class WhatsAppPlatformAdapter:
+    def __init__(self, wa_client: WhatsAppClient):
+        self._client = wa_client
+
+    async def send_message(self, to_id, text):
+        return await self._client.send_message(to_id, text)
+
+    async def download_media(self, media_id):
+        return await self._client.download_media(media_id)
+
+    def format_text(self, text):
+        return markdown_to_whatsapp(text)
+
+    def platform_name(self):
+        return "whatsapp"
+    # ... etc
+```
+
+## El Routing por Plataforma
+
+El scheduler necesita saber a qué plataforma enviar recordatorios:
+
+```python
+# app/main.py — set_scheduler
+def set_scheduler(scheduler, **clients):
+    """Configurar clients por plataforma para envío de reminders."""
+    _platform_clients.update(clients)
+
+async def _send_reminder(phone_number, text):
+    """Enviar reminder a la plataforma correcta."""
+    if phone_number.startswith("tg_"):
+        client = _platform_clients.get("telegram")
+    else:
+        client = _platform_clients.get("whatsapp")
+
+    if client:
+        await client.send_message(phone_number, text)
+```
+
+<Quiz
+  question="¿Qué es un Protocol runtime_checkable en Python?"
+  options={[
+    "Una clase base abstracta",
+    "Una interfaz que se puede verificar con isinstance() en runtime, sin herencia explícita",
+    "Un decorador para funciones async",
+    "Un tipo de base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo se distingue un usuario de Telegram de uno de WhatsApp en la DB?"
+  options={[
+    "Columna 'platform' separada",
+    "Tabla diferente por plataforma",
+    "Prefijo 'tg_' en el campo phone_number — sin migración de schema",
+    "No se distinguen"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué hay UNA función process_message_generic en vez de una por plataforma?"
+  options={[
+    "Porque WhatsApp y Telegram tienen la misma API",
+    "Para evitar duplicar la lógica de procesamiento — cada plataforma solo adapta el parsing y usa el Protocol",
+    "Porque Telegram no soporta herramientas",
+    "Es temporal"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la implementación del TelegramClient.

@@ -1,0 +1,217 @@
+---
+title: "Hot-Reload MCP"
+description: "Agregar y remover servidores MCP sin reiniciar la app"
+xpReward: 100
+---
+
+## El Problema: Deploy para Agregar una Tool
+
+Sin hot-reload, para conectar un nuevo MCP server necesitarías: editar la config, reiniciar la app, y esperar que todas las conexiones se re-establezcan. Con hot-reload, podés agregar o remover servidores MCP **en runtime** desde el chat.
+
+## hot_add_server
+
+```python
+# app/mcp/manager.py
+async def hot_add_server(self, name: str, cfg: dict) -> str:
+    """Connect a new MCP server at runtime."""
+    # Verificar si ya está conectado
+    if name in self._sessions:
+        return f"Server '{name}' already connected."
+
+    # Conectar
+    try:
+        await self._connect_server(name, cfg)
+    except Exception as e:
+        return f"Failed to connect '{name}': {e}"
+
+    # Contar tools nuevas
+    new_tools = self._tools_by_server.get(name, [])
+
+    # Invalidar cache de tools
+    self._invalidate_tools_cache()
+
+    # Actualizar categorías dinámicas del router
+    self._update_dynamic_categories(name)
+
+    # Registrar categoría "fetch" si aplica
+    self._register_fetch_category()
+
+    # Persistir config para que sobreviva a reinicio
+    self._server_configs[name] = cfg
+    self._persist_config()
+
+    return (
+        f"Connected '{name}': {len(new_tools)} new tool(s). "
+        f"Tools: {', '.join(new_tools)}"
+    )
+```
+
+## hot_remove_server
+
+```python
+async def hot_remove_server(self, name: str) -> str:
+    """Disconnect an MCP server at runtime."""
+    if name not in self._sessions:
+        return f"Server '{name}' not connected."
+
+    # 1. Remover tools de este server
+    to_remove = self._tools_by_server.pop(name, [])
+    for tool_name in to_remove:
+        self._tools.pop(tool_name, None)
+
+    # 2. Cerrar la sesión y limpiar recursos
+    stack = self._server_stacks.pop(name, None)
+    if stack:
+        await stack.aclose()  # Cleanup del AsyncExitStack
+    self._sessions.pop(name, None)
+
+    # 3. Invalidar cache
+    self._invalidate_tools_cache()
+
+    # 4. Marcar como disabled en config persistida
+    if name in self._server_configs:
+        self._server_configs[name]["enabled"] = False
+    self._persist_config()
+
+    return (
+        f"Disconnected '{name}', "
+        f"removed {len(to_remove)} tool(s)."
+    )
+```
+
+<Concept title="AsyncExitStack.aclose()">
+Cada server tiene su propio `AsyncExitStack` que gestiona el ciclo de vida de la conexión (proceso stdio, sesión MCP). Al cerrar el stack, se terminan el proceso y la sesión automáticamente — no hay leaks de recursos.
+</Concept>
+
+## Persistencia de Config
+
+```python
+def _persist_config(self):
+    """Save current server configs to disk."""
+    config = {"servers": self._server_configs}
+    config_path = Path(self.config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w") as f:
+        json.dump(config, f, indent=2)
+```
+
+<Callout variant="tip" title="Cambios que sobreviven a reinicio">
+Al hacer hot_add, la config se guarda a disco. Al reiniciar la app, los servers "enabled" se reconectan automáticamente. No necesitás editar el JSON manualmente.
+</Callout>
+
+## Invalidación de Cache
+
+```python
+def _invalidate_tools_cache(self):
+    """Invalidar caches de tools en el executor."""
+    # El executor tiene un cache module-level de tools
+    from app.skills.executor import _invalidate_cached_tools_map
+    _invalidate_cached_tools_map()
+```
+
+## Detección de Modo Fetch
+
+El manager detecta automáticamente qué herramientas de fetching están disponibles:
+
+```python
+def _register_fetch_category(self):
+    """Detectar herramientas de fetch y registrar categoría."""
+    # Prioridad: Puppeteer > mcp-fetch
+    puppeteer_tools = [
+        "puppeteer_navigate", "puppeteer_screenshot",
+        "puppeteer_click", "puppeteer_fill",
+    ]
+    has_puppeteer = any(t in self._tools for t in puppeteer_tools)
+
+    if has_puppeteer:
+        self._fetch_mode = "puppeteer"
+    elif "fetch" in self._tools:
+        self._fetch_mode = "mcp-fetch"
+    else:
+        self._fetch_mode = "unavailable"
+        logger.warning("No fetch tools available")
+```
+
+## Merge con Skill Tools
+
+Las tools de MCP se fusionan con las tools de skills locales:
+
+```python
+# app/skills/executor.py
+def _get_cached_tools_map():
+    """Build merged tools map: skills + MCP."""
+    tools_map = {}
+
+    # Skills locales
+    for tool in skill_registry.get_ollama_tools():
+        name = tool["function"]["name"]
+        tools_map[name] = tool
+
+    # MCP tools
+    if mcp_manager:
+        for tool in mcp_manager.get_ollama_tools():
+            name = tool["function"]["name"]
+            if name in tools_map:
+                logger.warning("Tool collision: %s", name)
+            tools_map[name] = tool
+
+    return tools_map
+```
+
+<Callout variant="warning" title="Colisiones de nombre">
+Si un MCP server registra una tool con el mismo nombre que un skill local, la MCP tool sobrescribe la local. Esto se loguea como warning para debugging. Evitá tener tools con el mismo nombre.
+</Callout>
+
+## Uso desde Chat
+
+El usuario puede gestionar MCP servers desde el chat con tools especiales:
+
+```
+Usuario: "Conectá el server de GitHub"
+Bot: [llama expand_tools.add_mcp_server({
+    name: "github",
+    command: "npx",
+    args: ["@modelcontextprotocol/server-github"],
+    env: {"GITHUB_TOKEN": "..."}
+})]
+Bot: "Connected 'github': 12 new tools."
+
+Usuario: "Desconectá el server de GitHub"
+Bot: [llama expand_tools.remove_mcp_server({name: "github"})]
+Bot: "Disconnected 'github', removed 12 tools."
+```
+
+<Quiz
+  question="¿Qué pasa con las tools cuando se hace hot_remove de un server?"
+  options={[
+    "Se mantienen en cache",
+    "Se remueven del diccionario de tools, se cierra la sesión MCP, y se invalida el cache del executor",
+    "Se desactivan pero quedan registradas",
+    "Se mueven a otro server"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo persisten los cambios de hot_add/hot_remove entre reinicios?"
+  options={[
+    "No persisten",
+    "Se guardan en la DB",
+    "Se escriben al archivo mcp_servers.json con _persist_config()",
+    "Se guardan en variables de entorno"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué prioridad tiene Puppeteer vs mcp-fetch para web fetching?"
+  options={[
+    "Ambos tienen igual prioridad",
+    "mcp-fetch tiene prioridad",
+    "Puppeteer tiene prioridad (browser completo > HTTP simple)",
+    "Se usan siempre ambos"
+  ]}
+  correct={2}
+/>
+
+En la última lección veremos cómo integrar todo: plataformas + MCP + skills en un sistema unificado.

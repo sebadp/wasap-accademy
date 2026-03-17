@@ -1,0 +1,196 @@
+---
+title: "Data Provenance: Quién Cambió Qué y Cuándo"
+description: "Audit log de entidades: acciones CREATE/UPDATE/DELETE/MERGE con snapshots before/after"
+xpReward: 100
+---
+
+## El Problema de la Procedencia
+
+Cuando el LLM extrae un hecho, lo guarda como memoria, y luego el consolidador lo mergea con otro, se pierde el rastro. ¿De dónde salió esta información? ¿Quién la modificó? ¿Cuál era el valor anterior?
+
+**Data provenance** resuelve esto: un log inmutable de cada mutación.
+
+<Concept title="Data Provenance">
+Es el registro del linaje de un dato: quién lo creó, quién lo modificó, cuándo, y cuál era el estado antes y después del cambio. En compliance, esto se llama "audit trail". En data engineering, "data lineage".
+</Concept>
+
+## entity_audit_log
+
+```sql
+CREATE TABLE IF NOT EXISTS entity_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,      -- 'memory', 'note', 'entity', 'relation'
+    entity_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK(
+        action IN ('CREATE', 'UPDATE', 'DELETE', 'MERGE')
+    ),
+    actor TEXT NOT NULL CHECK(
+        actor IN (
+            'user', 'llm_flush', 'llm_consolidator',
+            'tool', 'agent', 'system', 'file_sync'
+        )
+    ),
+    before_snapshot TEXT,           -- JSON del estado anterior (NULL en CREATE)
+    after_snapshot TEXT,            -- JSON del estado nuevo (NULL en DELETE)
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_entity
+    ON entity_audit_log(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_audit_actor
+    ON entity_audit_log(actor);
+```
+
+## Los 7 Actores
+
+Cada mutación registra **quién** la hizo:
+
+| Actor | Descripción | Ejemplo |
+|-------|-------------|---------|
+| `user` | Acción directa del usuario | `/remember`, `/forget` |
+| `llm_flush` | LLM extrayendo hechos pre-compactación | `flush_to_memory()` |
+| `llm_consolidator` | LLM mergeando memorias duplicadas | `consolidator.py` |
+| `tool` | Ejecución de un tool/skill | `save_note` tool |
+| `agent` | Loop agéntico autónomo | Agent creando sub-tareas |
+| `system` | Operación del sistema | Backfill, startup, migration |
+| `file_sync` | Sync desde archivo MEMORY.md | `watcher.py` detecta edición |
+
+<Callout variant="info" title="¿Por qué 7 actores?">
+Distinguir actores permite auditoría precisa: "¿Cuántas memorias fueron creadas por el LLM vs el usuario?" o "¿El consolidador borró algo importante?" Sin actores, todo el audit log sería una lista opaca de cambios.
+</Callout>
+
+## AuditLogger
+
+```python
+# app/ontology/audit.py
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Module-level accessor para evitar parameter threading
+_audit_logger: "AuditLogger | None" = None
+
+def get_audit_logger() -> "AuditLogger | None":
+    return _audit_logger
+
+def set_audit_logger(audit: "AuditLogger") -> None:
+    global _audit_logger
+    _audit_logger = audit
+
+
+class AuditLogger:
+    def __init__(self, repository: Repository):
+        self._repo = repository
+
+    async def log(
+        self,
+        entity_type: str,
+        entity_id: int,
+        action: str,
+        actor: str,
+        before: dict | None = None,
+        after: dict | None = None,
+    ) -> None:
+        """Registrar una mutación en el audit log."""
+        try:
+            await self._repo.insert_audit_log(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                action=action,
+                actor=actor,
+                before_snapshot=json.dumps(before) if before is not None else None,
+                after_snapshot=json.dumps(after) if after is not None else None,
+            )
+        except Exception as e:
+            # Best-effort: no fallar la operación principal
+            logger.warning("Audit log failed: %s", e)
+```
+
+<Callout variant="warning" title="Best-effort">
+El audit log nunca debe bloquear la operación principal. Si la inserción falla, se loguea un warning y la vida sigue. Es el mismo patrón que los embeddings: complemento valioso pero no critico.
+</Callout>
+
+## Module-Level Accessor
+
+El `AuditLogger` se inicializa en el lifespan y se accede desde cualquier módulo sin pasarlo como parámetro:
+
+```python
+# En main.py (lifespan)
+audit = AuditLogger(repository)
+set_audit_logger(audit)
+
+# En cualquier módulo
+from app.ontology.audit import get_audit_logger
+
+async def some_operation():
+    audit = get_audit_logger()
+    if audit:
+        await audit.log(
+            entity_type="memory",
+            entity_id=42,
+            action="UPDATE",
+            actor="llm_consolidator",
+            before={"content": "Juan usa Python"},
+            after={"content": "Juan es senior Python developer"},
+        )
+```
+
+<Concept title="Module-level accessor">
+El patrón `get_audit_logger()` / `set_audit_logger()` evita parameter threading: pasar el audit logger como argumento a través de 5+ niveles de funciones. Es similar a cómo `get_current_trace()` funciona en el sistema de tracing.
+</Concept>
+
+## Ejemplo: Audit Trail de una Memoria
+
+```json
+[
+  {
+    "action": "CREATE",
+    "actor": "user",
+    "after_snapshot": "{\"content\": \"Juan trabaja en backend\"}",
+    "created_at": "2024-03-15 10:00:00"
+  },
+  {
+    "action": "UPDATE",
+    "actor": "llm_consolidator",
+    "before_snapshot": "{\"content\": \"Juan trabaja en backend\"}",
+    "after_snapshot": "{\"content\": \"Juan es senior backend developer en la empresa\"}",
+    "created_at": "2024-03-15 22:00:00"
+  }
+]
+```
+
+<Quiz
+  question="¿Qué actor registra las mutaciones hechas por el consolidador de memorias?"
+  options={[
+    "user",
+    "system",
+    "llm_consolidator",
+    "agent"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué pasa si la inserción del audit log falla?"
+  options={[
+    "Se reintenta 3 veces",
+    "La operación principal también falla",
+    "Se loguea un warning y la operación principal continúa normalmente",
+    "Se guarda en un archivo de texto como fallback"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué ventaja tiene el patrón module-level accessor (get_audit_logger/set_audit_logger) sobre pasar el AuditLogger como parámetro?"
+  options={[
+    "Es más rápido en ejecución",
+    "Evita parameter threading: no hay que pasar el objeto a través de múltiples niveles de funciones",
+    "Permite tener múltiples instancias de AuditLogger simultáneamente",
+    "Es obligatorio en Python para objetos singleton"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo `memory_versions` agrega versionado inmutable para compliance total.

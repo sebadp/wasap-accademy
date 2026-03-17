@@ -1,0 +1,314 @@
+---
+title: "Prompt Versioning"
+description: "Tabla prompt_versions, cache chain, catálogo centralizado y fallback multi-capa"
+xpReward: 100
+---
+
+## El Problema: Prompts Hardcodeados No Evolucionan
+
+Si tu system prompt está hardcodeado en el código, para cambiarlo necesitás deploy. Eso es inaceptable cuando querés iterar rápido: probar variaciones, medir impacto, y hacer rollback si empeora.
+
+<Callout variant="info" title="Prompt versioning">
+LocalForge implementa un sistema de versionado de prompts donde cada prompt tiene múltiples versiones en la base de datos. Solo una versión está activa a la vez, y se puede cambiar sin redesplegar.
+</Callout>
+
+## El Catálogo: `prompt_registry.py`
+
+Todos los prompts del sistema tienen un default hardcodeado en un catálogo centralizado:
+
+```python
+# app/eval/prompt_registry.py
+PROMPT_DEFAULTS: dict[str, str] = {
+    "system_prompt": _SYSTEM_PROMPT,
+    "classifier": _CLASSIFIER_PROMPT,
+    "summarizer": _SUMMARIZER_PROMPT,
+    "flush_to_memory": _FLUSH_TO_MEMORY_PROMPT,
+    "consolidator": _CONSOLIDATOR_PROMPT,
+    "compaction_system": _COMPACTION_SYSTEM_PROMPT,
+    "planner_create": _PLANNER_CREATE_PROMPT,
+    "planner_replan": _PLANNER_REPLAN_PROMPT,
+    "planner_synthesize": _PLANNER_SYNTHESIZE_PROMPT,
+}
+
+def get_default(prompt_name: str) -> str | None:
+    """Return the hardcoded default for a named prompt, or None."""
+    return PROMPT_DEFAULTS.get(prompt_name)
+```
+
+<Concept title="Single source of truth">
+Todos los defaults viven en un solo archivo. Cuando se hace `seed_default_prompts()` al startup, se inserta v1 para cualquier prompt que no exista aún en la DB. Los módulos pueden tener sus propias constantes como fallback, pero en runtime se prefiere la versión de la DB.
+</Concept>
+
+## Ejemplos del Catálogo
+
+El system prompt principal:
+
+```python
+_SYSTEM_PROMPT = (
+    "You are a helpful personal assistant on WhatsApp. "
+    "Be friendly. Answer in the same language the user writes in. "
+    "Adapt your response length to the user's request — be brief for "
+    "simple questions, detailed when asked for long or thorough answers. "
+    "CRITICAL: When the user provides a URL and you have URL-reading "
+    "tools available, ALWAYS use them to fetch the content before responding."
+)
+```
+
+El clasificador de intent (con placeholders):
+
+```python
+_CLASSIFIER_PROMPT = (
+    "Classify this message into tool categories. "
+    'Reply with ONLY category names separated by commas, or "none".\n'
+    "Categories: {categories}, none\n\n"
+    "Examples:\n"
+    '"what time is it" → time\n'
+    '"15% of 230" → math\n'
+    '"tell me a joke" → none\n\n'
+    "{recent_context}"
+    "Message to classify: {user_message}"
+)
+```
+
+## El Cache Chain: 5 Niveles de Fallback
+
+`get_active_prompt()` implementa una cadena de fallback robusta:
+
+```python
+# app/eval/prompt_manager.py
+async def get_active_prompt(
+    prompt_name: str,
+    repository: object,
+    default: str | None = None,
+) -> str:
+    """Return the active prompt content, with in-memory cache.
+
+    Fallback order:
+    1. Cache (in-memory dict — fastest)
+    2. DB active version
+    3. Langfuse prompt management (label="production")
+    4. prompt_registry default (hardcoded catalog)
+    5. Explicit `default` param (backward compat)
+    """
+    if prompt_name not in _active_prompts:
+        try:
+            # Nivel 2: DB
+            row = await repository.get_active_prompt_version(prompt_name)
+            if row:
+                _active_prompts[prompt_name] = row["content"]
+            else:
+                # Nivel 3: Langfuse (sync → offload to thread)
+                langfuse_content = await asyncio.to_thread(
+                    _try_langfuse_prompt, prompt_name
+                )
+                if langfuse_content:
+                    _active_prompts[prompt_name] = langfuse_content
+                else:
+                    # Nivel 4+5: registry o default explícito
+                    from app.eval.prompt_registry import get_default
+                    registry_default = get_default(prompt_name)
+                    resolved = registry_default or default
+                    if resolved is None:
+                        raise ValueError(
+                            f"No content found for prompt '{prompt_name}'"
+                        )
+                    _active_prompts[prompt_name] = resolved
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to load prompt %s from DB", prompt_name)
+            # Fallback on exception too
+            from app.eval.prompt_registry import get_default
+            resolved = get_default(prompt_name) or default
+            if resolved is None:
+                raise ValueError(...) from exc
+            _active_prompts[prompt_name] = resolved
+    return _active_prompts[prompt_name]
+```
+
+<Step number={1} title="Cache in-memory (más rápido)">
+Dict a nivel de módulo: `_active_prompts[prompt_name]`. Si ya está cacheado, retorna inmediatamente sin I/O.
+</Step>
+
+<Step number={2} title="DB active version">
+Busca en `prompt_versions` la fila con `is_active = 1` para ese `prompt_name`.
+</Step>
+
+<Step number={3} title="Langfuse Prompt Management">
+Intenta cargar el prompt desde Langfuse con label "production". Esto permite editar prompts desde el dashboard de Langfuse.
+</Step>
+
+<Step number={4} title="Registry default (catálogo hardcodeado)">
+El valor default de `prompt_registry.PROMPT_DEFAULTS`.
+</Step>
+
+<Step number={5} title="Explicit default (backward compat)">
+El parámetro `default` pasado por el caller. Solo como último recurso.
+</Step>
+
+## Langfuse como Fuente de Prompts
+
+```python
+def _try_langfuse_prompt(name: str) -> str | None:
+    """Try to fetch a prompt from Langfuse Prompt Management."""
+    try:
+        settings = Settings()
+        if not settings.langfuse_public_key or not settings.langfuse_secret_key:
+            return None
+        langfuse = Langfuse(
+            public_key=settings.langfuse_public_key,
+            secret_key=settings.langfuse_secret_key,
+            host=settings.langfuse_host,
+        )
+        prompt = langfuse.get_prompt(name, label="production")
+        compiled = prompt.compile()
+        if compiled:
+            return compiled
+    except Exception:
+        logger.debug("Langfuse prompt fallback failed for '%s'", name)
+    return None
+```
+
+<Callout variant="tip" title="asyncio.to_thread para Langfuse sync">
+`_try_langfuse_prompt` es sync (el SDK de Langfuse no es async). Se ejecuta con `asyncio.to_thread()` para no bloquear el event loop. Si Langfuse no responde, no afecta al flujo principal.
+</Callout>
+
+## Invalidación del Cache
+
+Cuando se activa una nueva versión, el cache se invalida:
+
+```python
+# module-level cache: prompt_name → active content
+_active_prompts: dict[str, str] = {}
+
+def invalidate_prompt_cache(prompt_name: str | None = None) -> None:
+    """Invalidate cache for a specific prompt, or all prompts."""
+    if prompt_name:
+        _active_prompts.pop(prompt_name, None)
+    else:
+        _active_prompts.clear()
+```
+
+Esto se llama desde `/approve-prompt` después de activar una nueva versión:
+
+```python
+# app/commands/builtins.py — cmd_approve_prompt
+await context.repository.activate_prompt_version(prompt_name, version)
+invalidate_prompt_cache(prompt_name)
+```
+
+## Activar con Eval Gate
+
+Antes de activar, se puede correr un eval automático como gate de calidad:
+
+```python
+# app/eval/prompt_manager.py
+async def activate_with_eval(
+    prompt_name: str,
+    version: int,
+    repository: object,
+    ollama_client: object,
+    eval_threshold: float = 0.7,
+) -> dict:
+    """Run eval suite with a candidate prompt, return results."""
+    row = await repository.get_prompt_version(prompt_name, version)
+    candidate_content = row["content"]
+
+    # Fetch entries con expected_output
+    entries = await repository.get_dataset_entries(
+        entry_type=None, limit=20
+    )
+    entries_with_expected = [
+        e for e in entries if e.get("expected_output")
+    ]
+
+    correct = 0
+    total = 0
+    for entry in entries_with_expected[:10]:  # cap at 10
+        # Generar respuesta con el prompt candidato
+        messages = [
+            ChatMessage(role="system", content=candidate_content),
+            ChatMessage(role="user", content=entry["input_text"]),
+        ]
+        resp = await ollama_client.chat(messages, think=False)
+
+        # LLM-as-judge binary
+        judge_prompt = (
+            f"Question: {entry['input_text'][:300]}\n"
+            f"Expected: {entry['expected_output'][:300]}\n"
+            f"Actual: {str(resp).strip()[:300]}\n\n"
+            "Does the actual answer correctly answer the question? "
+            "Reply ONLY 'yes' or 'no'."
+        )
+        judge_resp = await ollama_client.chat(
+            [ChatMessage(role="user", content=judge_prompt)],
+            think=False,
+        )
+        if str(judge_resp).strip().lower().startswith("yes"):
+            correct += 1
+        total += 1
+
+    score = correct / total if total else 0.0
+    return {
+        "passed": score >= eval_threshold,
+        "score": round(score, 3),
+        "details": f"{correct}/{total} entries passed ({score:.0%})",
+        "activated": False,  # human must confirm
+        "entries_evaluated": total,
+    }
+```
+
+<Callout variant="warning" title="activated: False siempre">
+`activate_with_eval` NUNCA activa el prompt — solo corre el eval y retorna los resultados. La activación real la hace el humano via `/approve-prompt`. Esto es un design choice: nunca auto-activate sin confirmación humana.
+</Callout>
+
+## El Flujo Completo
+
+```
+[LLM propone cambio] → save_prompt_version(v=N+1, is_active=0)
+     ↓
+[Humano ejecuta /approve-prompt system_prompt N+1]
+     ↓
+[activate_with_eval() corre eval con dataset existente]
+     ↓
+[Score >= 70%?]
+  ├─ YES → Resultado guardado, humano decide activar
+  └─ NO → Resultado guardado, requiere revisión manual
+     ↓
+[Humano ejecuta /approve-prompt → activate + invalidate_cache + sync Langfuse]
+```
+
+<Quiz
+  question="¿Cuántos niveles de fallback tiene get_active_prompt()?"
+  options={[
+    "2 (cache + DB)",
+    "3 (cache + DB + default)",
+    "5 (cache → DB → Langfuse → registry → explicit default)",
+    "1 (solo DB)"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando se llama invalidate_prompt_cache('system_prompt')?"
+  options={[
+    "Se borra el prompt de la DB",
+    "Se elimina la entrada del cache in-memory, forzando una recarga desde DB en el próximo request",
+    "Se desactiva el prompt",
+    "Se restaura el default"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué activate_with_eval retorna activated=False siempre?"
+  options={[
+    "Porque hay un bug",
+    "Porque solo corre en modo test",
+    "Porque la activación real requiere confirmación humana — nunca auto-activate sin oversight",
+    "Porque Langfuse no soporta activación"
+  ]}
+  correct={2}
+/>
+
+En la última lección del módulo veremos la auto-evolución: cómo el sistema propone y aplica mejoras a sus propios prompts.

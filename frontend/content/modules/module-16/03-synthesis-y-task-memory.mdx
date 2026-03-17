@@ -1,0 +1,226 @@
+---
+title: "Synthesis & Task Memory"
+description: "Resumir resultados, persistir en task_memory, y bridge a conversación"
+xpReward: 100
+---
+
+## Fase 3: Synthesize
+
+Cuando todas las tareas están completadas (o después de max replans), el planner genera un resumen final:
+
+```python
+# app/agent/planner.py
+async def synthesize(
+    objective: str,
+    plan: AgentPlan,
+    ollama_client: OllamaClient,
+) -> str:
+    """Generate final summary from all task results."""
+    all_results = "\n".join(
+        f"#{t.id} [{t.status}] {t.description}\n"
+        f"  {t.result or '(no result)'}"
+        for t in plan.tasks
+    )
+
+    prompt = _PLANNER_SYNTHESIZE_PROMPT.format(
+        objective=objective,
+        context_summary=plan.context_summary,
+        all_results=all_results,
+    )
+
+    summary = await ollama_client.chat(
+        [ChatMessage(role="user", content=prompt)],
+        think=False,
+    )
+    return str(summary)
+```
+
+## El Prompt de Synthesis
+
+```python
+_PLANNER_SYNTHESIZE_PROMPT = """\
+You are summarizing the results of a completed agent session.
+
+OBJECTIVE: {objective}
+
+CONTEXT: {context_summary}
+
+ALL STEP RESULTS:
+{all_results}
+
+Write a concise, actionable summary of what was accomplished
+and any key findings. Keep it under 500 words. Use markdown.
+"""
+```
+
+<Concept title="Under 500 words">
+El límite de 500 palabras es intencional. El usuario recibe este resumen por WhatsApp — mensajes largos son difíciles de leer en móvil. Si el agente necesita reportar más detalle, debería haber usado un worker "reporter" que guardó el reporte completo.
+</Concept>
+
+## Ejemplo de Synthesis
+
+Input (all step results):
+```
+#1 [done] Read repository structure
+  Found: FastAPI app in app/, 15 modules, tests/ with 8 files.
+  No CI/CD config. Makefile has basic targets.
+
+#2 [done] Run test suite
+  42 tests, all passing. Coverage: 45%.
+  Untested: agent/, security/, mcp/
+
+#3 [done] Analyze coverage gaps
+  Critical gaps: webhook/router.py (0%), agent/loop.py (0%).
+  These are the most complex modules.
+
+#4 [done] Generate recommendations
+  Priority: 1) Integration tests for router, 2) Unit tests for
+  policy engine, 3) E2E test for agent session lifecycle.
+```
+
+Output:
+```markdown
+## Coverage Analysis Results
+
+The backend has **45% test coverage** with 42 passing tests.
+
+### Critical Gaps
+- `webhook/router.py` — 0% coverage (main message processing pipeline)
+- `agent/loop.py` — 0% coverage (agentic session management)
+- `security/policy_engine.py` — 0% coverage (YAML policy evaluation)
+
+### Recommendations (by priority)
+1. **Integration tests for webhook router** — test _handle_message flow
+2. **Unit tests for policy engine** — test regex matching, BLOCK/FLAG/ALLOW
+3. **E2E test for agent lifecycle** — test session creation → execution → completion
+
+No CI/CD pipeline exists yet. Consider adding GitHub Actions after improving coverage.
+```
+
+## Bridge a Conversación
+
+Después de la synthesis, el resultado se guarda en el historial de conversación:
+
+```python
+# Al final de _run_agent_body
+# Bridge: el resultado del agente queda en el contexto
+# de la conversación normal
+await repository.save_message(
+    conv_id=conv_id,
+    role="assistant",
+    content=f"[Sesión agéntica completada]\n{final_summary[:500]}",
+)
+```
+
+<Callout variant="tip" title="Context continuity">
+El bridge permite que en mensajes futuros el usuario pueda referirse a lo que hizo el agente: "en base al análisis que hiciste, ¿qué test escribo primero?". El LLM ve el resumen en su historial de conversación.
+</Callout>
+
+## Task Memory: El Plan como Tool
+
+Además del plan estructurado (AgentPlan), el agente tiene acceso a un **task plan markdown** que puede manipular con 3 tools:
+
+```python
+# El agente puede crear su propio plan libre
+await create_task_plan("""
+- [ ] Investigar repos similares
+- [ ] Leer documentación de Langfuse
+- [ ] Proponer architecture decision record
+- [ ] Escribir primer borrador
+""")
+
+# Y marcarlo progresivamente
+await update_task_status(1, done=True)
+# → "- [x] Investigar repos similares"
+
+# Y consultarlo
+plan = await get_task_plan()
+# → muestra el checklist actualizado
+```
+
+<Concept title="Task plan ≠ AgentPlan">
+Hay dos tipos de plan en el agente: el **AgentPlan** (JSON estructurado, creado por el planner) y el **task_plan** (checklist markdown, creado por el propio agente con tools). El AgentPlan se usa en modo planner. El task_plan se usa en modo reactivo o como complemento.
+</Concept>
+
+## Mensaje Final al Usuario
+
+```python
+# Construir mensaje de cierre
+final_msg_parts = [final_summary]
+
+# Agregar estado del plan si hay uno
+if session.plan:
+    done_count = sum(1 for t in session.plan.tasks if t.status == "done")
+    total = len(session.plan.tasks)
+    failed = sum(1 for t in session.plan.tasks if t.status == "failed")
+    final_msg_parts.append(
+        f"\n📊 Plan: {done_count}/{total} tareas completadas"
+        + (f", {failed} fallidas" if failed else "")
+    )
+
+if session.task_plan:
+    done = session.task_plan.count("[x]")
+    pending = session.task_plan.count("[ ]")
+    final_msg_parts.append(
+        f"📋 Checklist: {done}/{done + pending} items completados"
+    )
+
+await wa_client.send_message(
+    session.phone_number,
+    "\n".join(final_msg_parts),
+)
+```
+
+## Flujo Completo con Tracing
+
+Todo el flujo del planner está instrumentado con spans:
+
+```
+[Trace: agent_session_abc123]
+  ├─ [span: planner_create_plan] ─────── 3s
+  ├─ [span: worker_task_1] ──────────── 5s
+  │   └─ [generation: llm_chat] ──────  2s
+  │   └─ [tool: search_code] ────────   3s
+  ├─ [span: worker_task_2] ──────────── 8s
+  │   └─ [generation: llm_chat] ──────  3s
+  │   └─ [tool: run_command] ─────────  5s
+  ├─ [span: planner_replan] ─────────── 2s
+  ├─ [span: worker_task_3] ──────────── 4s
+  ├─ [span: planner_synthesize] ──────── 2s
+  └─ [span: goal_completion_judge] ──── 1s
+```
+
+<Quiz
+  question="¿Por qué el resumen de synthesis se limita a 500 palabras?"
+  options={[
+    "Porque Ollama no soporta más",
+    "Porque el usuario lee en WhatsApp/Telegram móvil — mensajes largos son difíciles de leer",
+    "Porque la DB tiene límite de caracteres",
+    "Es arbitrario"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué es el 'bridge a conversación'?"
+  options={[
+    "Un tipo de webhook",
+    "Guardar el resultado del agente en el historial de conversación para que mensajes futuros tengan contexto",
+    "Un puente entre WhatsApp y Telegram",
+    "Un backup de la sesión"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es la diferencia entre AgentPlan y task_plan?"
+  options={[
+    "Son lo mismo",
+    "AgentPlan es JSON estructurado creado por el planner; task_plan es checklist markdown creado por el propio agente con tools",
+    "task_plan es más detallado",
+    "AgentPlan solo funciona con workers"
+  ]}
+  correct={1}
+/>
+
+En la última lección veremos el JSON parsing robusto y el fallback plan.

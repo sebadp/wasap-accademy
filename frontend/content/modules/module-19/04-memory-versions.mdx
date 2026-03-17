@@ -1,0 +1,220 @@
+---
+title: "Memory Versions e Historial Inmutable"
+description: "Versionado append-only de memorias, trace_data_origin y get_entity_history para compliance"
+xpReward: 125
+---
+
+## Versionado Inmutable
+
+El audit log registra *qué cambió*. Pero para reconstruir el estado exacto de una memoria en cualquier punto del tiempo, necesitamos **versionado completo**: cada cambio crea una nueva versión, y las versiones anteriores nunca se borran.
+
+<Concept title="Append-only history">
+Un historial append-only solo agrega registros, nunca modifica ni borra los existentes. Es el mismo principio de un ledger contable o un log de Git: la historia es inmutable. Esto es fundamental para compliance (GDPR audit trail) y debugging ("¿qué decía esta memoria hace 3 días?").
+</Concept>
+
+## memory_versions Table
+
+```sql
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id INTEGER NOT NULL,
+    version_number INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    change_reason TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(memory_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_versions_memory
+    ON memory_versions(memory_id, version_number DESC);
+```
+
+<Callout variant="info" title="Indice descendente">
+El índice `DESC` en `version_number` optimiza la query más común: obtener la versión más reciente de una memoria (`ORDER BY version_number DESC LIMIT 1`).
+</Callout>
+
+## Creación Automática de Versiones
+
+Cada vez que una memoria cambia, se crea una nueva versión:
+
+```python
+# app/ontology/versioning.py
+
+async def create_version(
+    repository: Repository,
+    memory_id: int,
+    content: str,
+    actor: str,
+    change_reason: str | None = None,
+) -> int:
+    """Crear nueva versión de una memoria. Retorna version_number."""
+    # Obtener el número de versión más alto
+    current = await repository.get_latest_version(memory_id)
+    next_version = (current["version_number"] + 1) if current else 1
+
+    await repository.insert_memory_version(
+        memory_id=memory_id,
+        version_number=next_version,
+        content=content,
+        actor=actor,
+        change_reason=change_reason,
+    )
+    return next_version
+```
+
+Flujo integrado con el sistema de memorias:
+
+```python
+# En add_memory (simplificado)
+async def add_memory(content: str, actor: str = "user"):
+    memory_id = await repository.add_memory(content)
+    await create_version(repository, memory_id, content, actor, "initial")
+    await audit.log("memory", memory_id, "CREATE", actor, after={"content": content})
+    return memory_id
+
+# En consolidator (cuando mergea dos memorias)
+async def merge_memories(keep_id: int, remove_id: int, merged_content: str):
+    old = await repository.get_memory(keep_id)
+    await repository.update_memory(keep_id, merged_content)
+    await create_version(
+        repository, keep_id, merged_content,
+        actor="llm_consolidator",
+        change_reason=f"merged with memory {remove_id}",
+    )
+    await audit.log(
+        "memory", keep_id, "MERGE", "llm_consolidator",
+        before={"content": old["content"]},
+        after={"content": merged_content},
+    )
+```
+
+## Tools de Provenance
+
+Dos herramientas permiten al usuario inspeccionar el linaje de datos:
+
+### trace_data_origin
+
+```python
+# app/skills/tools/provenance_tools.py
+
+async def trace_data_origin(
+    entity_type: str,
+    entity_id: int,
+) -> dict:
+    """
+    Rastrear el origen completo de un dato.
+    Retorna: versiones + audit log combinados.
+    """
+    versions = await repository.get_all_versions(entity_type, entity_id)
+    audit_trail = await repository.get_audit_log(entity_type, entity_id)
+
+    return {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "total_versions": len(versions),
+        "created_by": audit_trail[0]["actor"] if audit_trail else "unknown",
+        "created_at": audit_trail[0]["created_at"] if audit_trail else None,
+        "last_modified_by": audit_trail[-1]["actor"] if audit_trail else None,
+        "versions": versions,
+        "audit_trail": audit_trail,
+    }
+```
+
+### get_entity_history
+
+```python
+async def get_entity_history(
+    entity_type: str,
+    actor: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Obtener historial filtrado por tipo y/o actor.
+    Útil para preguntas como "¿Qué memorias modificó el consolidador?"
+    """
+    return await repository.query_audit_log(
+        entity_type=entity_type,
+        actor=actor,
+        limit=limit,
+    )
+```
+
+## Ejemplo de Uso
+
+El usuario puede preguntar:
+
+```
+Usuario: "¿De dónde salió mi memoria sobre Python?"
+```
+
+El LLM usa `trace_data_origin("memory", 42)` y responde:
+
+```
+La memoria fue creada por vos el 15 de marzo a las 10:00
+con el texto "Juan usa Python". Luego el consolidador
+la actualizó el mismo día a las 22:00, mergeándola
+con otra memoria para quedar como "Juan es senior
+Python developer".
+```
+
+<Callout variant="tip" title="Compliance y confianza">
+Poder explicar el origen de cada dato construye confianza en el sistema. El usuario sabe que el LLM no inventó información, sino que puede rastrear cada hecho hasta su fuente original.
+</Callout>
+
+## Historial Inmutable vs Storage
+
+```
+memoria_id=42
+
+Version 1: "Juan usa Python"           (actor: user)
+Version 2: "Juan es senior Python dev" (actor: llm_consolidator)
+Version 3: "Juan es senior Python dev  (actor: user)
+            en Buenos Aires"
+
+╔═══════════════════════════════════════╗
+║  Las versiones NUNCA se borran.       ║
+║  Solo se agregan nuevas versiones.    ║
+║  Borrar una memoria marca la última   ║
+║  versión, no elimina las anteriores.  ║
+╚═══════════════════════════════════════╝
+```
+
+<Callout variant="warning" title="Storage growth">
+El versionado consume espacio proporcional a la cantidad de cambios. Para memorias que cambian frecuentemente, considerar una política de retención (ej: mantener últimas N versiones para queries rápidas, archivar las anteriores).
+</Callout>
+
+<Quiz
+  question="¿Qué pasa con las versiones anteriores cuando una memoria se actualiza?"
+  options={[
+    "Se borran para ahorrar espacio",
+    "Se sobreescriben con el nuevo contenido",
+    "Se mantienen intactas (append-only), y se crea una nueva versión",
+    "Se mueven a una tabla de archivo"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué retorna trace_data_origin?"
+  options={[
+    "Solo la versión actual de la memoria",
+    "Solo el audit trail de cambios",
+    "Todas las versiones + audit trail completo combinados",
+    "El embedding vector de la memoria"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué el índice en memory_versions usa version_number DESC?"
+  options={[
+    "Porque SQLite requiere un orden explícito en todos los índices",
+    "Para optimizar la query más común: obtener la versión más reciente de una memoria",
+    "Para que las versiones se inserten más rápido",
+    "Para mantener compatibilidad con PostgreSQL"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo de Knowledge Graphs y Data Provenance. Ahora tu asistente puede rastrear el origen de cada dato y explorar relaciones estructuradas entre entidades.

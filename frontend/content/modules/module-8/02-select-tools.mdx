@@ -1,0 +1,254 @@
+---
+title: "select_tools"
+description: "Mapeo deterministico de categorias a herramientas con budget proporcional"
+xpReward: 75
+---
+
+## De Categorias a Herramientas
+
+`select_tools()` es una funcion **deterministica** (sin LLM). Toma las categorias de classify_intent y retorna las herramientas especificas. Este es el Stage 2 del routing.
+
+<Callout variant="info" title="Deterministico = testeable">
+Al no depender de un LLM, `select_tools` produce el mismo resultado para los mismos inputs. Esto permite unit tests exactos sin mocks ni variabilidad.
+</Callout>
+
+## TOOL_CATEGORIES: El Mapeo Completo
+
+El diccionario central vive en `app/skills/router.py` y mapea cada categoria a sus tool names:
+
+```python
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "time": [
+        "get_current_datetime", "convert_timezone",
+        "schedule_task", "list_schedules",
+        "create_cron", "list_crons", "delete_cron",
+    ],
+    "math": ["calculate"],
+    "weather": ["get_weather"],
+    "search": ["web_search"],
+    "news": ["search_news", "add_news_preference"],
+    "notes": [
+        "save_note", "list_notes", "search_notes",
+        "delete_note", "get_note",
+    ],
+    "files": [
+        "read_file", "write_file", "list_directory",
+        "search_files", "read_text_file", "list_allowed_directories",
+    ],
+    "memory": [
+        "create_entities", "add_observations", "search_nodes",
+        "read_graph", "open_nodes", "delete_entities",
+        "delete_observations", "delete_relations", "create_relations",
+    ],
+    "github": [
+        "get_file_contents", "search_repositories",
+        "list_issues", "list_pull_requests",
+        "create_issue", "create_pull_request", "create_or_update_file",
+    ],
+    "projects": [
+        "create_project", "list_projects", "get_project",
+        "add_project_note", "get_project_note", "list_project_notes",
+        "search_project_notes", "add_task", "update_task",
+        "update_project_status", "project_progress", "delete_task",
+    ],
+    "tools": ["list_tool_categories", "list_category_tools"],
+    # ... mas categorias
+}
+```
+
+<Concept title="El orden importa">
+Las herramientas estan ordenadas por prioridad dentro de cada categoria. Cuando el budget es limitado, se toman las primeras N. Por ejemplo en "time", `get_current_datetime` va primero porque es la mas usada, mientras que `delete_cron` va al final.
+</Concept>
+
+## La Implementacion Real
+
+```python
+def select_tools(
+    categories: list[str],
+    all_tools: dict[str, dict],
+    max_tools: int = 8,
+) -> list[dict]:
+    """Retorna schemas Ollama filtrados, con budget proporcional."""
+    if not categories:
+        return []
+
+    # Filtrar categorias fantasma (e.g., "fetch" sin MCP server)
+    active_categories = [c for c in categories if c in TOOL_CATEGORIES]
+    if not active_categories:
+        return []
+
+    selected: list[dict] = []
+    seen: set[str] = set()
+    per_cat = max(1, max_tools // len(active_categories))
+
+    for category in active_categories:
+        tool_names = TOOL_CATEGORIES.get(category, [])
+        cat_count = 0
+        for name in tool_names:
+            if name in seen:
+                continue          # Dedup: evitar tools compartidos
+            if name in all_tools:
+                selected.append(all_tools[name])
+                seen.add(name)
+                cat_count += 1
+            if cat_count >= per_cat:
+                break             # Budget de esta categoria agotado
+
+    return selected[:max_tools]   # Cap global
+```
+
+Hay tres mecanismos de control aqui:
+
+<Step number={1} title="Filtro de categorias fantasma">
+```python
+active_categories = [c for c in categories if c in TOOL_CATEGORIES]
+```
+Las categorias que no existen (porque el MCP server no esta corriendo, por ejemplo) se excluyen *antes* de calcular el budget. Esto evita desperdiciar slots.
+</Step>
+
+<Step number={2} title="Distribucion proporcional">
+```python
+per_cat = max(1, max_tools // len(active_categories))
+```
+Cada categoria recibe al menos 1 slot, y el budget se divide equitativamente. Con 2 categorias y budget 8: `per_cat = 4`. Con 4 categorias: `per_cat = 2`.
+</Step>
+
+<Step number={3} title="Deduplicacion y cap global">
+```python
+if name in seen: continue        # No repetir tools
+return selected[:max_tools]      # Nunca superar el limite
+```
+El `set seen` previene que herramientas compartidas entre categorias se dupliquen. El slice final garantiza el cap.
+</Step>
+
+## Ejemplo Concreto
+
+```
+Mensaje: "Guarda una nota sobre el clima en Buenos Aires"
+classify_intent -> ["notes", "weather"]
+
+select_tools(["notes", "weather"], all_tools, max_tools=8):
+  active_categories = ["notes", "weather"]  (ambas existen)
+  per_cat = max(1, 8 // 2) = 4
+
+  notes (budget: 4):
+    save_note     -> agregado (1/4)
+    list_notes    -> agregado (2/4)
+    search_notes  -> agregado (3/4)
+    delete_note   -> agregado (4/4) -- budget agotado
+    get_note      -> SKIP (budget lleno)
+
+  weather (budget: 4):
+    get_weather   -> agregado (1/4)
+    -- no hay mas tools en weather
+
+  Total: 5 tools (< 8, dentro del cap)
+  -> [save_note, list_notes, search_notes, delete_note, get_weather]
+```
+
+## Caso Edge: Una Sola Categoria
+
+Cuando hay una sola categoria, recibe todo el budget:
+
+```
+Mensaje: "Mostra mis proyectos"
+classify_intent -> ["projects"]
+
+select_tools(["projects"], all_tools, max_tools=8):
+  per_cat = max(1, 8 // 1) = 8  -- Todo el budget
+
+  projects (budget: 8):
+    create_project      (1/8)
+    list_projects       (2/8)
+    get_project         (3/8)
+    add_project_note    (4/8)
+    get_project_note    (5/8)
+    list_project_notes  (6/8)
+    search_project_notes(7/8)
+    add_task            (8/8) -- budget agotado
+    update_task         -> SKIP
+    ...
+
+  Total: 8 tools (= max_tools)
+```
+
+<Callout variant="tip" title="El orden dentro de la categoria importa">
+Con `projects` (12 tools) y budget de 8, las primeras 8 se seleccionan y las ultimas 4 no. Si el LLM necesita `delete_task` (posicion 12), puede usar `request_more_tools` para pedirlo.
+</Callout>
+
+## Categorias Dinamicas con MCP
+
+Cuando se conecta un nuevo MCP server, sus tools se registran en una nueva categoria:
+
+```python
+def register_dynamic_category(category: str, tool_names: list[str]) -> None:
+    """Agregar o actualizar una categoria en runtime."""
+    existing = TOOL_CATEGORIES.get(category, [])
+    merged = list(existing)
+    for name in tool_names:
+        if name not in merged:
+            merged.append(name)
+    TOOL_CATEGORIES[category] = merged
+```
+
+<Callout variant="info" title="Registro unificado">
+Desde la perspectiva de `select_tools`, no hay diferencia entre skills builtin y MCP tools. Ambos viven en el mismo `TOOL_CATEGORIES` dict. Un tool de GitHub MCP y un tool builtin de notas se seleccionan con la misma logica.
+</Callout>
+
+## El Parametro max_tools
+
+El valor default viene de Settings:
+
+```python
+class Settings(BaseSettings):
+    max_tools_per_call: int = 8  # Configurable via env var
+```
+
+Este valor se pasa desde `router.py` al `executor.py`:
+
+```python
+result = await execute_tool_loop(
+    messages=messages,
+    max_tools=settings.max_tools_per_call,  # default: 8
+    ...
+)
+```
+
+<Concept title="max_tools_per_call = 8 es el sweet spot">
+Con qwen3.5:9b, 8 tools es el mejor balance: suficientes para cubrir la mayoria de tareas multi-herramienta, pocas para que el modelo no se confunda. Si usas un modelo mas grande (e.g., qwen3:32b), podes subir este valor.
+</Concept>
+
+<Quiz
+  question="select_tools usa LLM para elegir herramientas?"
+  options={[
+    "Si, hace otra llamada al LLM para refinar",
+    "No, es un mapeo deterministico con un diccionario",
+    "Depende de la cantidad de categorias",
+    "Solo si hay mas de 8 tools candidatas"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Si classify retorna ['notes', 'weather'] y max_tools=8, cuantas herramientas se seleccionan?"
+  options={[
+    "8 (siempre el maximo)",
+    "5 (4 de notes + 1 de weather, < 8)",
+    "2 (una por categoria)",
+    "Depende del LLM"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa si dos categorias comparten un tool name (e.g., 'get_conversation_transcript' en debugging y conversation)?"
+  options={[
+    "Se agrega dos veces al pool",
+    "Se deduplica automaticamente con el set 'seen' y solo se agrega una vez",
+    "Causa un error de conflicto",
+    "Se elige la version de la primera categoria"
+  ]}
+  correct={1}
+/>
+
+En la siguiente leccion veremos como las sticky categories mantienen continuidad.

@@ -1,0 +1,219 @@
+---
+title: "Backfill & Best-Effort"
+description: "Embeddings que nunca bloquean la app aunque fallen"
+xpReward: 75
+---
+
+## El Patrón Best-Effort
+
+En LocalForge, los embeddings son **best-effort**: si fallan, la app sigue funcionando. Un error de embedding **nunca** se propaga al usuario ni bloquea el procesamiento de mensajes.
+
+<Concept title="Best-effort = intentar sin garantizar">
+El sistema intenta generar y usar embeddings en cada oportunidad, pero si falla (Ollama caído, disco lleno, error de red), simplemente loguea un warning y continúa. La funcionalidad core (chat, memorias, notas) sigue operando sin embeddings.
+</Concept>
+
+## Los 3 Patrones de Best-Effort
+
+### Patrón 1: try/except con warning
+
+Cada función de indexación atrapa excepciones y no las propaga:
+
+```python
+# app/embeddings/indexer.py
+async def embed_memory(
+    memory_id: int,
+    content: str,
+    repository: Repository,
+    ollama_client: OllamaClient,
+    model: str,
+) -> None:
+    """Compute and store embedding for a single memory. Best-effort."""
+    try:
+        embeddings = await ollama_client.embed(
+            [content[:_MAX_EMBED_CHARS]], model=model
+        )
+        await repository.save_embedding(memory_id, embeddings[0])
+    except Exception:
+        logger.warning("Failed to embed memory %d", memory_id, exc_info=True)
+        # NO raise — la memoria existe sin embedding
+```
+
+<Callout variant="warning" title="logger.warning, no logger.debug">
+Originalmente los errores de embedding se logueaban como `debug` y eran invisibles en producción (nivel INFO). Ahora se usan `warning` para que los fallos de persistencia sean visibles en los logs sin crashear la app.
+</Callout>
+
+### Patrón 2: Flag de disponibilidad
+
+`init_db()` retorna un flag que controla si la búsqueda semántica está disponible:
+
+```python
+# app/database/db.py
+async def init_db(db_path, embedding_dims=768) -> tuple[aiosqlite.Connection, bool]:
+    # ... setup ...
+    vec_available = False
+    try:
+        import sqlite_vec
+        ext_path = sqlite_vec.loadable_path()
+        conn._connection.enable_load_extension(True)
+        conn._connection.load_extension(ext_path)
+        conn._connection.enable_load_extension(False)
+        # Create vector tables
+        await conn.execute(VEC_SCHEMA_MEMORIES.format(dims=embedding_dims))
+        await conn.execute(VEC_SCHEMA_NOTES.format(dims=embedding_dims))
+        # ... more vec tables ...
+        vec_available = True
+    except Exception:
+        logger.warning("sqlite-vec not available, semantic search disabled")
+
+    return conn, vec_available
+```
+
+### Patrón 3: Fallback graceful
+
+Cada punto de búsqueda tiene un path alternativo que funciona sin embeddings:
+
+```python
+# app/context/conversation_context.py — dentro de _get_memories_with_threshold
+if embedding is not None and settings is not None:
+    # Path semántico: buscar por similitud de vectores
+    results = await repository.search_similar_memories_with_distance(
+        embedding, top_k=settings.semantic_search_top_k,
+    )
+    # ... threshold filtering ...
+else:
+    # Path fallback: las últimas N memorias por recencia
+    top_k = settings.semantic_search_top_k if settings else 10
+    memories = await repository.get_active_memories(limit=top_k)
+```
+
+## Backfill: Indexación Retroactiva
+
+Al iniciar la app, `backfill_embeddings()` indexa memorias que no tienen embedding. Esto cubre:
+- Memorias creadas antes de activar embeddings
+- Memorias cuyo embedding falló en un intento anterior
+- Datos importados sin embeddings
+
+```python
+# app/embeddings/indexer.py
+BATCH_SIZE = 50
+
+async def backfill_embeddings(
+    repository: Repository,
+    ollama_client: OllamaClient,
+    model: str,
+) -> int:
+    """Backfill embeddings for all unembedded memories. Returns count embedded."""
+    unembedded = await repository.get_unembedded_memories()
+    if not unembedded:
+        return 0
+
+    count = 0
+    for i in range(0, len(unembedded), BATCH_SIZE):
+        batch = unembedded[i : i + BATCH_SIZE]
+        valid = [
+            (mem_id, content[:_MAX_EMBED_CHARS])
+            for mem_id, content in batch if content
+        ]
+        if not valid:
+            continue
+
+        ids, texts = zip(*valid, strict=False)
+        try:
+            # Batch embed: una sola llamada HTTP para 50 textos
+            embeddings = await ollama_client.embed(list(texts), model=model)
+            for mem_id, emb in zip(ids, embeddings, strict=False):
+                await repository.save_embedding(mem_id, emb, auto_commit=False)
+            # Single commit per batch instead of per-row
+            await repository.commit()
+            count += min(len(ids), len(embeddings))
+        except Exception:
+            logger.warning("Failed to backfill batch %d-%d", i, i + len(batch), exc_info=True)
+
+    if count:
+        logger.info("Backfilled %d memory embeddings", count)
+    return count
+```
+
+<Callout variant="tip" title="Batch processing: eficiencia x3">
+En vez de hacer una llamada HTTP a Ollama por cada memoria, el backfill envía batches de 50 textos. Y en vez de un commit por cada INSERT, hace un solo commit por batch. Esto reduce dramáticamente el overhead de red y I/O de disco.
+</Callout>
+
+## SQL para encontrar memorias sin embedding
+
+El backfill usa un LEFT JOIN para encontrar memorias que no tienen entrada en `vec_memories`:
+
+```sql
+-- repository.get_unembedded_memories()
+SELECT m.id, m.content
+FROM memories m
+LEFT JOIN vec_memories v ON v.memory_id = m.id
+WHERE m.active = 1 AND v.memory_id IS NULL
+```
+
+<Concept title="LEFT JOIN + IS NULL = anti-join">
+Este patrón SQL es la forma estándar de encontrar registros en una tabla que NO tienen correspondencia en otra. Si `v.memory_id IS NULL`, significa que no existe un embedding para esa memoria.
+</Concept>
+
+## Funciones de Backfill Análogas
+
+El mismo patrón se aplica a notas y notas de proyecto:
+
+| Función | Tabla vec | Qué indexa |
+|---------|-----------|-----------|
+| `backfill_embeddings()` | `vec_memories` | Memorias activas sin embedding |
+| `backfill_note_embeddings()` | `vec_notes` | Notas (título + contenido concatenados) |
+| `backfill_project_note_embeddings()` | `vec_project_notes` | Notas de proyecto |
+| `embed_tool_descriptions()` | `vec_tools` | Descripciones de tools para discovery semántico |
+
+## Degradación Grácil: Los 3 Niveles
+
+```
+Nivel 1 — Con sqlite-vec + embeddings:
+  Búsqueda semántica → resultados por relevancia de significado
+  ✅ Mejor calidad de contexto
+
+Nivel 2 — Sin sqlite-vec (extensión no disponible):
+  get_active_memories(limit=10) → últimas 10 memorias por recencia
+  ⚠️ Funcional, menor precisión
+
+Nivel 3 — Sin Ollama (servicio caído):
+  get_active_memories(limit=10) → mismas últimas 10 memorias
+  ⚠️ Funcional, sin personalización semántica
+```
+
+La app funciona en los 3 niveles. La calidad de las respuestas mejora con cada capa disponible.
+
+<Quiz
+  question="¿Qué significa 'best-effort' para los embeddings en LocalForge?"
+  options={[
+    "Se generan con el mejor algoritmo posible",
+    "Se intentan generar, pero si fallan la app sigue funcionando sin ellos",
+    "Se generan con máxima prioridad sobre otras operaciones",
+    "Se reintenta hasta que funcionen correctamente"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el backfill procesa en batches de 50 en vez de uno por uno?"
+  options={[
+    "Porque Ollama no soporta requests individuales",
+    "Para reducir llamadas HTTP a Ollama y commits a SQLite (eficiencia de red y disco)",
+    "Porque struct.pack requiere mínimo 50 vectores",
+    "Por un límite de sqlite-vec en inserciones"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo encuentra el backfill las memorias que necesitan embedding?"
+  options={[
+    "Busca memorias con un flag needs_embedding=true",
+    "Usa LEFT JOIN entre memories y vec_memories, filtrando donde vec es NULL",
+    "Lee un archivo de log con las memorias fallidas",
+    "Recalcula todos los embeddings desde cero"
+  ]}
+  correct={1}
+/>
+
+En la última lección armamos el pipeline RAG completo: de query a respuesta.

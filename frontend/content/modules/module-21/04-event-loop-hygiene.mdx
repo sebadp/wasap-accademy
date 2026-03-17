@@ -1,0 +1,219 @@
+---
+title: "Event Loop Hygiene"
+description: "NUNCA bloquear el event loop: to_thread, _track_task, graceful shutdown y model warmup"
+xpReward: 125
+---
+
+## La Regla de Oro
+
+<Callout variant="error" title="NUNCA bloquear el event loop">
+Si una función tarda más de ~10ms y es sync (no async), NO la llames directamente en una coroutine. Cada milisegundo que bloqueas el event loop, TODOS los otros requests, timers y tasks se congelan.
+</Callout>
+
+## Identificar Código Blocking
+
+Operaciones comunes que bloquean el event loop:
+
+```python
+# BLOCKING: File I/O
+content = open("data/log.txt").read()           # Bloquea
+path.read_text()                                 # Bloquea
+path.write_text(content)                         # Bloquea
+
+# BLOCKING: CPU-intensive
+import langdetect
+lang = langdetect.detect(text)                   # Bloquea (~5-20ms)
+
+# BLOCKING: Sync HTTP (si alguien usa requests en vez de aiohttp)
+import requests
+resp = requests.get("https://api.example.com")   # Bloquea (~100-1000ms)
+
+# NO BLOCKING: Estas ya son async
+result = await aiosqlite_conn.execute(sql)       # OK
+response = await ollama.chat(messages)           # OK
+await asyncio.sleep(1)                           # OK
+```
+
+## run_in_executor vs to_thread
+
+Ambos ejecutan código sync en un thread, pero la API difiere:
+
+```python
+import asyncio
+
+# asyncio.to_thread (Python 3.9+, más limpio)
+result = await asyncio.to_thread(blocking_function, arg1, arg2)
+
+# loop.run_in_executor (más control, funciona en Python 3.7+)
+loop = asyncio.get_event_loop()
+result = await loop.run_in_executor(None, blocking_function, arg1, arg2)
+```
+
+LocalForge usa `to_thread` en todos los casos:
+
+```python
+# app/memory/daily_log.py
+async def append(self, entry: str) -> None:
+    await asyncio.to_thread(self._append_sync, entry)
+
+# app/memory/markdown.py
+async def sync_to_file(self) -> None:
+    await asyncio.to_thread(self._write_sync)
+
+# app/context/fact_extractor.py (langdetect es sync)
+async def detect_language(text: str) -> str:
+    return await asyncio.to_thread(langdetect.detect, text)
+```
+
+## _track_task: Background Task Tracking
+
+Cuando lanzás un background task, necesitás trackear que termine antes del shutdown:
+
+```python
+# app/webhook/router.py
+
+_background_tasks: set[asyncio.Task] = set()
+
+def _track_task(task: asyncio.Task) -> None:
+    """Registrar un background task para graceful shutdown."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# Uso
+task = asyncio.create_task(embed_memory(repo, ollama, mem_id, content))
+_track_task(task)
+```
+
+<Concept title="done_callback pattern">
+`task.add_done_callback(_background_tasks.discard)` remueve el task del set automáticamente cuando termina. Sin esto, el set crecería indefinidamente. Es un patrón de auto-limpieza.
+</Concept>
+
+## Graceful Shutdown
+
+Al cerrar la app, esperamos a que todos los background tasks terminen:
+
+```python
+# app/webhook/router.py
+
+async def graceful_shutdown() -> None:
+    """Esperar a que todos los background tasks terminen."""
+    if _background_tasks:
+        logger.info("Waiting for %d background tasks...", len(_background_tasks))
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
+        logger.info("All background tasks completed")
+
+# En main.py (lifespan)
+async def lifespan(app: FastAPI):
+    # ... startup ...
+    yield
+    # Shutdown
+    await graceful_shutdown()
+    scheduler.shutdown()
+    await db_conn.close()
+```
+
+<Callout variant="warning" title="return_exceptions=True">
+Sin `return_exceptions=True`, si un task lanza una excepción, `gather` la propaga al caller — pero **no cancela los demás tasks**. Estos siguen corriendo en background como tasks huérfanos. Con `return_exceptions=True`, `gather` espera a que **todos** terminen y captura las excepciones como valores. En shutdown, queremos que todos los tasks terminen sin importar si algunos fallaron.
+</Callout>
+
+## Model Warmup at Startup
+
+El primer request a Ollama es lento porque carga el modelo en memoria. El warmup pre-carga el modelo:
+
+```python
+# app/main.py (lifespan)
+async def lifespan(app: FastAPI):
+    # ... init DB, clients, etc ...
+
+    # Model warmup (non-critical)
+    try:
+        await ollama_client.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            model=settings.chat_model,
+        )
+        logger.info("Model warmup completed: %s", settings.chat_model)
+    except Exception as e:
+        logger.warning("Model warmup failed (non-critical): %s", e)
+
+    yield
+    # ... shutdown ...
+```
+
+<Callout variant="tip" title="Non-critical, wrapped en try/except">
+El warmup es una optimización, no un requisito. Si Ollama no está disponible al inicio (ej: todavía arrancando), la app arranca igual. El primer request real será más lento, pero la app no crashea.
+</Callout>
+
+## Checklist de Event Loop Hygiene
+
+```python
+# 1. File I/O → to_thread
+await asyncio.to_thread(path.read_text)
+
+# 2. CPU-bound → to_thread
+await asyncio.to_thread(langdetect.detect, text)
+
+# 3. Background tasks → create_task + _track_task
+task = asyncio.create_task(some_background_work())
+_track_task(task)
+
+# 4. Shutdown → gather all tracked tasks
+await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+# 5. Warmup → non-critical, wrapped en try/except
+try:
+    await warmup()
+except Exception:
+    pass  # Non-critical
+```
+
+## Diagrama: Task Lifecycle
+
+```
+create_task()
+    │
+    ├── _track_task() → agrega al set
+    │
+    ├── task corriendo en background...
+    │
+    ├── task termina
+    │   └── done_callback → remueve del set
+    │
+    └── SI shutdown antes de terminar:
+        └── graceful_shutdown() → await gather(*tasks)
+```
+
+<Quiz
+  question="¿Qué hace task.add_done_callback(_background_tasks.discard)?"
+  options={[
+    "Cancela el task cuando el set se vacía",
+    "Remueve automáticamente el task del set cuando termina, evitando que el set crezca indefinidamente",
+    "Reintenta el task si falla",
+    "Loguea el resultado del task"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el model warmup está wrapped en try/except?"
+  options={[
+    "Porque Ollama siempre falla la primera vez",
+    "Para capturar errores de red",
+    "Porque es non-critical: si falla, la app arranca igual y el primer request real será más lento",
+    "Para evitar que el warmup se ejecute dos veces"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué graceful_shutdown usa return_exceptions=True en asyncio.gather?"
+  options={[
+    "Para que los tasks se ejecuten más rápido",
+    "Para que gather espere a que todos los tasks terminen y retorne las excepciones como valores, en vez de propagarlas al caller apenas ocurre la primera",
+    "Porque es un requisito de FastAPI",
+    "Para loguear las excepciones automáticamente"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo de Performance Optimization. Ahora entendés cómo LocalForge paraleliza, cachea y mantiene el event loop sano para responder en el menor tiempo posible.

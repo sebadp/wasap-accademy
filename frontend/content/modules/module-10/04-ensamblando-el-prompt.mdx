@@ -1,0 +1,299 @@
+---
+title: "Ensamblando el Prompt Final"
+description: "_build_context(): la función sync que construye el prompt sin DB calls"
+xpReward: 100
+---
+
+## El Ensamblaje Final
+
+`_build_context()` en `router.py` es la función que toma todos los datos recolectados por `ConversationContext.build()` y produce la lista de `ChatMessage` que se envía al LLM. Es **sincrónica** y no hace I/O -- solo formatea y ensambla strings.
+
+<Callout variant="info" title="Sin DB calls, sin await">
+`_build_context()` no hace ninguna query a la base de datos ni llamada a Ollama. Toda la I/O ya se completó en las fases anteriores. Esta función es puro string manipulation, lo que la hace predecible, testeable, y rápida (<1ms).
+</Callout>
+
+## _build_context(): El Código Completo
+
+```python
+# app/webhook/router.py
+def _build_context(
+    system_prompt: str,
+    memories: list[str],
+    relevant_notes: list[Note],
+    daily_logs: str | None,
+    skills_summary: str | None,
+    summary: str | None,
+    history: list[ChatMessage],
+    projects_summary: str | None = None,
+    project_notes: list | None = None,
+) -> list[ChatMessage]:
+    """Build LLM context from pre-fetched data (sync, no DB calls).
+
+    Consolidates context into a single system message with XML-delimited
+    sections for better attention focus in qwen3.5:9b.
+    """
+    from app.context.context_builder import ContextBuilder
+
+    builder = ContextBuilder(system_prompt)
+    builder.add_section("user_memories", _format_memories(memories))
+    builder.add_section("active_projects", projects_summary)
+    builder.add_section("project_notes", _format_project_notes(project_notes or []))
+    builder.add_section("relevant_notes", _format_notes(relevant_notes))
+    builder.add_section("recent_activity", daily_logs)
+    builder.add_section("capabilities", skills_summary)
+    if summary:
+        builder.add_section("conversation_summary",
+                            f"Previous conversation summary:\n{summary}")
+
+    context: list[ChatMessage] = [
+        ChatMessage(role="system", content=builder.build_system_message())
+    ]
+    context.extend(history)
+    return context
+```
+
+## Las Funciones de Formateo
+
+Cada tipo de dato tiene su helper que transforma los datos raw en texto listo para inyección:
+
+```python
+# app/webhook/router.py
+def _format_memories(memories: list[str]) -> str | None:
+    """Format memory list into a block string."""
+    if not memories:
+        return None
+    return "Important user information:\n" + "\n".join(
+        f"- {m}" for m in memories
+    )
+
+def _format_notes(relevant_notes: list[Note]) -> str | None:
+    """Format notes list into a block string."""
+    if not relevant_notes:
+        return None
+    return "Relevant notes:\n" + "\n".join(
+        f"- [{n.id}] {n.title}: {n.content[:200]}" for n in relevant_notes
+    )
+
+def _format_project_notes(project_notes: list) -> str | None:
+    """Format project notes/documents for context injection."""
+    if not project_notes:
+        return None
+    lines = ["Project documents and notes:"]
+    for n in project_notes:
+        header = f"[{n.id}]"
+        if n.title:
+            header += f" {n.title}"
+        lines.append(f"- {header}: {n.content[:500]}")
+    return "\n".join(lines)
+```
+
+<Concept title="Retornar None para secciones vacías">
+Todas las funciones de formateo retornan `None` si no hay datos. `ContextBuilder.add_section()` ignora contenido `None`, así que la sección XML no aparece en el prompt. Este es el mecanismo de skip-if-empty que ahorra tokens.
+</Concept>
+
+## _build_capabilities_for_categories()
+
+Las capabilities solo muestran herramientas de las categorías activas para este mensaje:
+
+```python
+# app/skills/router.py
+def _build_capabilities_for_categories(
+    categories: list[str],
+) -> list[str]:
+    if categories == ["none"]:
+        return []  # Sin tools, sin capabilities
+
+    capabilities = []
+    for cat in categories:
+        tools = TOOL_CATEGORIES.get(cat, [])
+        capabilities.extend(tools)
+    return capabilities
+```
+
+<Callout variant="tip" title="Capabilities filtradas = menos ruido">
+Si `classify_intent` retornó `["weather", "notes"]`, las capabilities solo listan `get_weather, save_note, list_notes, ...`. No se muestran `calculate` ni `web_search`. Esto reduce el ruido en el prompt y ayuda al LLM a enfocarse en las herramientas relevantes.
+</Callout>
+
+## El Flujo Completo: De Mensaje a Respuesta
+
+```
+Mensaje del usuario llega al webhook
+        │
+        ▼
+    Phase A+B (async, paralelo):
+    ┌─ ConversationContext.build()────────────────┐
+    │  Step 1: embed(query) → 768 floats          │
+    │  Step 2: asyncio.gather(                     │
+    │    search_memories,  get_history,             │
+    │    get_sticky,       get_daily_logs,          │
+    │    search_notes,     search_project_notes     │
+    │  )                                            │
+    │  Step 3: extract_facts(memories)              │
+    └──────────────────────────────────────────────┘
+        │
+        ▼  (en paralelo con classify_intent)
+    Phase C: classify_intent(user_text, ollama_client)
+        │
+        ▼
+    Phase D: _build_context() ← sync, sin I/O
+        │     ContextBuilder ensambla XML sections
+        │     _format_memories, _format_notes, ...
+        │     Retorna [system_msg + history]
+        ▼
+    execute_tool_loop() o chat() directo
+        │
+        ▼
+    Respuesta al usuario
+```
+
+## Anatomía del Prompt Final
+
+Este es un ejemplo completo de lo que el LLM recibe:
+
+```
+[Mensaje 1: role=system] ← construido por _build_context()
+───────────────────────────────────────────────
+You are a helpful personal assistant on WhatsApp.
+Be friendly. Answer in the same language the user writes in...
+
+<user_memories>
+Important user information:
+- Sebastián, backend developer en fintech, Buenos Aires
+- Prefiere respuestas técnicas y directas
+- GitHub username: sebadp
+- GitHub token configurado
+</user_memories>
+
+<active_projects>
+Active projects:
+  - API v2: 3/5 tasks (60%)
+  - Landing page: 1/3 tasks (33%)
+</active_projects>
+
+<project_notes>
+Project documents and notes:
+- [12] Architecture: Microservices con FastAPI, PostgreSQL, Redis cache
+</project_notes>
+
+<relevant_notes>
+Relevant notes:
+- [42] Deploy Guide: Usar Docker Compose en producción con nginx reverse proxy
+- [38] API Endpoints: POST /users, POST /auth/login, GET /payments
+</relevant_notes>
+
+<recent_activity>
+## 2026-03-16
+- Completó tarea "diseño de endpoints" en API v2
+- Creó nota "Deploy Guide"
+## 2026-03-15
+- Discutió estrategia de autenticación JWT
+</recent_activity>
+
+<capabilities>
+Available tools: save_note, list_notes, search_notes, web_search
+</capabilities>
+
+<conversation_summary>
+Previous conversation summary:
+El usuario viene trabajando en su API v2, discutimos autenticación JWT
+y rate limiting para endpoints públicos. Mencionó que el deploy será
+con Docker Compose.
+</conversation_summary>
+───────────────────────────────────────────────
+
+[Mensaje 2: role=user]
+¿Cómo iba el proyecto?
+
+[Mensaje 3: role=assistant]
+Tu proyecto API v2 tiene 3 de 5 tareas completadas (60%)...
+
+[Mensaje 4: role=user]
+Agregá una tarea de testing
+
+[Mensaje 5: role=user]  ← el mensaje actual
+¿Y cómo hago el deploy?
+```
+
+## Token Budget del Prompt Final
+
+Para el ejemplo anterior, el budget se distribuye aproximadamente así:
+
+| Sección | Tokens estimados | % del total |
+|---------|-----------------|-------------|
+| System prompt base | ~500 | 4% |
+| user_memories | ~200 | 1.5% |
+| active_projects | ~100 | 0.8% |
+| project_notes | ~150 | 1.1% |
+| relevant_notes | ~200 | 1.5% |
+| recent_activity | ~150 | 1.1% |
+| capabilities | ~50 | 0.4% |
+| conversation_summary | ~200 | 1.5% |
+| **History (4 msgs)** | ~800 | 6% |
+| **Total** | **~2350** | **~7% de 32K** |
+
+<Callout variant="info" title="Presupuesto holgado">
+En este ejemplo solo se usa el 7% del contexto, dejando ~30K tokens para la respuesta y tool calls. En conversaciones largas con muchas memorias y notas, el uso puede subir al 40-60%. El sistema de monitoreo (`log_context_budget`) emite WARNING cuando se supera el 80%.
+</Callout>
+
+## Por Qué el Orden de las Secciones Importa
+
+El orden en `_build_context()` sigue un patrón intencional:
+
+<Step number={1} title="user_memories (primero)">
+La identidad del usuario es lo más importante. Determina idioma, nivel técnico, y personalización.
+</Step>
+
+<Step number={2} title="active_projects + project_notes">
+El contexto de trabajo actual. Si el usuario pregunta "¿cómo va?", necesita ver sus proyectos.
+</Step>
+
+<Step number={3} title="relevant_notes">
+Notas semánticamente relevantes al query actual. Inyectadas por RAG.
+</Step>
+
+<Step number={4} title="recent_activity">
+Daily logs de los últimos 2 días. Da continuidad temporal.
+</Step>
+
+<Step number={5} title="capabilities">
+Tools disponibles. Solo las de las categorías clasificadas para este mensaje.
+</Step>
+
+<Step number={6} title="conversation_summary (último)">
+El resumen es lo más redundante (el historial verbatim ya contiene detalles). Va último por el efecto "lost in the middle" de los LLMs.
+</Step>
+
+<Quiz
+  question="¿_build_context() hace queries a la base de datos?"
+  options={[
+    "Sí, busca memorias y notas en cada llamada",
+    "No, es una función sync que solo ensambla strings ya recolectados",
+    "Solo si el cache expiró",
+    "Depende de la configuración de Settings"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué se incluye en la sección capabilities del prompt?"
+  options={[
+    "Todos los 60+ tools disponibles en el sistema",
+    "Solo los tools de las categorías clasificadas para este mensaje específico",
+    "Solo los 5 tools más utilizados por el usuario",
+    "Nada — capabilities siempre está vacío"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué las funciones _format_* retornan None cuando no hay datos?"
+  options={[
+    "Porque Python requiere None como valor de retorno por defecto",
+    "Para que ContextBuilder.add_section() omita la sección XML y ahorre tokens",
+    "Para generar un error que el caller debe manejar",
+    "Porque el LLM no puede procesar strings vacíos"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Context Engineering. Ahora dominás cómo LocalForge construye el contexto óptimo para cada interacción: desde la estimación de tokens, pasando por la recolección paralela de datos, la extracción de facts, hasta el ensamblaje final del prompt con XML tags.

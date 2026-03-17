@@ -1,0 +1,190 @@
+---
+title: "Knowledge Graphs: Entidades y Relaciones"
+description: "Qué es un knowledge graph, cómo modela entidades y relaciones, y por qué importa para un AI assistant"
+xpReward: 50
+---
+
+## Mas Alla del Texto Libre
+
+Las memorias y notas guardan información como texto. Pero el texto no captura **relaciones estructuradas**. Si el usuario dice "Juan trabaja en el proyecto API con María", el texto libre guarda la oración completa. Un knowledge graph captura:
+
+- **Juan** (persona) --trabaja_en--> **proyecto API** (proyecto)
+- **María** (persona) --trabaja_en--> **proyecto API** (proyecto)
+- **Juan** (persona) --colabora_con--> **María** (persona)
+
+<Concept title="Knowledge Graph">
+Un grafo de conocimiento es una estructura de datos donde los **nodos** son entidades (personas, proyectos, herramientas, temas) y las **aristas** son relaciones entre ellas. Permite responder preguntas como "¿quién trabaja en qué?" o "¿qué temas están relacionados?" sin parsear texto libre.
+</Concept>
+
+## Schema en SQLite
+
+LocalForge modela el knowledge graph con dos tablas:
+
+```sql
+-- app/database/db.py (dentro de init_db)
+
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('person', 'topic', 'project', 'tool')),
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(name, type)
+);
+
+CREATE TABLE IF NOT EXISTS entity_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES entities(id),
+    target_id INTEGER NOT NULL REFERENCES entities(id),
+    relation_type TEXT NOT NULL,
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(source_id, target_id, relation_type)
+);
+```
+
+<Callout variant="info" title="UNIQUE constraint">
+`UNIQUE(name, type)` en entities evita duplicados: puede haber un topic "Python" y un tool "Python", pero no dos topics "Python". En relations, `UNIQUE(source_id, target_id, relation_type)` previene aristas duplicadas.
+</Callout>
+
+## Tipos de Entidades
+
+| Tipo | Ejemplos | Fuente |
+|------|----------|--------|
+| `person` | Juan, María, el jefe | Memorias, conversación |
+| `topic` | Python, machine learning, cocina | Notas, memorias |
+| `project` | API v2, app mobile, tesis | Sistema de proyectos |
+| `tool` | Docker, PostgreSQL, FastAPI | Notas, conversación |
+
+## Por Qué un Knowledge Graph en un AI Assistant
+
+El LLM puede usar el grafo para:
+
+1. **Contexto enriquecido**: "El usuario pregunta sobre el proyecto API -> personas involucradas: Juan, María -> temas relacionados: REST, PostgreSQL"
+2. **Respuestas conectadas**: "¿Con quién trabajo en Python?" -> traversar el grafo en vez de buscar texto
+3. **Desambiguación**: "María" puede ser una persona o un proyecto. El grafo tiene el tipo explícito
+
+```python
+# Ejemplo conceptual de enriquecimiento
+async def enrich_context(entity_name: str, registry: EntityRegistry):
+    entity = await registry.get_entity(entity_name)
+    if not entity:
+        return ""
+
+    relations = await registry.get_relations(entity.id)
+    # "Juan: persona, trabaja en API v2, colabora con María"
+    return format_entity_context(entity, relations)
+```
+
+<Callout variant="tip" title="Complemento, no reemplazo">
+El knowledge graph complementa la búsqueda semántica. Los embeddings encuentran texto similar; el grafo encuentra relaciones estructuradas. Juntos dan contexto completo.
+</Callout>
+
+## Graph Traversal: BFS con Límite de Hops
+
+Para enriquecer el contexto del LLM, LocalForge hace **BFS (Breadth-First Search)** desde una entidad relevante, explorando relaciones hasta un límite de profundidad:
+
+```python
+# Pseudocódigo del traversal
+async def traverse_graph(start_entity_id: int, registry: EntityRegistry, max_hops: int = 2):
+    visited = set()
+    queue = [(start_entity_id, 0)]  # (entity_id, depth)
+    context_parts = []
+
+    while queue:
+        entity_id, depth = queue.pop(0)
+        if entity_id in visited or depth > max_hops:
+            continue
+        visited.add(entity_id)
+
+        entity = await registry.get_entity_by_id(entity_id)
+        relations = await registry.get_relations(entity_id)
+        context_parts.append(format_entity(entity, relations))
+
+        for rel in relations:
+            queue.append((rel.target_id, depth + 1))
+
+    return "\n".join(context_parts)
+```
+
+<Concept title="Hop limit">
+Sin límite, un BFS podría traversar todo el grafo. Con `max_hops=2`, solo se exploran entidades a 2 relaciones de distancia. "Juan" → proyecto "API" → persona "María" son 2 hops. Esto mantiene el contexto relevante y dentro del token budget.
+</Concept>
+
+## Presupuesto de Caracteres para Grafo
+
+El contexto de grafo inyectado al LLM tiene un presupuesto fijo:
+
+```python
+_GRAPH_CONTEXT_BUDGET = 1000  # Max chars de contexto de grafo
+```
+
+Si el traversal genera más de 1000 caracteres, se trunca priorizando entidades más cercanas (menor profundidad de BFS).
+
+## Relaciones Comunes
+
+| Tipo de relación | Ejemplo | Dirección |
+|-----------------|---------|-----------|
+| `works_on` | Juan → API v2 | persona → proyecto |
+| `collaborates_with` | Juan → María | persona → persona |
+| `uses` | API v2 → FastAPI | proyecto → tool |
+| `related_to` | Python → ML | topic → topic |
+
+<Callout variant="warning" title="Relaciones son unidireccionales">
+`entity_relations` modela relaciones dirigidas. Juan --colabora_con--> María no implica automáticamente María --colabora_con--> Juan. El código de extracción crea ambas direcciones explícitamente cuando corresponde.
+</Callout>
+
+## Metadata JSON
+
+Entidades y relaciones tienen un campo `metadata TEXT DEFAULT '{}'` para datos adicionales:
+
+```python
+# Ejemplo: entidad con metadata
+{
+    "name": "API v2",
+    "type": "project",
+    "metadata": {
+        "status": "active",
+        "started": "2025-01-15",
+        "tech_stack": ["FastAPI", "PostgreSQL"]
+    }
+}
+```
+
+Esto permite almacenar información específica del tipo sin agregar columnas al schema.
+
+<Quiz
+  question="¿Qué ventaja tiene un knowledge graph sobre texto libre para almacenar relaciones?"
+  options={[
+    "Usa menos espacio en disco",
+    "Captura relaciones estructuradas que se pueden traversar programáticamente",
+    "Es más rápido de escribir",
+    "No necesita base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué constraint previene entidades duplicadas del mismo tipo?"
+  options={[
+    "PRIMARY KEY en id",
+    "CHECK(type IN (...))",
+    "UNIQUE(name, type)",
+    "REFERENCES entities(id)"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cómo puede el LLM usar el knowledge graph para desambiguar una entidad como 'Python'?"
+  options={[
+    "Buscando la entidad más reciente con ese nombre",
+    "Consultando el tipo explícito del nodo (topic vs tool) en el grafo",
+    "Preguntándole al usuario cada vez",
+    "Usando embeddings para inferir el significado"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo EntityRegistry maneja CRUD y extracción automática de entidades.

@@ -1,0 +1,177 @@
+---
+title: "Historial con Ventana"
+description: "Enviar los ultimos N mensajes verbatim + resumen de los anteriores al LLM"
+xpReward: 75
+---
+
+## El Problema: Contexto Limitado
+
+Los LLMs tienen una **ventana de contexto finita** (qwen3.5:9b tiene ~32K tokens). Si una conversacion tiene 200 mensajes, no podes enviarlos todos. Pero si envias solo los ultimos 5, el modelo pierde contexto importante de turnos anteriores.
+
+<Concept title="Token Budget">
+32K tokens suena mucho, pero el system prompt, memorias, notas, daily logs y tool results ya consumen una porcion significativa. El historial de mensajes compite por el espacio restante. LocalForge tiene un `token_estimator` que advierte cuando se supera el 80% del budget.
+</Concept>
+
+## La Solucion: Verbatim + Summary
+
+Enviar los ultimos N mensajes **tal cual** (verbatim) + un **resumen** de todo lo anterior. Lo mejor de ambos mundos: detalle reciente + contexto historico.
+
+<Callout variant="info" title="La estrategia">
+Los ultimos 8 mensajes van completos para mantener el flujo conversacional. Todo lo anterior se resume en 2-3 parrafos por el Summarizer. Asi el LLM tiene contexto sin saturar la ventana.
+</Callout>
+
+## get_windowed_history()
+
+El metodo clave vive en `app/conversation/manager.py`:
+
+```python
+async def get_windowed_history(
+    self, phone_number: str, verbatim_count: int = 8,
+) -> tuple[list[ChatMessage], str | None]:
+    """Return recent messages verbatim + summary of older ones.
+
+    Returns:
+        (recent_messages, summary_of_older)
+        - recent_messages: last `verbatim_count` messages verbatim
+        - summary_of_older: existing DB summary if history > verbatim_count, else None
+
+    Zero-latency: uses DB summary already computed by maybe_summarize, no new LLM call.
+    """
+    conv_id = await self._get_conv_id(phone_number)
+    # Launch both queries in parallel — summary is cheap (~1ms with index)
+    history, summary = await asyncio.gather(
+        self._repo.get_recent_messages(conv_id, self._max_messages),
+        self._repo.get_latest_summary(conv_id),
+    )
+
+    if len(history) <= verbatim_count:
+        return history, None  # Conversacion corta: todo verbatim, sin resumen
+
+    return history[-verbatim_count:], summary
+```
+
+<Callout variant="tip" title="asyncio.gather para paralelismo">
+Las dos queries (`get_recent_messages` y `get_latest_summary`) se ejecutan en paralelo con `asyncio.gather()`. Aunque cada una toma ~1ms con indices, en produccion cada milisegundo cuenta en el hot path.
+</Callout>
+
+## El Parametro verbatim_count
+
+`verbatim_count=8` es el default, configurable via `Settings.history_verbatim_count`. Significa que el LLM recibe los ultimos 8 mensajes completos:
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    history_verbatim_count: int = 8  # Last N messages verbatim
+```
+
+<Concept title="verbatim_count=8">
+8 mensajes = ~4 turnos completos (user + assistant). Suficiente para mantener el flujo conversacional inmediato sin ocupar demasiado contexto. Si tu LLM tiene una ventana mas grande (128K+), podes subir este valor.
+</Concept>
+
+## Zero-Latency: No se genera resumen al leer
+
+El resumen **ya existe** en la tabla `summaries`. Fue generado previamente por el Summarizer como background task. Leer el historial es solo un `SELECT` -- no hay llamada a LLM.
+
+```
+Escritura (background):          Lectura (hot path):
++---------------+                +--------------------+
+|  Summarizer   |---genera--->   | get_windowed_      |
+|  (async job)  |   resumen      |   history()        |
++---------------+     |          |                    |
+                      v          |  SELECT recientes  |
+               +----------+     |  SELECT summary    |
+               | summaries|<----+                    |
+               |  (table) |     +--------------------+
+               +----------+
+```
+
+<Callout variant="warning" title="Separar escritura de lectura">
+Generar el resumen es caro (llamada a LLM, ~2-5 segundos). Leerlo es barato (un SELECT, ~1ms). Al generar en background, el hot path nunca espera por el LLM. Esto es el patron CQRS (Command Query Responsibility Segregation) aplicado de forma practica.
+</Callout>
+
+## Logica de Decision
+
+La logica es simple pero efectiva:
+
+```python
+if len(history) <= verbatim_count:
+    return history, None  # Todo cabe, no necesitamos resumen
+return history[-verbatim_count:], summary
+```
+
+Tres escenarios posibles:
+
+| Mensajes en DB | verbatim_count | Resultado |
+|----------------|----------------|-----------|
+| 5 | 8 | 5 mensajes verbatim, sin resumen |
+| 8 | 8 | 8 mensajes verbatim, sin resumen |
+| 50 | 8 | 8 mensajes verbatim + resumen de los 42 anteriores |
+
+## Ejemplo del Resultado
+
+```python
+recent_messages = [
+    ChatMessage(role="user", content="Como va mi proyecto?"),
+    ChatMessage(role="assistant", content="Tu proyecto 'API v2' tiene 3 tareas..."),
+    ChatMessage(role="user", content="Marca la primera como completada"),
+    ChatMessage(role="assistant", content="Listo, marque 'Setup database' completada"),
+    # ... 4 mensajes mas
+]
+
+summary = (
+    "El usuario pidio ayuda para organizar su proyecto de API v2. "
+    "Se creo el proyecto con 5 tareas. Discutimos la arquitectura REST "
+    "y decidimos usar FastAPI con SQLite."
+)
+```
+
+## Como se Usa en el Hot Path
+
+En `router.py`, el windowed history se usa asi:
+
+```python
+# Fase B: queries en paralelo
+recent_msgs, summary = await conversation.get_windowed_history(
+    phone_number, settings.history_verbatim_count
+)
+
+# _build_context() inyecta el summary como system message si existe
+if summary:
+    context.append(ChatMessage(
+        role="system",
+        content=f"Previous conversation summary:\n{summary}"
+    ))
+context.extend(recent_msgs)
+```
+
+El resumen va como un `system` message antes del historial reciente. Asi el LLM tiene contexto completo: sabe que paso antes (resumen) y ve los detalles recientes (verbatim).
+
+<Quiz
+  question="Cuantos mensajes verbatim envia LocalForge al LLM por defecto?"
+  options={["4", "8", "16", "Todos"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Cuando se genera el resumen del historial?"
+  options={[
+    "Cada vez que se lee el historial",
+    "Antes de cada llamada al LLM",
+    "Como background task del Summarizer, independiente de la lectura",
+    "Al iniciar la app"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Que pasa si la conversacion tiene menos de 8 mensajes?"
+  options={[
+    "Se genera un resumen de emergencia con LLM",
+    "Se retorna un error por historial insuficiente",
+    "Se retornan todos los mensajes verbatim y el summary es None",
+    "Se completan los mensajes faltantes con placeholders"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como funciona ese Summarizer que corre en background.

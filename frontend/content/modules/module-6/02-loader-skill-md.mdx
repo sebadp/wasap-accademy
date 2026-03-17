@@ -1,0 +1,264 @@
+---
+title: "Loader de SKILL.md"
+description: "Parsear frontmatter con regex para cargar definiciones de skills"
+xpReward: 75
+---
+
+## El Parser de SKILL.md
+
+LocalForge parsea los archivos SKILL.md usando **regex** en vez de una librería YAML como PyYAML. Esta es una decisión de diseño deliberada.
+
+<Callout variant="tip" title="Trade-off consciente">
+PyYAML agrega una dependencia, puede tener vulnerabilidades (YAML bombs), y es overkill para parsear frontmatter simple. Regex es más rápido, sin dependencias externas, y suficiente para el formato que necesitamos.
+</Callout>
+
+## El Formato Frontmatter
+
+Un SKILL.md real tiene este formato:
+
+```markdown
+---
+name: notes
+description: Save, list, search and delete personal notes
+version: 1
+tools:
+  - save_note
+  - list_notes
+  - search_notes
+  - delete_note
+---
+Use notes tools when the user wants to save, find, or manage notes.
+
+When to use:
+- "anotá que..." / "guardá esto" → save_note
+- "qué notas tengo" → list_notes
+- "buscá en mis notas sobre X" → search_notes
+- "borrá la nota de..." → delete_note
+```
+
+El frontmatter (entre `---`) contiene la metadata estructurada. Todo lo que viene después es el body con instrucciones para el LLM.
+
+## La Función parse_frontmatter
+
+El código real en `app/skills/loader.py`:
+
+```python
+# app/skills/loader.py
+def parse_frontmatter(text: str) -> tuple[dict[str, str | list[str]], str]:
+    """Parse YAML-like frontmatter from a SKILL.md file using regex.
+    Returns (frontmatter_dict, body_text)."""
+
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)", text, re.DOTALL)
+    if not match:
+        return {}, text
+
+    fm_text = match.group(1)
+    body = match.group(2).strip()
+
+    result: dict[str, str | list[str]] = {}
+    current_key: str | None = None
+
+    for line in fm_text.split("\n"):
+        # List item under current key
+        list_match = re.match(r"^\s+-\s+(.+)$", line)
+        if list_match and current_key is not None:
+            val = result.get(current_key)
+            if not isinstance(val, list):
+                result[current_key] = []
+            result[current_key].append(list_match.group(1).strip())
+            continue
+
+        # Key-value pair
+        kv_match = re.match(r"^(\w+)\s*:\s*(.*)$", line)
+        if kv_match:
+            current_key = kv_match.group(1)
+            value = kv_match.group(2).strip()
+            if value:
+                result[current_key] = value
+            else:
+                result[current_key] = []  # Preparar para lista
+            continue
+
+    return result, body
+```
+
+<Concept title="State machine simple">
+El parser mantiene un `current_key` que trackea bajo qué campo estamos. Cuando encuentra una línea `- item`, la agrega a la lista del key actual. Cuando encuentra `key: value`, cambia el key actual. No necesita nesting profundo porque el frontmatter de skills es plano.
+</Concept>
+
+Veamos qué produce con el ejemplo de notes:
+
+```python
+# Input: el SKILL.md de notes
+# Output:
+fm = {
+    "name": "notes",
+    "description": "Save, list, search and delete personal notes",
+    "version": "1",
+    "tools": ["save_note", "list_notes", "search_notes", "delete_note"],
+}
+body = "Use notes tools when the user wants to save..."
+```
+
+## De Frontmatter a SkillMetadata
+
+`load_skill_metadata` convierte el diccionario del parser en un `SkillMetadata` tipado:
+
+```python
+def load_skill_metadata(skill_dir: Path) -> SkillMetadata | None:
+    """Load a SkillMetadata from a SKILL.md file in the given directory."""
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_file.exists():
+        return None
+
+    text = skill_file.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(text)
+
+    name = fm.get("name")
+    if not name or not isinstance(name, str):
+        logger.warning("SKILL.md in %s missing 'name' field", skill_dir)
+        return None
+
+    description = fm.get("description", "")
+    if not isinstance(description, str):
+        description = ""
+
+    version_raw = fm.get("version", "1")
+    try:
+        version = int(version_raw) if isinstance(version_raw, str) else 1
+    except ValueError:
+        version = 1
+
+    tools_raw = fm.get("tools", [])
+    tools = tools_raw if isinstance(tools_raw, list) else []
+
+    return SkillMetadata(
+        name=name,
+        description=description,
+        version=version,
+        tools=tools,
+        instructions=body,  # El body completo del SKILL.md
+    )
+```
+
+<Callout variant="warning" title="Validación defensiva">
+Cada campo se valida con type checks explícitos. Si `name` falta o no es string, retorna `None`. Si `version` no es parseable a int, usa 1 como default. Esto previene que un SKILL.md malformado rompa la carga.
+</Callout>
+
+## Escaneo del Directorio de Skills
+
+`scan_skills_directory` recorre todos los subdirectorios buscando SKILL.md:
+
+```python
+def scan_skills_directory(skills_dir: str) -> list[SkillMetadata]:
+    """Scan a directory for skill subdirectories containing SKILL.md files."""
+    path = Path(skills_dir)
+    if not path.exists():
+        logger.info("Skills directory %s does not exist, skipping", skills_dir)
+        return []
+
+    skills = []
+    for child in sorted(path.iterdir()):
+        if child.is_dir():
+            metadata = load_skill_metadata(child)
+            if metadata:
+                skills.append(metadata)
+                logger.info(
+                    "Loaded skill: %s (%d tools)",
+                    metadata.name, len(metadata.tools),
+                )
+    return skills
+```
+
+## Flujo de Carga Completo
+
+<Step number={1} title="Buscar SKILL.md files">
+`scan_skills_directory` itera sobre `skills/` buscando subdirectorios con SKILL.md.
+</Step>
+
+<Step number={2} title="Parsear frontmatter">
+`parse_frontmatter` extrae metadata con regex: nombre, descripción, versión, lista de tools.
+</Step>
+
+<Step number={3} title="Crear SkillMetadata">
+`load_skill_metadata` valida campos y construye el dataclass, incluyendo el body como `instructions`.
+</Step>
+
+<Step number={4} title="Registrar en SkillRegistry">
+`registry.load_skills()` llama a `scan_skills_directory` y guarda cada `SkillMetadata` en `_skills`.
+</Step>
+
+<Step number={5} title="Registrar handlers Python">
+Cada handler (ej: `calculator_tools.register(registry)`) se llama por separado y registra sus tools.
+</Step>
+
+## Error Handling: Graceful Degradation
+
+Si un SKILL.md tiene formato inválido, no rompe nada:
+
+```python
+# En registry.load_skills()
+skills = scan_skills_directory(self._skills_dir)
+for skill in skills:
+    self._skills[skill.name] = skill  # Solo si metadata es válida
+```
+
+```python
+# En load_skill_metadata() — retorna None si falla
+if not name or not isinstance(name, str):
+    logger.warning("SKILL.md in %s missing 'name' field", skill_dir)
+    return None  # scan_skills_directory lo ignora
+```
+
+<Callout variant="info" title="Nunca fallar por un skill roto">
+Si un SKILL.md tiene formato inválido, se loguea un warning y se continúa. Los otros skills se cargan normalmente. Esto sigue el patrón best-effort: la app siempre arranca, aunque con menos skills disponibles.
+</Callout>
+
+## Por Qué No PyYAML
+
+Comparación directa del trade-off:
+
+| Aspecto | Regex (actual) | PyYAML |
+|---------|---------------|--------|
+| Dependencias | Ninguna (stdlib) | pip install PyYAML |
+| Seguridad | Sin riesgo | YAML bombs (`yaml.safe_load` mitiga) |
+| Velocidad | Más rápido | Overhead de parsing completo |
+| Soporte YAML completo | No (solo frontmatter plano) | Sí |
+| Mantenimiento | ~50 líneas simples | Depende de versión del package |
+
+Para el caso de uso de SKILL.md (frontmatter plano, sin nesting profundo), regex es la solución correcta.
+
+<Quiz
+  question="¿Por qué LocalForge usa regex en vez de PyYAML para parsear SKILL.md?"
+  options={[
+    "Porque regex es siempre más rápido que PyYAML",
+    "Simplicidad, cero dependencias extra, y suficiente para frontmatter plano",
+    "Porque PyYAML no soporta el formato frontmatter",
+    "Por seguridad (PyYAML no tiene safe_load)"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si un SKILL.md tiene formato inválido?"
+  options={[
+    "La app no inicia y muestra un error",
+    "Se lanza una excepción y se detiene la carga de todos los skills",
+    "Se loguea un warning y se continúa con los demás skills",
+    "Se borra el archivo automáticamente"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué contiene el campo 'instructions' de SkillMetadata?"
+  options={[
+    "Los parámetros de los tools del skill",
+    "El body del SKILL.md (texto después del frontmatter) con instrucciones para el LLM",
+    "El código Python del handler",
+    "El schema JSON para Ollama"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección vamos a implementar un skill completo desde cero.

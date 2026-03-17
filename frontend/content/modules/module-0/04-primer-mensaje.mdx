@@ -8,74 +8,242 @@ xpReward: 75
 
 Llegó el momento de ver el big picture en acción. Vamos a trazar el camino completo que hace un mensaje de WhatsApp desde que el usuario lo envía hasta que recibe la respuesta de la IA.
 
-<Callout variant="info">
-Este flujo es el corazón de WasAP. Todo lo que vas a aprender en los próximos módulos es profundizar en cada uno de estos pasos.
+<Callout variant="info" title="El corazón de LocalForge">
+Este flujo es el corazón del sistema. Todo lo que vas a aprender en los próximos módulos es profundizar en cada uno de estos pasos. Entender el pipeline completo te da el mapa mental para navegar los 85 archivos del proyecto.
 </Callout>
 
 ## El pipeline completo
 
 <Step number={1} title="Usuario envía mensaje en WhatsApp">
-El usuario escribe "Hola, ¿qué puedes hacer?" en el chat de WhatsApp Business.
+El usuario escribe "Hola, qué puedes hacer?" en el chat de WhatsApp Business. Meta recibe el mensaje en sus servidores.
 </Step>
 
 <Step number={2} title="Meta hace POST a tu webhook">
-Los servidores de Meta envían un POST a `https://tu-api.com/webhook` con el payload JSON del mensaje.
+Los servidores de Meta envían un HTTP POST a `https://tu-dominio.ngrok-free.app/webhook` con el payload JSON del mensaje. El POST incluye el header `X-Hub-Signature-256` con la firma HMAC.
 </Step>
 
-<Step number={3} title="Verificación de firma">
-Tu API verifica que el request viene realmente de Meta usando `X-Hub-Signature-256`. Si la firma no coincide, rechaza el request con 403.
+<Step number={3} title="Verificación de firma + dedup">
+LocalForge verifica que el request viene de Meta usando `validate_signature()`. Luego, `try_claim_message()` hace un INSERT OR IGNORE atómico en la tabla `processed_messages` para evitar procesar duplicados (Meta puede reintentar el POST).
 </Step>
 
-<Step number={4} title="Parseo del payload">
-El handler extrae el número de teléfono, el texto del mensaje y el message ID del payload de Meta.
+<Step number={4} title="Parseo del payload + rate limiting">
+El parser `extract_messages()` navega el JSON anidado de Meta y extrae el número, texto, message ID y tipo. El `RateLimiter` verifica que el usuario no exceda 10 mensajes por minuto.
 </Step>
 
-<Step number={5} title="Recuperar contexto de memoria">
-Se consulta la base de datos para obtener los últimos N mensajes de este usuario. Se añaden al prompt como historial.
+<Step number={5} title="Typing indicator + background processing">
+Se envía una reacción de reloj de arena al mensaje del usuario (typing indicator) y el procesamiento real se despacha a `BackgroundTasks` para retornar 200 inmediatamente a Meta.
 </Step>
 
-<Step number={6} title="Llamar al LLM">
-Se construye el prompt final con el sistema, el historial y el mensaje actual. Se llama a la API de Claude/OpenAI.
+<Step number={6} title="Fase A — I/O paralelo">
+En paralelo: generar embedding del query, guardar el mensaje en SQLite, cargar daily logs. `classify_intent()` se lanza como task para correr en paralelo con el I/O.
 </Step>
 
-<Step number={7} title="Enviar respuesta">
-La respuesta del LLM se envía de vuelta al usuario via la API de WhatsApp Business (POST a `graph.facebook.com`).
+<Step number={7} title="Fase B — Contexto">
+En paralelo: buscar memorias semánticas, buscar notas relevantes, obtener resumen de conversación, cargar historial reciente (últimos 8 mensajes verbatim).
 </Step>
 
-## El código del handler
+<Step number={8} title="Fase C+D — LLM + respuesta">
+Se construye el contexto con XML tags, se llama al LLM via Ollama. Si hay tools, se ejecuta el tool calling loop. La respuesta se formatea (Markdown a WhatsApp markup), se splitea si excede 4096 chars, y se envía.
+</Step>
+
+## El código del webhook POST
+
+Este es el código **real** de `incoming_webhook` en `app/webhook/router.py`:
 
 ```python
-async def handle_message(
-    message: WhatsAppMessage,
-    db: AsyncSession,
-    llm: LLMClient,
-    wa: WhatsAppClient,
-) -> None:
-    history = await db.get_conversation_history(
-        phone=message.from_phone,
-        limit=20,
-    )
-    prompt = build_prompt(
-        system=SYSTEM_PROMPT,
-        history=history,
-        user_message=message.text,
-    )
-    response = await llm.complete(prompt)
-    await db.save_message(phone=message.from_phone, role="user", content=message.text)
-    await db.save_message(phone=message.from_phone, role="assistant", content=response.text)
-    await wa.send_message(to=message.from_phone, text=response.text)
+# app/webhook/router.py
+@router.post("/webhook")
+async def incoming_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> Response:
+    settings = get_settings(request)
+    body = await request.body()
+
+    # 1. Validar firma HMAC-SHA256
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not validate_signature(body, signature, settings.whatsapp_app_secret):
+        logger.warning("Invalid webhook signature")
+        return Response(status_code=200)  # Siempre 200 para Meta
+
+    payload = await request.json()
+    repository = get_repository(request)
+    wa_client = get_whatsapp_client(request)
+
+    # 2. Extraer mensajes del payload
+    messages = extract_messages(payload)
+
+    for msg in messages:
+        # 3. Verificar allowlist
+        if msg.from_number not in settings.allowed_phone_numbers:
+            logger.warning("Message from non-whitelisted number: %s", msg.from_number)
+            continue
+
+        # 4. Rate limiting
+        if not rate_limiter.is_allowed(msg.from_number):
+            logger.warning("Rate limit exceeded for %s", msg.from_number)
+            continue
+
+        # 5. Dedup atómico (INSERT OR IGNORE)
+        if await repository.try_claim_message(msg.message_id):
+            logger.info("Duplicate message ignored: %s", msg.message_id)
+            continue
+
+        # 6. Procesar en background
+        background_tasks.add_task(process_message, msg=msg, ...)
+
+    return Response(status_code=200)
 ```
 
-<Concept term="Dependency Injection">
-El handler recibe `db`, `llm` y `wa` como parámetros inyectados por FastAPI. Esto hace el código testeable: en los tests, inyectás mocks en lugar de las implementaciones reales.
+<Concept title="Siempre retornar 200">
+Meta espera un status code 200 para todos los webhooks, incluso si la firma es inválida. Si retornás 403 o 500, Meta reintenta el request hasta 7 veces con backoff exponencial. Por eso LocalForge retorna 200 pero simplemente ignora el payload inválido.
+</Concept>
+
+<Concept title="BackgroundTasks">
+`BackgroundTasks` de FastAPI permite despachar trabajo asíncrono después de retornar la respuesta HTTP. Esto es crítico: Meta tiene un timeout de 20 segundos para webhooks. Si tu handler tarda más (porque el LLM tarda en responder), Meta marca tu webhook como caído. Con background tasks, retornás 200 en milisegundos y procesás el mensaje en segundo plano.
 </Concept>
 
 <Quiz
-  question="¿Por qué se verifica la firma HMAC-SHA256 del webhook antes de procesarlo?"
-  options={["Para comprimir el payload y procesarlo más rápido", "Para asegurarse de que el request viene realmente de Meta y no de un tercero malicioso", "Para validar que el número de teléfono existe en WhatsApp", "Para autenticar al usuario final en la base de datos"]}
+  question="¿Por qué LocalForge retorna HTTP 200 incluso cuando la firma del webhook es inválida?"
+  options={["Porque FastAPI no soporta otros status codes en webhooks", "Para que Meta no reintente el request hasta 7 veces con backoff", "Porque el status code no importa para la seguridad", "Para ocultar que la firma fue rechazada al atacante"]}
   correct={1}
 />
 
+## El process_message real
+
+Después de retornar 200, `process_message` se ejecuta en background:
+
+```python
+# app/webhook/router.py
+async def process_message(msg: WhatsAppMessage, ...) -> None:
+    """WhatsApp-specific wrapper: convierte a tipos platform-agnostic."""
+    incoming = _wa_msg_to_incoming(msg)  # WhatsAppMessage -> IncomingMessage
+    adapter = WhatsAppPlatformAdapter(wa_client, msg.message_id)
+    await process_message_generic(msg=incoming, platform_client=adapter, ...)
+
+
+async def process_message_generic(
+    msg: IncomingMessage,
+    platform_client: PlatformClient,  # Protocol: WhatsApp o Telegram
+    ...
+) -> None:
+    """Platform-agnostic message processor."""
+    # Marcar como leído + typing indicator en paralelo
+    try:
+        await asyncio.gather(
+            platform_client.mark_as_read(msg.message_id),
+            platform_client.send_typing_indicator(msg.user_id),
+        )
+    except Exception:
+        logger.debug("Failed to send initial platform signals")
+
+    try:
+        await _handle_message(msg, settings, platform_client, ...)
+    finally:
+        # SIEMPRE quitar el typing indicator, incluso si hay error
+        try:
+            await platform_client.remove_typing_indicator(msg.user_id)
+        except Exception:
+            pass
+```
+
+<Concept title="PlatformClient Protocol">
+`PlatformClient` es un Protocol (structural typing de Python). Define métodos como `send_message()`, `mark_as_read()`, `send_typing_indicator()`. Tanto `WhatsAppPlatformAdapter` como `TelegramClient` lo implementan. Esto permite que `process_message_generic` sea 100% reutilizable entre plataformas.
+</Concept>
+
+## El dedup atómico explicado
+
+Meta puede enviar el mismo webhook múltiples veces (retries). Sin dedup, procesarías el mismo mensaje dos veces y enviarías respuestas duplicadas:
+
+```python
+# app/database/repository.py
+async def try_claim_message(self, wa_message_id: str) -> bool:
+    """Atomic dedup: returns True if message was ALREADY processed."""
+    cursor = await self._conn.execute(
+        "INSERT OR IGNORE INTO processed_messages (wa_message_id) VALUES (?)",
+        (wa_message_id,),
+    )
+    await self._conn.commit()
+    # Si se insertó (rowcount=1), es nuevo. Si no se insertó (0), ya existía.
+    return cursor.rowcount == 0
+```
+
+<Callout variant="warning" title="INSERT OR IGNORE vs SELECT + INSERT">
+Nunca hagas `SELECT` para verificar y luego `INSERT`. En un sistema async, dos coroutines podrían hacer `SELECT` simultáneamente, ambas ver que no existe, y ambas hacer `INSERT`. `INSERT OR IGNORE` es atómico a nivel de SQLite: solo uno gana.
+</Callout>
+
+## El RateLimiter en memoria
+
+```python
+# app/webhook/rate_limiter.py
+import time
+from collections import defaultdict, deque
+
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int):
+        self._max_requests = max_requests
+        self._window = window_seconds
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        q = self._requests[key]
+
+        # Limpiar entradas expiradas
+        while q and q[0] <= now - self._window:
+            q.popleft()
+
+        if len(q) >= self._max_requests:
+            return False
+
+        q.append(now)
+        return True
+```
+
+<Concept title="Sliding Window Rate Limiter">
+El rate limiter usa una ventana deslizante con `deque`. Cada request agrega un timestamp. Antes de verificar el límite, limpia los timestamps más viejos que la ventana. `time.monotonic()` se usa en vez de `time.time()` porque es inmune a cambios del reloj del sistema.
+</Concept>
+
+<Quiz
+  question="¿Por qué se usa INSERT OR IGNORE en lugar de SELECT + INSERT para el dedup de mensajes?"
+  options={["Porque INSERT OR IGNORE es más legible que dos queries separados", "Para evitar race conditions donde dos coroutines procesan el mismo mensaje simultáneamente", "Porque SELECT no funciona en SQLite con aiosqlite", "Para mejorar la performance al evitar un round-trip a la DB"]}
+  correct={1}
+/>
+
+## El Dependency Injection en acción
+
+Mirá cómo el handler del webhook obtiene todas sus dependencias:
+
+```python
+# Dentro de incoming_webhook()
+repository = get_repository(request)      # SQLite repository
+wa_client = get_whatsapp_client(request)  # WhatsApp API client
+ollama_client = get_ollama_client(request) # Ollama LLM client
+conversation = get_conversation_manager(request)
+skill_registry = get_skill_registry(request)
+rate_limiter = get_rate_limiter(request)
+transcriber = get_transcriber(request)    # faster-whisper
+vec_available = get_vec_available(request) # sqlite-vec ok?
+trace_recorder = get_trace_recorder(request) # Langfuse
+```
+
+<Callout variant="tip" title="Testeabilidad">
+Cada una de estas funciones `get_*()` lee de `request.app.state`. En los tests, simplemente asignás mocks a `app.state.repository`, `app.state.ollama_client`, etc. No necesitás montar la infraestructura real.
+</Callout>
+
 ## Felicitaciones
 
-Completaste el **Módulo 0: Setup & Onboarding**. Ahora tenés una visión completa de la arquitectura, Docker, configuración y el flow de un mensaje. En el **Módulo 1** implementamos el webhook paso a paso.
+Completaste el **Módulo 0: Setup & Onboarding**. Ahora tenés una visión completa de:
+
+- La arquitectura de 85 archivos organizados por dominio
+- Docker Compose con Ollama, ngrok y Langfuse
+- Pydantic Settings con validación fail-fast y field_validators custom
+- El pipeline completo de un mensaje con 4 fases paralelas
+
+<Quiz
+  question="¿Cuál es la función de BackgroundTasks en el webhook de LocalForge?"
+  options={["Ejecutar el procesamiento del mensaje en un thread separado", "Retornar 200 a Meta inmediatamente y procesar el mensaje después de la respuesta HTTP", "Enviar el mensaje a una cola de Redis para procesamiento posterior", "Reintentar automáticamente si el procesamiento del mensaje falla"]}
+  correct={1}
+/>
+
+En el **Módulo 1** implementamos el webhook paso a paso: verificación GET, firma HMAC, parseo de payload, cliente de WhatsApp y testing completo.

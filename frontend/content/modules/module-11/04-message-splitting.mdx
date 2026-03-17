@@ -1,0 +1,252 @@
+---
+title: "Message Splitting"
+description: "Dividir mensajes largos respetando breakpoints naturales y límites de plataforma"
+xpReward: 100
+---
+
+## El Problema: LLMs Generan Texto Largo
+
+Un LLM puede generar respuestas de 8,000+ caracteres. Pero tanto WhatsApp como Telegram limitan cada mensaje a **4,096 caracteres**. Cortar a lo bruto en el caracter 4096 puede partir una palabra, romper un bloque de código, o cortar una URL a la mitad.
+
+<Callout variant="info" title="Prioridad de breakpoints">
+En vez de cortar arbitrariamente, LocalForge busca el mejor punto de corte cerca del límite. La prioridad: separador de párrafo > fin de oración > espacio > corte duro.
+</Callout>
+
+## El Algoritmo: split_message
+
+```python
+# app/formatting/splitter.py
+def split_message(text: str, max_length: int = 4096) -> list[str]:
+    """Split a message into chunks that fit within max_length.
+
+    Split priority:
+      paragraph break (\\n\\n) > sentence end (. ) > space > hard cut.
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        # Try to find the best split point within max_length
+        segment = text[:max_length]
+
+        # Priority 1: paragraph break
+        pos = segment.rfind("\n\n")
+        if pos > 0:
+            chunks.append(text[:pos])
+            text = text[pos + 2:]  # Skip the \n\n
+            continue
+
+        # Priority 2: sentence end (". ")
+        pos = segment.rfind(". ")
+        if pos > 0:
+            chunks.append(text[:pos + 1])  # Include the period
+            text = text[pos + 2:]           # Skip ". "
+            continue
+
+        # Priority 3: space
+        pos = segment.rfind(" ")
+        if pos > 0:
+            chunks.append(text[:pos])
+            text = text[pos + 1:]  # Skip the space
+            continue
+
+        # Priority 4: hard cut (último recurso)
+        chunks.append(text[:max_length])
+        text = text[max_length:]
+
+    return chunks
+```
+
+## Los 4 Niveles de Prioridad
+
+### Prioridad 1: Párrafo (`\n\n`)
+
+```
+"Primer párrafo con mucho texto...\n\nSegundo párrafo..."
+                                    ↑ Cortar aquí
+```
+
+`rfind("\n\n")` busca el **último** doble newline dentro del límite. Esto maximiza el tamaño de cada chunk mientras corta en un límite natural de párrafo.
+
+<Concept title="rfind: buscar desde el final">
+`rfind` (reverse find) busca la última ocurrencia del separador. Si usáramos `find` (desde el inicio), el primer chunk sería muy pequeño y tendríamos más mensajes. Con `rfind`, maximizamos cada chunk.
+</Concept>
+
+### Prioridad 2: Oración (`". "`)
+
+```
+"Primera oración larga. Segunda oración. Tercera..."
+                                        ↑ Cortar aquí
+```
+
+Se busca `". "` (punto seguido de espacio) para no partir en el medio de un decimal (`3.14`) o una URL (`api.example.com`).
+
+```python
+pos = segment.rfind(". ")
+if pos > 0:
+    chunks.append(text[:pos + 1])  # Incluir el punto
+    text = text[pos + 2:]          # Saltar ". "
+```
+
+<Callout variant="tip" title="El +1 y +2">
+`pos + 1` incluye el punto en el chunk actual (la oración termina completa). `pos + 2` salta el punto y el espacio para que el siguiente chunk empiece limpio, sin espacio inicial.
+</Callout>
+
+### Prioridad 3: Espacio
+
+```
+"una palabra_muy_larga_que_no_tiene puntos ni newlines cerca"
+                                                ↑ Cortar aquí
+```
+
+Si no hay ni párrafos ni oraciones, se corta en el último espacio. Esto evita partir palabras a la mitad.
+
+### Prioridad 4: Corte Duro
+
+```
+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaaaaaa..."
+                                                ↑ Cortar aquí
+```
+
+Solo se usa si no hay **ningún** separador en los primeros 4096 caracteres. Esto es extremadamente raro en texto normal (solo pasa con strings sin espacios, como URLs muy largas o datos Base64).
+
+## Ejemplo Visual
+
+Input (8500 chars):
+
+```
+Párrafo 1... (2000 chars)\n\n
+Párrafo 2... (3000 chars)\n\n
+Párrafo 3... (3500 chars)
+```
+
+Resultado con `max_length=4096`:
+
+```
+Iteración 1: segment = text[:4096] → contiene P1 + inicio de P2
+             rfind("\n\n") encuentra el \n\n en posición ~2000
+Chunk 1: "Párrafo 1..."              (2000 chars)
+
+Iteración 2: texto restante = P2 + P3 (6500 chars)
+             segment = text[:4096] → contiene P2 + inicio de P3
+             rfind("\n\n") encuentra el \n\n en posición ~3000
+Chunk 2: "Párrafo 2..."              (3000 chars)
+
+Iteración 3: texto restante = P3 (3500 chars) ≤ 4096
+Chunk 3: "Párrafo 3..."              (3500 chars → cabe completo)
+```
+
+## Uso en el Pipeline
+
+El splitter se usa **después** de formatear y **antes** de enviar:
+
+```python
+# En TelegramClient.send_message()
+formatted = self.format_text(text)
+chunks = split_message(formatted, max_length=4096)
+
+last_id = None
+for chunk in chunks:
+    resp = await self._http.post(
+        f"{self._api}/sendMessage",
+        json={
+            "chat_id": cid,
+            "text": chunk,
+            "parse_mode": "HTML",
+        },
+    )
+    if resp.is_success:
+        last_id = str(resp.json()["result"]["message_id"])
+return last_id
+```
+
+<Callout variant="warning" title="Formatear ANTES de splitear">
+El orden es: markdown → format → split → send. Si splitearas primero, podrías cortar en medio de un `**bold**` y la conversión a `*bold*` fallaría porque los markers quedarían en chunks diferentes.
+</Callout>
+
+## Edge Cases
+
+### max_length configurable
+
+```python
+def split_message(text: str, max_length: int = 4096) -> list[str]:
+```
+
+El default es 4096 (WhatsApp y Telegram), pero es configurable. Útil para testing o si una plataforma tiene un límite diferente.
+
+### Texto que cabe en un mensaje
+
+```python
+if len(text) <= max_length:
+    return [text]  # Fast path: no splitting needed
+```
+
+La mayoría de los mensajes caben en un solo chunk. Este early return evita la lógica de splitting para el caso común.
+
+### Strip de whitespace
+
+```python
+chunks.append(text[:pos])
+text = text[pos + 2:]  # Skip the separator
+```
+
+Al cortar en `\n\n`, se eliminan los newlines del separador. Cada chunk empieza y termina limpio, sin whitespace extra.
+
+## Pattern: Pipeline de Procesamiento
+
+El flujo completo de un mensaje de salida:
+
+```
+LLM output (markdown)
+    │
+    ▼
+format_text()           ← markdown → WA/HTML
+    │
+    ▼
+split_message()         ← divide si > 4096
+    │
+    ▼
+send_message() × N      ← un API call por chunk
+```
+
+Cada paso es una **función pura** (sin side effects) excepto `send_message`. Esto hace que el pipeline sea fácil de testear: podés verificar cada transformación independientemente.
+
+<Quiz
+  question="¿Cuál es la PRIMERA prioridad para elegir dónde dividir un mensaje largo?"
+  options={[
+    "Espacio en blanco",
+    "Doble newline (\\n\\n) — separador de párrafo",
+    "Punto y seguido ('. ')",
+    "Corte duro al límite de caracteres"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se usa rfind en vez de find para buscar el punto de corte?"
+  options={[
+    "Es más rápido",
+    "rfind busca desde el FINAL, maximizando el tamaño de cada chunk en vez de crear chunks pequeños",
+    "find no funciona con newlines",
+    "Por compatibilidad con Python 3.11"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si el texto no tiene ningún espacio, punto ni newline en los primeros 4096 caracteres?"
+  options={[
+    "Se devuelve un error",
+    "Se envía el texto completo sin dividir",
+    "Se hace un corte duro exactamente en el caracter 4096 (prioridad 4, último recurso)",
+    "Se trunca el texto"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo Multimedia & Formatting. Ahora sabés cómo LocalForge transcribe audio, describe imágenes, convierte markdown a formatos de plataforma, y divide mensajes largos inteligentemente.

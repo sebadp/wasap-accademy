@@ -1,0 +1,244 @@
+---
+title: "El Loop de Ejecucion"
+description: "execute_tool_loop: el ciclo LLM -> tools -> resultados -> LLM"
+xpReward: 75
+---
+
+## El Ciclo de Tool Calling
+
+El LLM no ejecuta una sola herramienta y listo. Puede necesitar **multiples rondas**: usar una herramienta, ver el resultado, decidir que necesita otra, y asi. El `execute_tool_loop` en `app/skills/executor.py` orquesta este ciclo.
+
+```
+LLM --tool_calls--> Ejecutar tools --results--> LLM --tool_calls--> ...
+                                                  |
+                                                  +--text--> Respuesta final
+```
+
+<Callout variant="info" title="MAX_TOOL_ITERATIONS = 5">
+El loop se ejecuta hasta 5 veces. Esto previene loops infinitos donde el LLM sigue pidiendo tools sin converger a una respuesta. Si se agotan las iteraciones, se fuerza una respuesta de texto.
+</Callout>
+
+## La Firma Completa
+
+`execute_tool_loop` recibe muchos parametros porque centraliza toda la logica de tool calling:
+
+```python
+async def execute_tool_loop(
+    messages: list[ChatMessage],
+    ollama_client: OllamaClient,
+    skill_registry: SkillRegistry,
+    mcp_manager: McpManager | None = None,
+    max_tools: int = 8,
+    pre_classified_categories: list[str] | None = None,
+    user_facts: dict[str, str] | None = None,
+    recent_messages: list[ChatMessage] | None = None,
+    sticky_categories: list[str] | None = None,
+    hitl_callback: Callable[[str, dict, str], Awaitable[bool]] | None = None,
+    parent_span_id: str | None = None,
+    repository: Repository | None = None,
+    embed_model: str | None = None,
+) -> str:
+```
+
+<Concept title="Inversion de dependencias">
+El loop recibe todo por parametro -- no importa globales. Esto permite testear con mocks, inyectar callbacks de seguridad (HITL), y reusar el loop tanto en el flujo normal como en el modo agente.
+</Concept>
+
+## El Flujo Paso a Paso
+
+<Step number={1} title="Clasificar intencion">
+Primero se determinan las categorias de herramientas. Si ya vienen pre-clasificadas (del critical path), se reusan:
+
+```python
+# Extraer ultimo mensaje del usuario para compactacion
+user_message = ""
+for msg in reversed(messages):
+    if msg.role == "user":
+        user_message = msg.content
+        break
+
+# Stage 1: classify intent (reusar si ya se computo)
+all_tools_map = _get_cached_tools_map(skill_registry, mcp_manager)
+categories = pre_classified_categories or await classify_intent(
+    user_message,
+    ollama_client,
+    recent_messages=recent_messages,
+    sticky_categories=sticky_categories,
+)
+```
+</Step>
+
+<Step number={2} title="Seleccionar herramientas">
+Con las categorias, se seleccionan las herramientas concretas y se agrega el meta-tool:
+
+```python
+if categories == ["none"]:
+    return await ollama_client.chat(messages)  # Plain chat
+
+tools = select_tools(categories, all_tools_map, max_tools=max_tools)
+
+# Agregar meta-tool para expansion dinamica
+meta_tool_schema = build_request_more_tools_schema(
+    list(TOOL_CATEGORIES.keys())
+)
+tools = [meta_tool_schema] + tools
+```
+</Step>
+
+<Step number={3} title="Inyectar user facts">
+Si hay datos estructurados del usuario (como su username de GitHub), se inyectan para evitar que el LLM los adivine:
+
+```python
+if user_facts:
+    from app.context.fact_extractor import format_facts_for_prompt
+    facts_text = format_facts_for_prompt(user_facts)
+    if facts_text:
+        working_messages.insert(
+            1 if working_messages[0].role == "system" else 0,
+            ChatMessage(role="system", content=facts_text),
+        )
+```
+</Step>
+
+<Step number={4} title="Iterar: LLM -> tools -> resultados">
+El loop principal ejecuta hasta `MAX_TOOL_ITERATIONS` rondas:
+
+```python
+for iteration in range(MAX_TOOL_ITERATIONS):
+    response = await ollama_client.chat_with_tools(
+        working_messages, tools=tools
+    )
+
+    # Si retorna texto sin tool_calls -> terminamos
+    if not response.tool_calls:
+        return response.content
+
+    # Ejecutar tool calls en paralelo
+    # (ver leccion 02 para detalles)
+    ...
+
+    # Limpiar resultados viejos para liberar contexto
+    _clear_old_tool_results(working_messages, keep_last_n=2)
+```
+</Step>
+
+<Step number={5} title="Safety: forzar respuesta">
+Si se agotan las 5 iteraciones, se fuerza una respuesta final sin tools:
+
+```python
+# Inyectar nudge para que resuma lo encontrado
+working_messages.append(ChatMessage(
+    role="system",
+    content=(
+        "You have reached the maximum number of tool calls. "
+        "Summarize what you have found so far. "
+        "Do NOT call any more tools."
+    ),
+))
+response = await ollama_client.chat_with_tools(
+    working_messages, tools=None  # Sin tools = solo texto
+)
+return response.content
+```
+</Step>
+
+## Manejo de Respuestas Vacias
+
+Un problema sutil: a veces el LLM retorna contenido vacio despues de usar tools. LocalForge tiene un mecanismo de retry:
+
+```python
+if not response.content or not response.content.strip():
+    if iteration > 0:
+        # Nudge: pedir que resuma los resultados
+        working_messages.append(ChatMessage(
+            role="system",
+            content="Your reply was empty. Based on the tool results above, "
+                    "provide a complete text response."
+        ))
+        retry = await ollama_client.chat_with_tools(
+            working_messages, tools=tools
+        )
+        if retry.content and retry.content.strip():
+            return retry.content
+        # Last resort: forzar sin tools
+        forced = await ollama_client.chat_with_tools(
+            working_messages, tools=None
+        )
+        return forced.content
+```
+
+<Callout variant="tip" title="Tres niveles de recuperacion">
+1. **Nudge con tools**: pide al LLM que resuma, aun ofreciendo tools. 2. **Retry sin nudge**: si el LLM quiere mas tools, deja que siga el loop. 3. **Forzar sin tools**: ultimo recurso, quita las tools para forzar texto puro.
+</Callout>
+
+## pre_classified_categories
+
+```python
+# En router.py -- las categorias ya fueron clasificadas en Phase C
+categories = await classify_intent(messages, context)
+
+# Se pasan al executor para evitar doble clasificacion
+result = await execute_tool_loop(
+    messages=messages,
+    pre_classified_categories=categories,  # Ya clasificado
+)
+```
+
+<Callout variant="warning" title="Evitar trabajo duplicado">
+Sin `pre_classified_categories`, el executor llamaria a `classify_intent` de nuevo internamente. Este parametro permite reusar la clasificacion que ya se computo en el critical path (Phase C del pipeline).
+</Callout>
+
+## Tracing: Observabilidad del Loop
+
+Cada iteracion del loop genera un span de tracing con metricas:
+
+```python
+trace = get_current_trace()
+if trace:
+    async with trace.span(
+        f"llm:iteration_{iteration + 1}",
+        kind="generation",
+        parent_id=parent_span_id,
+    ) as gen_span:
+        gen_span.set_input({
+            "message_count": len(working_messages),
+            "tool_count": len(tools),
+        })
+        response = await ollama_client.chat_with_tools(...)
+        gen_span.set_metadata({
+            "gen_ai.usage.input_tokens": response.input_tokens,
+            "gen_ai.usage.output_tokens": response.output_tokens,
+        })
+```
+
+Esto permite ver en Langfuse cuantas iteraciones tomo cada mensaje, cuantos tokens consumio, y que tools se llamaron.
+
+<Quiz
+  question="Cuantas iteraciones maximas tiene el tool calling loop?"
+  options={["3", "5", "10", "Sin limite"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa cuando se agotan las iteraciones del loop?"
+  options={[
+    "Se retorna un error al usuario",
+    "Se inyecta un nudge y se hace una llamada final SIN tools para forzar texto",
+    "Se reinicia el loop desde cero",
+    "Se envia un mensaje vacio"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Para que sirve el parametro pre_classified_categories?"
+  options={[
+    "Para forzar categorias especificas ignorando al LLM",
+    "Para reusar la clasificacion del critical path y evitar una segunda llamada LLM",
+    "Para definir categorias personalizadas por usuario",
+    "Para deshabilitar la clasificacion completamente"
+  ]}
+  correct={1}
+/>
+
+En la siguiente leccion veremos como se ejecutan multiples tools en paralelo.

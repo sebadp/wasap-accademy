@@ -1,0 +1,203 @@
+---
+title: "Docker para Apps de AI"
+description: "Containers para AI: seguridad con appuser, layer caching, multi-stage builds y Docker Compose con Ollama"
+xpReward: 50
+---
+
+## Por Qué Docker para AI
+
+Una app de AI tiene dependencias complejas: Python 3.11+, libraries de ML (faster-whisper), extensiones de SQLite (sqlite-vec), y un LLM server (Ollama). Docker empaqueta todo esto en un container reproducible.
+
+<Callout variant="info" title="Funciona en mi máquina">
+Sin Docker: "funciona en mi máquina" pero falla en producción porque faltan dependencias, la versión de Python es diferente, o sqlite-vec no está compilado. Con Docker: si funciona en el container, funciona en producción.
+</Callout>
+
+## Seguridad: appuser (UID=1000)
+
+**Nunca correr como root.** LocalForge crea un usuario no-root:
+
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+
+# Crear usuario no-root
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -u 1000 appuser
+
+# Instalar dependencias del sistema
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential libsqlite3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copiar requirements primero (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar código
+COPY . .
+
+# Crear directorio de datos con permisos correctos
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+
+# Cambiar a usuario no-root
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+<Callout variant="warning" title="UID=1000">
+`UID=1000` es el UID estándar del primer usuario en Linux. Si los volúmenes montados tienen archivos del usuario del host (UID=1000), el container puede leerlos y escribirlos sin problemas de permisos.
+</Callout>
+
+## Layer Caching: Dependencias Primero, Código Después
+
+Docker cachea cada capa. Si una capa no cambió, se reutiliza:
+
+```dockerfile
+# BUENO: requirements.txt cambia poco → capa cacheada
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt  # Cacheada si requirements no cambió
+
+# El código cambia frecuentemente → solo reconstruye esta capa
+COPY . .
+```
+
+```
+Cambio en código Python:
+  Layer 1: FROM python:3.11-slim        ✅ cached
+  Layer 2: apt-get install              ✅ cached
+  Layer 3: pip install -r requirements  ✅ cached (requirements no cambió)
+  Layer 4: COPY . .                     🔄 rebuild (código cambió)
+  Layer 5: CMD [...]                    🔄 rebuild
+
+Tiempo de rebuild: ~5 segundos (vs ~2 minutos sin cache)
+```
+
+<Concept title="Layer caching">
+Cada instrucción en el Dockerfile crea una capa. Docker cachea capas de arriba hacia abajo. Cuando una capa cambia, todas las siguientes se reconstruyen. Por eso las dependencias (que cambian poco) van antes del código (que cambia mucho).
+</Concept>
+
+## Multi-Stage Build
+
+Para reducir el tamaño de la imagen final:
+
+```dockerfile
+# Stage 1: Build (incluye herramientas de compilación)
+FROM python:3.11-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential libsqlite3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
+
+# Stage 2: Runtime (imagen más liviana)
+FROM python:3.11-slim
+
+RUN groupadd -r appuser && useradd -r -g appuser -u 1000 appuser
+
+WORKDIR /app
+COPY --from=builder /build/deps /usr/local/lib/python3.11/site-packages/
+COPY . .
+
+RUN mkdir -p /app/data && chown -R appuser:appuser /app
+
+USER appuser
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+## Docker Compose: App + Ollama
+
+```yaml
+# docker-compose.yml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - ollama
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+
+volumes:
+  ollama_data:
+```
+
+<Callout variant="tip" title="Volume mount para data/">
+`./data:/app/data` monta el directorio local `data/` dentro del container. Los datos (SQLite DB, daily logs, MEMORY.md) persisten entre restarts del container.
+</Callout>
+
+<Terminal title="Levantar todo">
+docker compose up -d
+</Terminal>
+
+<Terminal title="Descargar los modelos necesarios en Ollama">
+docker compose exec ollama ollama pull qwen3.5:9b
+docker compose exec ollama ollama pull nomic-embed-text
+docker compose exec ollama ollama pull llava:7b
+</Terminal>
+
+<Terminal title="Ver logs de la app">
+docker compose logs -f app
+</Terminal>
+
+<Quiz
+  question="¿Por qué el Dockerfile copia requirements.txt ANTES que el código?"
+  options={[
+    "Porque Python lo requiere",
+    "Para que la capa de pip install se cachee cuando solo cambia el código",
+    "Para ordenar los archivos alfabéticamente",
+    "Porque requirements.txt es más pesado"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el container corre como appuser (UID=1000) en vez de root?"
+  options={[
+    "Porque root es más lento",
+    "Por seguridad: si un atacante compromete la app, no tiene acceso root al host",
+    "Porque Docker no permite root",
+    "Para usar menos memoria"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el propósito del volume mount ./data:/app/data en Docker Compose?"
+  options={[
+    "Acelerar las lecturas de disco dentro del container",
+    "Permitir que Docker acceda al código fuente",
+    "Persistir los datos (SQLite DB, daily logs, MEMORY.md) entre restarts del container",
+    "Compartir datos entre múltiples containers simultáneamente"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos cómo implementar health checks para monitorear la app en producción.

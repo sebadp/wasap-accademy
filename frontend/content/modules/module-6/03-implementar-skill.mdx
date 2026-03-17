@@ -1,0 +1,284 @@
+---
+title: "Implementar un Skill"
+description: "Guía paso a paso para crear un skill completo desde cero"
+xpReward: 100
+---
+
+## Vamos a Crear un Skill
+
+En esta lección vamos a construir un skill completo: **unit converter** (conversor de unidades). Seguiremos el mismo patrón que usan los skills reales de LocalForge como calculator y datetime.
+
+<Callout variant="tip" title="Hands-on">
+Seguí estos pasos para crear tu propio skill. Al final, tendrás una herramienta funcional que el LLM puede usar para convertir unidades.
+</Callout>
+
+## Paso 1: Crear el SKILL.md
+
+Primero definimos el contrato en `skills/converter/SKILL.md`:
+
+```markdown
+---
+name: converter
+description: Convert units of measurement (temperature, distance, weight)
+version: 1
+tools:
+  - convert_units
+---
+Use `convert_units` when the user asks to convert between units.
+
+Supported conversions:
+- Distance: km <-> miles, m <-> ft
+- Temperature: celsius <-> fahrenheit
+- Weight: kg <-> lb
+
+Examples:
+- "convertí 100 km a millas" -> convert_units(value=100, from_unit="km", to_unit="miles")
+- "cuantos grados fahrenheit son 30 celsius" -> convert_units(value=30, from_unit="celsius", to_unit="fahrenheit")
+
+How to respond:
+- Show the conversion clearly: "100 km = 62.14 millas"
+- Round to 2 decimal places for readability
+- Use the user's language
+```
+
+Notá que el frontmatter es mínimo (`name`, `description`, `version`, `tools`) y el body tiene instrucciones detalladas para que el LLM sepa cómo usar y presentar los resultados.
+
+## Paso 2: Crear el Handler Python
+
+Ahora implementamos la lógica en `app/skills/tools/converter_tools.py`. Seguimos el patrón exacto del calculator real:
+
+```python
+# app/skills/tools/converter_tools.py
+from __future__ import annotations
+
+import logging
+from app.skills.registry import SkillRegistry
+
+logger = logging.getLogger(__name__)
+
+CONVERSIONS = {
+    ("km", "miles"): lambda v: v * 0.621371,
+    ("miles", "km"): lambda v: v * 1.60934,
+    ("celsius", "fahrenheit"): lambda v: v * 9/5 + 32,
+    ("fahrenheit", "celsius"): lambda v: (v - 32) * 5/9,
+    ("kg", "lb"): lambda v: v * 2.20462,
+    ("lb", "kg"): lambda v: v * 0.453592,
+    ("m", "ft"): lambda v: v * 3.28084,
+    ("ft", "m"): lambda v: v * 0.3048,
+}
+
+
+def register(registry: SkillRegistry) -> None:
+    async def convert_units(
+        value: float, from_unit: str, to_unit: str
+    ) -> str:
+        logger.info(
+            "Converting %s %s to %s", value, from_unit, to_unit
+        )
+        key = (from_unit.lower().strip(), to_unit.lower().strip())
+        if key not in CONVERSIONS:
+            return (
+                f"Conversión no soportada: {from_unit} -> {to_unit}. "
+                f"Unidades soportadas: km, miles, celsius, fahrenheit, "
+                f"kg, lb, m, ft"
+            )
+
+        result = CONVERSIONS[key](value)
+        formatted = f"{value} {from_unit} = {result:.2f} {to_unit}"
+        logger.info("Conversion result: %s", formatted)
+        return formatted
+
+    registry.register_tool(
+        name="convert_units",
+        description="Convert a value from one unit to another",
+        parameters={
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "number",
+                    "description": "Numeric value to convert",
+                },
+                "from_unit": {
+                    "type": "string",
+                    "description": "Source unit (km, miles, celsius, "
+                    "fahrenheit, kg, lb, m, ft)",
+                },
+                "to_unit": {
+                    "type": "string",
+                    "description": "Target unit",
+                },
+            },
+            "required": ["value", "from_unit", "to_unit"],
+        },
+        handler=convert_units,
+        skill_name="converter",
+    )
+```
+
+<Concept title="Patrón register()">
+Todos los handlers siguen el mismo patrón: una función `register(registry)` que define handlers async internos y los registra. El handler es una closure que captura dependencias del scope exterior si las necesita. Calculator no necesita nada. Notes necesita `repository`.
+</Concept>
+
+Comparemos con el handler real del calculator para ver el patrón:
+
+```python
+# app/skills/tools/calculator_tools.py (real)
+def register(registry: SkillRegistry) -> None:
+    async def calculate(expression: str) -> str:
+        try:
+            result = safe_eval(expression)
+            # Format nicely: remove trailing .0 for integers
+            if isinstance(result, float) and result == int(result):
+                return str(int(result))
+            return str(result)
+        except (ValueError, SyntaxError, TypeError, ZeroDivisionError) as e:
+            return f"Error: {e}"
+
+    registry.register_tool(
+        name="calculate",
+        description="Evaluate a mathematical expression safely",
+        parameters={...},
+        handler=calculate,
+        skill_name="calculator",
+    )
+```
+
+El patrón es idéntico: `register()` -> define handler async -> `registry.register_tool()`.
+
+## Paso 3: Registrar en el Router
+
+Para que el clasificador de intent sepa cuándo ofrecer tu tool, agrégalo a `TOOL_CATEGORIES` en `app/skills/router.py`:
+
+```python
+# app/skills/router.py
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "math": ["calculate", "convert_units"],  # Agregar acá
+    "time": ["get_current_datetime", "convert_timezone", ...],
+    "weather": ["get_weather"],
+    "notes": ["save_note", "list_notes", "search_notes", "delete_note"],
+    # ... otras categorías
+}
+```
+
+<Callout variant="warning" title="Categoría correcta">
+Elegí la categoría que mejor describe tu tool. `convert_units` entra en "math" porque el usuario probablemente dirá "convertí 100 km a millas" en un contexto matemático. Si creás un skill de traducción de idiomas, podría ir en una nueva categoría "language".
+</Callout>
+
+También podés crear una **categoría nueva** si ninguna existente aplica:
+
+```python
+TOOL_CATEGORIES["conversion"] = ["convert_units"]
+```
+
+Y agregar un ejemplo al prompt del clasificador:
+
+```python
+# En _CLASSIFIER_PROMPT_TEMPLATE
+'"convertí 100 km a millas" -> conversion\n'
+'"cuantos grados fahrenheit son 30 celsius" -> conversion\n'
+```
+
+## Paso 4: Registrar el Handler en el Startup
+
+En el lifespan de FastAPI, hay que llamar a `register()`:
+
+```python
+# En la función que registra todos los skills
+from app.skills.tools import converter_tools
+
+converter_tools.register(registry)
+```
+
+## Paso 5: El Resultado Completo
+
+Cuando el usuario dice "convertí 100 km a millas", el flujo es:
+
+```
+1. Usuario: "convertí 100 km a millas"
+2. classify_intent() -> ["math"]      # El clasificador detecta categoría math
+3. select_tools(["math"]) -> [calculate, convert_units]  # Ambas tools de math
+4. LLM recibe schemas + mensaje
+5. LLM genera: convert_units(value=100, from_unit="km", to_unit="miles")
+6. Handler ejecuta: CONVERSIONS[("km", "miles")](100) -> 62.1371
+7. Resultado: "100 km = 62.14 miles"
+8. LLM formatea: "100 kilómetros equivalen a 62.14 millas."
+9. Respuesta enviada al usuario
+```
+
+<Step number={1} title="SKILL.md define el contrato">
+Qué herramientas ofrece, qué parámetros acepta, y cómo el LLM debe usarlas.
+</Step>
+
+<Step number={2} title="Handler implementa la lógica">
+La función async que ejecuta la herramienta y retorna un string con el resultado.
+</Step>
+
+<Step number={3} title="Router mapea categorías">
+En qué contextos (math, weather, notes...) el LLM puede acceder a esta herramienta.
+</Step>
+
+<Step number={4} title="Startup registra todo">
+El handler se registra en el SkillRegistry durante el lifespan de FastAPI.
+</Step>
+
+## Skills con Dependencias
+
+Algunos skills necesitan acceso a `repository`, `ollama_client`, u otras dependencias. El patrón es el mismo pero con keyword arguments:
+
+```python
+# app/skills/tools/notes_tools.py (simplificado)
+def register(registry: SkillRegistry, **dependencies) -> None:
+    repository = dependencies.get("repository")
+
+    async def save_note(title: str, content: str) -> str:
+        note_id = await repository.save_note(title, content)
+        return f"Nota guardada: {title} (ID: {note_id})"
+
+    registry.register_tool(
+        name="save_note",
+        handler=save_note,
+        skill_name="notes",
+        ...
+    )
+```
+
+Las dependencias se pasan desde el lifespan:
+
+```python
+notes_tools.register(registry, repository=repository)
+```
+
+<Quiz
+  question="¿En qué orden se crean las partes de un skill?"
+  options={[
+    "Handler -> SKILL.md -> Router",
+    "SKILL.md (definición) -> Handler (lógica) -> Router (TOOL_CATEGORIES)",
+    "Router -> SKILL.md -> Handler",
+    "No importa el orden, se pueden crear en cualquier secuencia"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Dónde se mapea un tool nuevo a una categoría para el routing?"
+  options={[
+    "En el SKILL.md en un campo 'category'",
+    "En el handler Python con un decorador",
+    "En TOOL_CATEGORIES dentro de router.py",
+    "En la base de datos SQLite"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cómo recibe un skill acceso a dependencias como repository?"
+  options={[
+    "Las importa directamente del módulo",
+    "Via keyword arguments en la función register(registry, **dependencies)",
+    "Via variables globales",
+    "Via inyección de dependencias de FastAPI con Depends()"
+  ]}
+  correct={1}
+/>
+
+En la última lección del módulo aprenderemos cómo testear skills correctamente.

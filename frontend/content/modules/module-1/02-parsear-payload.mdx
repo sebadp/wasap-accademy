@@ -1,97 +1,256 @@
 ---
 title: "Parsear el payload de WhatsApp"
-description: "Extraer mensajes del JSON anidado de Meta con Pydantic"
+description: "Extraer mensajes del JSON anidado de Meta con funciones puras"
 xpReward: 75
 ---
 
-## El payload de Meta es... complejo
+## El payload de Meta es... profundo
 
-El JSON que envía Meta está profundamente anidado. Un mensaje de texto simple requiere navegar 5 niveles de anidamiento. Pydantic hace esto manejable.
+El JSON que envía Meta está profundamente anidado. Un mensaje de texto simple requiere navegar 5 niveles de anidamiento: `entry[0].changes[0].value.messages[0].text.body`. En LocalForge, el parser convierte esta estructura compleja en objetos Pydantic limpios.
 
-<Callout variant="tip">
-El payload tiene esta estructura porque Meta diseñó el webhook para soportar múltiples tipos de eventos, múltiples accounts y múltiples cambios en un solo request.
+<Callout variant="tip" title="¿Por qué tanta anidación?">
+Meta diseñó el webhook para soportar múltiples tipos de eventos (mensajes, estados, reacciones), múltiples accounts y múltiples cambios en un solo request. La estructura es genérica y extensible, pero incómoda para el caso simple de "un usuario te mandó un texto".
 </Callout>
 
-## Los modelos Pydantic
+## Los modelos Pydantic de LocalForge
 
-```python title="app/webhook/models.py"
+Antes de ver el parser, mirá los modelos que representan un mensaje:
+
+```python
+# app/models.py — modelos de datos
 from pydantic import BaseModel
-from typing import Literal
-
-
-class TextMessage(BaseModel):
-    body: str
-
 
 class WhatsAppMessage(BaseModel):
-    id: str
-    from_: str  # Número del remitente
-    timestamp: str
-    type: Literal["text", "image", "audio", "document"]
-    text: TextMessage | None = None
+    from_number: str          # Número del remitente (sin +)
+    message_id: str           # ID único del mensaje (wamid.xxx)
+    timestamp: str            # Unix timestamp
+    text: str                 # Texto del mensaje (o caption de imagen)
+    type: str                 # "text", "audio", "image"
+    media_id: str | None = None          # ID del media (para audio/imagen)
+    reply_to_message_id: str | None = None  # Si es reply a otro mensaje
 
-
-class Change(BaseModel):
-    value: ChangeValue
-    field: str
-
-
-class ChangeValue(BaseModel):
-    messages: list[WhatsAppMessage] | None = None
-    statuses: list[dict] | None = None
-
-
-class Entry(BaseModel):
-    id: str
-    changes: list[Change]
-
-
-class WebhookPayload(BaseModel):
-    object: str
-    entry: list[Entry]
+class WhatsAppReaction(BaseModel):
+    from_number: str           # Quién reaccionó
+    reacted_message_id: str    # A qué mensaje reaccionó
+    emoji: str                 # El emoji de la reacción
 ```
 
-## Extraer el mensaje
+<Concept title="from_number vs from">
+En el payload JSON de Meta, el campo se llama `"from"`. Pero `from` es una **palabra reservada** de Python (la usás en `from x import y`). Por eso el modelo usa `from_number`. El parser se encarga de mapear `msg["from"]` a `from_number`.
+</Concept>
 
-Con los modelos definidos, parsear el payload es limpio:
+<Concept title="media_id">
+Para mensajes de audio e imagen, Meta no envía el contenido directamente. Envía un `media_id` que después usás con la Graph API para descargar los bytes. Este patrón de dos pasos (metadata primero, contenido después) es común en APIs de mensajería para evitar payloads enormes.
+</Concept>
 
-```python title="app/webhook/handler.py"
-async def extract_messages(payload: WebhookPayload) -> list[WhatsAppMessage]:
-    """Extrae los mensajes de texto del payload de Meta."""
-    messages = []
+## El parser real de LocalForge
 
-    for entry in payload.entry:
-        for change in entry.changes:
-            if change.field != "messages":
-                continue
-            if not change.value.messages:
-                continue
+El archivo `app/webhook/parser.py` es una función pura que toma un `dict` (el payload JSON) y retorna una lista de `WhatsAppMessage`:
 
-            for msg in change.value.messages:
-                if msg.type == "text" and msg.text:
-                    messages.append(msg)
+```python
+# app/webhook/parser.py — código completo real
+from app.models import WhatsAppMessage, WhatsAppReaction
 
+_SUPPORTED_TYPES = {"text", "audio", "image"}
+
+
+def extract_messages(payload: dict) -> list[WhatsAppMessage]:
+    """Extract text, audio, and image messages from a WhatsApp webhook payload."""
+    messages: list[WhatsAppMessage] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for msg in value.get("messages", []):
+                msg_type = msg.get("type")
+                if msg_type not in _SUPPORTED_TYPES:
+                    continue
+
+                text = ""
+                media_id = None
+
+                if msg_type == "text":
+                    text = msg["text"]["body"]
+                elif msg_type == "audio":
+                    media_id = msg["audio"]["id"]
+                elif msg_type == "image":
+                    media_id = msg["image"]["id"]
+                    caption = msg["image"].get("caption")
+                    if caption:
+                        text = caption
+
+                reply_to = msg.get("context", {}).get("id")
+
+                messages.append(
+                    WhatsAppMessage(
+                        from_number=msg["from"],
+                        message_id=msg["id"],
+                        timestamp=msg["timestamp"],
+                        text=text,
+                        type=msg_type,
+                        media_id=media_id,
+                        reply_to_message_id=reply_to,
+                    )
+                )
     return messages
 ```
 
-## Tipos de mensajes
+<Callout variant="info" title="Función pura">
+`extract_messages()` es una **función pura**: toma un dict, retorna una lista. No tiene side effects, no accede a la DB, no hace requests HTTP. Esto la hace trivial de testear: pasás un dict, verificás lo que sale.
+</Callout>
 
-WasAP maneja varios tipos:
+## Desglosando el parser
 
-| Tipo | Descripción | Soporte |
-|------|-------------|---------|
-| `text` | Mensaje de texto | ✓ Módulo 1 |
-| `image` | Imagen con caption | ✓ Módulo 11 |
-| `audio` | Audio/voz | ✓ Módulo 11 |
-| `document` | PDF, Word, etc | ✓ Módulo 11 |
-| `location` | Coordenadas GPS | Parcial |
+### 1. El set de tipos soportados
 
-<Callout variant="info">
-Por ahora procesamos solo `text`. Los demás tipos se ignoran con un log de advertencia. En el Módulo 11 implementamos procesamiento de media.
+```python
+_SUPPORTED_TYPES = {"text", "audio", "image"}
+```
+
+Solo procesamos estos tres tipos. Los tipos `reaction`, `sticker`, `location`, `contacts`, `document` se ignoran silenciosamente. El set permite `O(1)` lookup en vez de encadenar `if/elif`.
+
+### 2. Navegación defensiva con .get()
+
+```python
+for entry in payload.get("entry", []):
+    for change in entry.get("changes", []):
+        value = change.get("value", {})
+        for msg in value.get("messages", []):
+```
+
+Cada `.get(key, default)` protege contra keys faltantes. Si `payload` no tiene `"entry"`, el for loop simplemente no itera. Sin `.get()`, un `KeyError` crashearía el handler.
+
+<Concept title="Programación defensiva">
+Cuando procesás datos de una API externa, asumí que cualquier campo puede faltar. Meta podría enviar un payload con `statuses` en vez de `messages`, o sin `changes`. Usar `.get()` con defaults vacíos es más robusto que `payload["entry"]` que tira `KeyError`.
+</Concept>
+
+### 3. Extracción según tipo
+
+```python
+if msg_type == "text":
+    text = msg["text"]["body"]        # Texto directo
+elif msg_type == "audio":
+    media_id = msg["audio"]["id"]     # Solo media_id, sin texto
+elif msg_type == "image":
+    media_id = msg["image"]["id"]     # media_id + caption opcional
+    caption = msg["image"].get("caption")
+    if caption:
+        text = caption
+```
+
+<Callout variant="tip" title="Caption como texto">
+Para imágenes, el `caption` (texto que el usuario escribe junto a la imagen) se usa como `text`. Esto permite que el pipeline de procesamiento trate el caption como input textual normal, mientras que el `media_id` se usa para descargar y analizar la imagen con el modelo de visión.
+</Callout>
+
+### 4. Reply context
+
+```python
+reply_to = msg.get("context", {}).get("id")
+```
+
+Si el usuario está **respondiendo** a un mensaje anterior (citándolo), Meta incluye un campo `context.id` con el `message_id` del mensaje citado. LocalForge usa esto para inyectar el texto citado en el prompt del LLM, dándole contexto de a qué se refiere el usuario.
+
+<Quiz
+  question="¿Por qué se usa from_number en lugar de from como nombre del campo en WhatsAppMessage?"
+  options={["Por convención de nombres de la API de WhatsApp", "Para que el campo sea opcional en Pydantic", "Porque from es una palabra reservada de Python", "Para evitar colisiones con el campo from de SMTP"]}
+  correct={2}
+/>
+
+## El parser de reacciones
+
+LocalForge también parsea **reacciones** (cuando un usuario responde con un emoji a un mensaje del bot):
+
+```python
+# app/webhook/parser.py — parser de reacciones
+def extract_reactions(payload: dict) -> list[WhatsAppReaction]:
+    """Extract reactions from a WhatsApp webhook payload.
+
+    Reactions bypass the normal message pipeline (dedup, rate limit)
+    entirely — they're lightweight fire-and-forget.
+    """
+    reactions: list[WhatsAppReaction] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for msg in value.get("messages", []):
+                if msg.get("type") != "reaction":
+                    continue
+                reaction = msg.get("reaction", {})
+                reacted_id = reaction.get("message_id")
+                emoji = reaction.get("emoji")
+                if not reacted_id or not emoji:
+                    continue
+                reactions.append(
+                    WhatsAppReaction(
+                        from_number=msg["from"],
+                        reacted_message_id=reacted_id,
+                        emoji=emoji,
+                    )
+                )
+    return reactions
+```
+
+<Concept title="Reacciones como feedback">
+Las reacciones no pasan por el pipeline normal (dedup, rate limit, LLM). Se procesan como fire-and-forget. En LocalForge, una reacción de thumbs-down a una respuesta del bot activa `add_correction_pair()`, que registra el par pregunta-respuesta como "mala" para mejorar el sistema de evaluación.
+</Concept>
+
+## Tipos de mensajes soportados
+
+| Tipo | Descripción | Qué se extrae | Módulo |
+|------|-------------|---------------|--------|
+| `text` | Mensaje de texto | `text.body` como string | Módulo 1 |
+| `image` | Imagen con caption opcional | `media_id` + `caption` como text | Módulo 11 |
+| `audio` | Audio/mensaje de voz | `media_id` para transcripción | Módulo 11 |
+| `reaction` | Emoji en respuesta a un mensaje | `emoji` + `reacted_message_id` | Módulo 13 |
+| `document` | PDF, Word, etc. | No soportado aún | Futuro |
+| `location` | Coordenadas GPS | No soportado aún | Futuro |
+| `sticker` | Sticker animado | Ignorado | - |
+
+<Callout variant="info" title="Extensibilidad">
+Para agregar soporte para un nuevo tipo (ej: `document`), solo necesitás: (1) agregar `"document"` al set `_SUPPORTED_TYPES`, (2) agregar un `elif msg_type == "document"` que extraiga el `media_id`, y (3) manejar la descarga y procesamiento en el pipeline.
 </Callout>
 
 <Quiz
-  question="¿Por qué se usa from_ con underscore en lugar de from como nombre del campo Pydantic?"
-  options={["Por convención de nombres de WhatsApp", "Para que el campo sea opcional", "Porque from es una palabra reservada de Python", "Para evitar colisiones con el campo from de SMTP"]}
-  correct={2}
+  question="¿Qué pasa cuando el parser encuentra un tipo de mensaje no soportado (ej: 'sticker')?"
+  options={["Lanza una excepción que el handler captura", "Lo ignora silenciosamente con continue", "Lo procesa como texto vacío", "Lo loguea como error y retorna 400"]}
+  correct={1}
 />
+
+## Cómo se usa el payload parseado
+
+Después de parsear, el handler itera sobre los mensajes y aplica las capas de protección:
+
+```python
+# En incoming_webhook() — después del parse
+messages = extract_messages(payload)
+reactions = extract_reactions(payload)
+
+# Reacciones: fire-and-forget (sin dedup ni rate limit)
+for reaction in reactions:
+    background_tasks.add_task(_handle_reaction, reaction, ...)
+
+# Mensajes: pipeline completo
+for msg in messages:
+    logger.info(
+        "Incoming [%s] (%s): %s",
+        msg.from_number,
+        msg.type,
+        msg.text[:80] if msg.text else "(empty)",
+    )
+
+    if msg.from_number not in settings.allowed_phone_numbers:
+        continue  # Allowlist
+    if not rate_limiter.is_allowed(msg.from_number):
+        continue  # Rate limit
+    if await repository.try_claim_message(msg.message_id):
+        continue  # Dedup
+
+    background_tasks.add_task(process_message, msg=msg, ...)
+```
+
+<Quiz
+  question="¿Cómo maneja LocalForge el campo 'context.id' cuando un usuario responde citando un mensaje anterior?"
+  options={["Lo ignora porque no es relevante para el LLM", "Lo extrae como reply_to_message_id y luego inyecta el texto citado en el prompt", "Lo usa para verificar que el mensaje citado existe en la DB", "Lo envía de vuelta a Meta como acknowledgment"]}
+  correct={1}
+/>
+
+En la próxima lección construimos el cliente HTTP para enviar respuestas de vuelta al usuario via la Graph API de Meta.

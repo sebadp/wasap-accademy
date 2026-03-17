@@ -1,0 +1,208 @@
+---
+title: "Markdown a WhatsApp"
+description: "Convertir markdown estándar a la sintaxis propietaria de WhatsApp con placeholder strategy"
+xpReward: 75
+---
+
+## El Problema: WhatsApp No Entiende Markdown
+
+Los LLMs generan texto en Markdown estándar: `**bold**`, `*italic*`, `` `code` ``. Pero WhatsApp tiene **su propia sintaxis** de formato:
+
+| Markdown estándar | WhatsApp | Resultado |
+|-------------------|----------|-----------|
+| `**bold**` | `*bold*` | **bold** |
+| `*italic*` | `_italic_` | _italic_ |
+| `~~strike~~` | `~strike~` | ~~strike~~ |
+| `` `code` `` | `` ```code``` `` | `code` |
+| `# Header` | `*Header*` (bold) | No hay headers |
+| `[text](url)` | `text (url)` | No hay links |
+
+<Callout variant="warning" title="El conflicto de asteriscos">
+En Markdown, `*text*` es italic y `**text**` es bold. En WhatsApp, `*text*` es **bold**. Si convertís directamente, bold e italic se mezclan y producen resultados incorrectos.
+</Callout>
+
+## La Solución: Placeholder Strategy
+
+La clave es convertir bold y italic en un **orden específico**, usando placeholders temporales para evitar conflictos:
+
+```python
+# app/formatting/whatsapp.py
+import re
+
+# Pre-compiled regexes (used per message)
+_RE_FENCED_CODE = re.compile(r"```[\s\S]*?```")
+_RE_INLINE_CODE = re.compile(r"`[^`]+`")
+_RE_HEADER = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+_RE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_RE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_RE_ITALIC = re.compile(r"\*(.+?)\*")
+_RE_STRIKE = re.compile(r"~~(.+?)~~")
+_RE_CODE_PLACEHOLDER = re.compile(r"\x00CODE(\d+)\x00")
+
+_BOLD_MARK = "\x01BOLD\x01"
+```
+
+<Concept title="Pre-compiled regexes">
+Los patrones regex se compilan una sola vez al importar el módulo, no en cada llamada a la función. Para texto que se procesa en cada mensaje, esto evita recompilar el mismo patrón cientos de veces.
+</Concept>
+
+## El Algoritmo Completo
+
+```python
+def markdown_to_whatsapp(text: str) -> str:
+    """Convert Markdown formatting to WhatsApp-compatible formatting."""
+    # ── Fase 1: Proteger code blocks ──
+    placeholders: list[str] = []
+
+    def _protect(m: re.Match) -> str:
+        placeholders.append(m.group(0))
+        return f"\x00CODE{len(placeholders) - 1}\x00"
+
+    # Proteger fenced code blocks primero, luego inline code
+    text = _RE_FENCED_CODE.sub(_protect, text)
+    text = _RE_INLINE_CODE.sub(_protect, text)
+
+    # ── Fase 2: Headers → bold placeholder ──
+    text = _RE_HEADER.sub(
+        lambda m: f"{_BOLD_MARK}{m.group(1)}{_BOLD_MARK}",
+        text,
+    )
+
+    # ── Fase 3: Links → texto plano ──
+    text = _RE_LINK.sub(r"\1 (\2)", text)
+
+    # ── Fase 4: Bold → placeholder (antes de italic!) ──
+    text = _RE_BOLD.sub(
+        lambda m: f"{_BOLD_MARK}{m.group(1)}{_BOLD_MARK}",
+        text,
+    )
+
+    # ── Fase 5: Italic → _text_ ──
+    text = _RE_ITALIC.sub(r"_\1_", text)
+
+    # ── Fase 6: Restaurar bold ──
+    text = text.replace(_BOLD_MARK, "*")
+
+    # ── Fase 7: Strikethrough ──
+    text = _RE_STRIKE.sub(r"~\1~", text)
+
+    # ── Fase 8: Restaurar code blocks ──
+    def _restore(m: re.Match) -> str:
+        idx = int(m.group(1))
+        return placeholders[idx]
+
+    text = _RE_CODE_PLACEHOLDER.sub(_restore, text)
+
+    return text
+```
+
+## ¿Por Qué Funciona?
+
+Veamos el caso problemático sin placeholders:
+
+```
+Input:    "**importante** y *cursiva*"
+Sin fix:  "*importante* y _cursiva_"
+          ↑ Ahora *importante* matchea con *..* → se convierte a _importante_
+          Resultado: "_importante_ y _cursiva_"  ← TODO es italic!
+```
+
+Con placeholder strategy:
+
+```
+Input:    "**importante** y *cursiva*"
+Fase 4:   "\x01BOLD\x01importante\x01BOLD\x01 y *cursiva*"
+Fase 5:   "\x01BOLD\x01importante\x01BOLD\x01 y _cursiva_"
+Fase 6:   "*importante* y _cursiva_"  ← Correcto!
+```
+
+<Concept title="Null byte placeholders">
+`\x00CODE0\x00` usa el byte null (`\x00`) como delimitador. Es imposible que aparezca en texto normal de un mensaje, lo que garantiza que los placeholders nunca colisionan con contenido del usuario. `\x01` se usa para el bold mark por la misma razón.
+</Concept>
+
+## Protección de Code Blocks
+
+Los code blocks se extraen **primero** y se restauran **último**. Esto evita que el contenido del código sea modificado por las conversiones de formato:
+
+```
+Input:    "Usa **dict** y luego `**kwargs`"
+Paso 1:   "Usa **dict** y luego \x00CODE0\x00"  (protegido)
+Paso 4:   "Usa \x01BOLD\x01dict\x01BOLD\x01 y luego \x00CODE0\x00"
+Paso 6:   "Usa *dict* y luego \x00CODE0\x00"
+Paso 8:   "Usa *dict* y luego `**kwargs`"  ← kwargs no se tocó
+```
+
+<Callout variant="tip" title="Fenced antes que inline">
+Se protegen los fenced code blocks (```) antes que el inline code (`). Esto evita que un backtick dentro de un fenced block se interprete como inline code:
+```
+\`\`\`python
+x = \`value\`
+\`\`\`
+```
+</Callout>
+
+## Headers y Links
+
+WhatsApp no soporta headers ni links clickeables. La conversión es pragmática:
+
+```python
+# Headers: # Header → *Header* (bold)
+"## Paso 1: Setup" → "*Paso 1: Setup*"
+
+# Links: [text](url) → text (url)
+"Leé la [documentación](https://docs.com)" → "Leé la documentación (https://docs.com)"
+```
+
+## Lambda en re.sub
+
+Para bold y headers, se usa `lambda` en vez de un replacement string:
+
+```python
+# ✅ Con lambda — seguro
+text = _RE_BOLD.sub(
+    lambda m: f"{_BOLD_MARK}{m.group(1)}{_BOLD_MARK}",
+    text,
+)
+
+# ❌ Con string — riesgo de \x escape issues
+text = _RE_BOLD.sub(r"\x01BOLD\x01\1\x01BOLD\x01", text)
+```
+
+<Callout variant="warning" title="Lambda vs replacement strings">
+Con replacement strings de regex, secuencias como `\x01` pueden interpretarse de formas inesperadas. Usar `lambda` evita estos problemas porque la concatenación de strings es directa — sin parsing de escapes.
+</Callout>
+
+<Quiz
+  question="¿Por qué se usan placeholders temporales para bold antes de convertir italic?"
+  options={[
+    "Para mejorar el rendimiento del regex",
+    "Porque * se usa para bold en WhatsApp e italic en Markdown, y sin placeholders la conversión de italic matchearía el bold ya convertido",
+    "Para soportar Unicode",
+    "Por compatibilidad con Telegram"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué se protege PRIMERO en la conversión markdown → WhatsApp?"
+  options={[
+    "Bold text",
+    "Headers",
+    "Code blocks (fenced y inline), porque su contenido no debe ser modificado",
+    "Links"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cómo se convierten los headers de Markdown para WhatsApp?"
+  options={[
+    "Se mantienen igual",
+    "Se eliminan los # y el texto se convierte a bold (*text*)",
+    "Se convierten a mayúsculas",
+    "Se ignoran"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la conversión inversa: markdown a HTML para Telegram.

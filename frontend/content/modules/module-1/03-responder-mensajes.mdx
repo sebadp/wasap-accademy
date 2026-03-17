@@ -9,97 +9,259 @@ xpReward: 75
 Para enviar mensajes, usamos la **Graph API de Meta**. El endpoint principal es:
 
 ```
-POST https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages
+POST https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages
 ```
 
-<Callout variant="info">
-`PHONE_NUMBER_ID` es el ID de tu número de WhatsApp Business, distinto al número en sí. Lo obtenés en el portal de desarrolladores de Meta.
+<Callout variant="info" title="PHONE_NUMBER_ID vs número de teléfono">
+`PHONE_NUMBER_ID` es el **ID interno** de tu número de WhatsApp Business en Meta, no el número en sí. Lo obtenés en el portal de Meta Developers bajo WhatsApp > API Setup. Es un string numérico como `"123456789012345"`.
 </Callout>
 
-## El cliente HTTP
+## El WhatsAppClient real de LocalForge
 
-WasAP encapsula todas las llamadas a la API de WhatsApp en un cliente:
+El cliente encapsula todas las llamadas a la Graph API en una clase con métodos async:
 
-```python title="app/whatsapp/client.py"
+```python
+# app/whatsapp/client.py — código real completo
+import logging
 import httpx
-from app.config import Settings
+from app.formatting.splitter import split_message
+
+logger = logging.getLogger(__name__)
+GRAPH_API_URL = "https://graph.facebook.com/v22.0"
 
 
 class WhatsAppClient:
-    BASE_URL = "https://graph.facebook.com/v18.0"
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        access_token: str,
+        phone_number_id: str,
+    ):
+        self._http = http_client
+        self._access_token = access_token
+        self._phone_number_id = phone_number_id
 
-    def __init__(self, settings: Settings) -> None:
-        self.phone_id = settings.whatsapp_phone_id
-        self.token = settings.whatsapp_token
-        self.client = httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {self.token}"},
-            timeout=30.0,
-        )
+    @property
+    def _base_url(self) -> str:
+        return f"{GRAPH_API_URL}/{self._phone_number_id}"
 
-    async def send_text(self, to: str, text: str) -> dict:
-        """Envía un mensaje de texto."""
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "text",
-            "text": {"body": text},
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": "application/json",
         }
-        response = await self.client.post(
-            f"{self.BASE_URL}/{self.phone_id}/messages",
-            json=payload,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    async def mark_as_read(self, message_id: str) -> None:
-        """Marca un mensaje como leído (✓✓ azules)."""
-        await self.client.post(
-            f"{self.BASE_URL}/{self.phone_id}/messages",
-            json={
-                "messaging_product": "whatsapp",
-                "status": "read",
-                "message_id": message_id,
-            },
-        )
-
-    async def close(self) -> None:
-        await self.client.aclose()
 ```
 
-<Concept term="httpx.AsyncClient">
-HTTPX es el equivalente async de `requests`. El `AsyncClient` reutiliza conexiones HTTP via connection pooling, lo que mejora significativamente la performance en alta carga.
+<Concept title="httpx.AsyncClient compartido">
+El `WhatsAppClient` no crea su propio `httpx.AsyncClient`. Lo recibe como parámetro del constructor. Esto es importante: en `main.py`, se crea **un solo** `httpx.AsyncClient` con connection pooling que se comparte entre el `WhatsAppClient`, el `OllamaClient` y el `TelegramClient`. Reutilizar conexiones TCP mejora significativamente la performance.
 </Concept>
 
-## Manejo de errores de la API
+## Enviar mensajes con split automático
 
-La API de WhatsApp puede retornar errores por múltiples razones:
+WhatsApp tiene un límite de ~4096 caracteres por mensaje. El `send_message()` automáticamente splitea mensajes largos:
 
-```python title="app/whatsapp/errors.py"
-class WhatsAppError(Exception):
-    def __init__(self, code: int, message: str) -> None:
-        self.code = code
-        super().__init__(f"WhatsApp API error {code}: {message}")
+```python
+# app/whatsapp/client.py — envío con split automático
+async def send_message(self, to: str, text: str) -> str | None:
+    """Send message (splitting if needed). Returns wa_message_id of first chunk."""
+    chunks = split_message(text)
+    first_id: str | None = None
+    for i, chunk in enumerate(chunks):
+        msg_id = await self._send_single_message(to, chunk)
+        if i == 0:
+            first_id = msg_id
+    return first_id
 
-
-async def safe_send(client: WhatsAppClient, to: str, text: str) -> bool:
+async def _send_single_message(self, to: str, text: str) -> str | None:
+    """Send a single message chunk. Returns wa_message_id."""
+    to = self._normalize_ar_number(to)
+    url = f"{self._base_url}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+    resp = await self._http.post(url, json=payload, headers=self._headers)
+    if resp.status_code != 200:
+        logger.error("Send failed [%s] %s: %s", to, resp.status_code, resp.text)
+    self._check_auth_error(resp)
+    logger.info("Outgoing  [%s]: %s", to, text[:80])
     try:
-        await client.send_text(to, text)
-        return True
-    except httpx.HTTPStatusError as e:
-        error_body = e.response.json()
-        code = error_body.get("error", {}).get("code", 0)
-        if code == 131047:
-            # Usuario bloqueó el número
-            logger.warning(f"User {to} blocked the bot")
-        elif code == 131026:
-            # Número no existe en WhatsApp
-            logger.error(f"Phone {to} not on WhatsApp")
-        return False
+        return resp.json()["messages"][0]["id"]
+    except (KeyError, IndexError):
+        return None
 ```
 
+<Concept title="Message Splitting">
+`split_message()` en `app/formatting/splitter.py` splitea mensajes largos en chunks de maximo 4096 caracteres. La prioridad de split es: primero en `\n\n` (párrafos), luego en `". "` (oraciones), luego en `" "` (palabras), y como último recurso, corte duro. Esto preserva la legibilidad del mensaje.
+</Concept>
+
+<Callout variant="tip" title="Retornar el wa_message_id">
+`send_message()` retorna el `wa_message_id` del primer chunk. Esto se usa para el tracing: podés trackear qué mensaje de WhatsApp corresponde a qué respuesta del LLM. La Graph API retorna el ID en `response.json()["messages"][0]["id"]`.
+</Callout>
+
+## Normalización de números argentinos
+
+Un detalle de producción interesante: los números argentinos tienen un formato inconsistente entre WhatsApp y la Graph API:
+
+```python
+# app/whatsapp/client.py
+@staticmethod
+def _normalize_ar_number(number: str) -> str:
+    """Convert Argentine mobile numbers from 549xxx to 54xxx format."""
+    if number.startswith("549") and len(number) == 13:
+        return "54" + number[3:]
+    return number
+```
+
+<Callout variant="warning" title="Bug real de producción">
+WhatsApp envía números argentinos como `549XXXXXXXXXX` (13 dígitos con el 9 de móvil), pero la Graph API espera `54XXXXXXXXXX` (12 dígitos sin el 9). Sin esta normalización, los mensajes de respuesta fallan con error 131009 ("Invalid recipient"). Este es un ejemplo de un bug que solo descubrís en producción.
+</Callout>
+
 <Quiz
-  question="¿Por qué se usa httpx.AsyncClient en lugar de la librería requests estándar?"
-  options={["Porque requests no soporta JSON", "Porque httpx tiene soporte nativo para async/await y connection pooling", "Porque la API de WhatsApp requiere HTTP/2", "Porque requests no puede manejar respuestas grandes"]}
+  question="¿Por qué WhatsAppClient recibe httpx.AsyncClient como parámetro en vez de crear uno propio?"
+  options={["Porque httpx no soporta múltiples instancias", "Para compartir connection pooling entre WhatsAppClient, OllamaClient y TelegramClient", "Porque FastAPI requiere que todos los clientes usen el mismo AsyncClient", "Para poder mockear el cliente HTTP en los tests"]}
   correct={1}
 />
+
+## Marcar como leído y typing indicators
+
+Además de enviar mensajes, el cliente maneja las señales visuales que el usuario ve en WhatsApp:
+
+```python
+# app/whatsapp/client.py — señales visuales
+async def mark_as_read(self, message_id: str) -> None:
+    """Marca un mensaje como leído (doble tick azul)."""
+    url = f"{self._base_url}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id,
+    }
+    resp = await self._http.post(url, json=payload, headers=self._headers)
+    self._check_auth_error(resp)
+
+async def send_reaction(self, message_id: str, to: str, emoji: str) -> None:
+    """Envía una reacción (emoji) a un mensaje."""
+    to = self._normalize_ar_number(to)
+    url = f"{self._base_url}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "reaction",
+        "reaction": {"message_id": message_id, "emoji": emoji},
+    }
+    resp = await self._http.post(url, json=payload, headers=self._headers)
+    self._check_auth_error(resp)
+```
+
+<Concept title="Typing indicator con emojis">
+WhatsApp Business API no tiene un endpoint nativo de "typing..." como Telegram. LocalForge usa un workaround creativo: envía una reacción de reloj de arena al mensaje del usuario cuando empieza a procesar, y la quita (enviando un emoji vacío `""`) cuando termina. El usuario ve el reloj de arena aparecer y desaparecer.
+</Concept>
+
+## Descarga de media (audio/imágenes)
+
+Para mensajes de audio e imagen, Meta no envía el contenido. Envía un `media_id` que usás para descargar:
+
+```python
+# app/whatsapp/client.py — descarga de media en 2 pasos
+async def download_media(self, media_id: str) -> bytes:
+    # Paso 1: Obtener URL del media
+    url = f"{GRAPH_API_URL}/{media_id}"
+    headers = {"Authorization": f"Bearer {self._access_token}"}
+    resp = await self._http.get(url, headers=headers)
+    resp.raise_for_status()
+    media_url = resp.json()["url"]
+
+    # Paso 2: Descargar los bytes
+    resp = await self._http.get(media_url, headers=headers)
+    resp.raise_for_status()
+    return resp.content
+```
+
+<Callout variant="info" title="¿Por qué dos pasos?">
+Meta primero te da una URL temporal firmada para descargar el archivo. La URL expira después de unos minutos. Este patrón es común en APIs de cloud storage (similar a presigned URLs de S3): el primer request es autenticado, y la URL firmada resultante se puede descargar sin headers adicionales de auth.
+</Callout>
+
+## Manejo de errores de autenticación
+
+El access token de WhatsApp expira periódicamente. El cliente detecta esto y loguea mensajes útiles:
+
+```python
+# app/whatsapp/client.py — detección de auth errors
+def _check_auth_error(self, resp: httpx.Response) -> None:
+    if resp.status_code == 401:
+        logger.error(
+            "WhatsApp API auth failed (401) — access token expired or invalid. "
+            "Renew it at https://developers.facebook.com -> WhatsApp -> API Setup"
+        )
+    elif resp.status_code == 400 and "permission" in resp.text.lower():
+        logger.error(
+            "WhatsApp API permission error (400) — the access token lacks "
+            "required permissions. Check 'whatsapp_business_messaging' permission"
+        )
+    resp.raise_for_status()
+```
+
+<Callout variant="warning" title="Tokens que expiran">
+Los tokens temporales de desarrollo de Meta expiran en 24 horas. Para producción, necesitás un **System User token** que no expira. Crealo en Meta Business Suite > System Users. Si tu bot deja de responder de repente, lo primero que deberías revisar es si el token expiró.
+</Callout>
+
+<Quiz
+  question="¿Cómo implementa LocalForge el indicador de 'escribiendo...' en WhatsApp?"
+  options={["Usa el endpoint nativo de typing de la Graph API", "Envía una reacción de reloj de arena al mensaje y la quita al terminar", "No implementa typing indicator porque WhatsApp no lo soporta", "Envía un mensaje temporal que luego borra"]}
+  correct={1}
+/>
+
+## El PlatformClient Protocol
+
+Para soportar múltiples plataformas, LocalForge define un Protocol que abstrae las operaciones:
+
+```python
+# app/platforms/base.py — Protocol definition
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class PlatformClient(Protocol):
+    async def send_message(self, to_id: str, text: str) -> str | None: ...
+    async def download_media(self, media_id: str) -> bytes: ...
+    async def mark_as_read(self, message_id: str) -> None: ...
+    async def send_typing_indicator(self, to_id: str) -> None: ...
+    async def remove_typing_indicator(self, to_id: str, indicator_id: str | None = None) -> None: ...
+    def format_text(self, text: str) -> str: ...
+    def platform_name(self) -> str: ...
+```
+
+```python
+# app/webhook/router.py — adapter para WhatsApp
+class WhatsAppPlatformAdapter:
+    """Adapts WhatsAppClient to the PlatformClient Protocol."""
+
+    def __init__(self, client: WhatsAppClient, current_message_id: str = ""):
+        self._client = client
+        self._msg_id = current_message_id
+
+    async def send_message(self, to_id: str, text: str) -> str | None:
+        return await self._client.send_message(to_id, text)
+
+    def format_text(self, text: str) -> str:
+        return markdown_to_whatsapp(text)
+
+    def platform_name(self) -> str:
+        return "whatsapp"
+```
+
+<Concept title="Protocol vs ABC">
+`Protocol` (PEP 544) usa **structural typing**: una clase "implementa" el Protocol si tiene los métodos correctos, sin necesidad de heredar explícitamente. `WhatsAppPlatformAdapter` nunca dice `(PlatformClient)` en su definición, pero cumple el Protocol porque tiene todos los métodos. Esto es más flexible que ABC y más Pythonic.
+</Concept>
+
+<Quiz
+  question="¿Por qué la descarga de media de WhatsApp requiere 2 requests HTTP?"
+  options={["Porque Meta limita el tamaño del primer request", "Porque el primer request obtiene una URL temporal firmada, y el segundo descarga los bytes", "Porque el primer request verifica que el media existe y el segundo lo descarga", "Porque Meta usa un CDN diferente para los metadatos y el contenido"]}
+  correct={1}
+/>
+
+En la próxima lección escribimos tests completos para todo el pipeline de webhooks: verificación GET, firma HMAC, parseo de payload y envío de respuestas.

@@ -1,0 +1,204 @@
+---
+title: "Paralelización con asyncio"
+description: "asyncio.gather, create_task y to_thread: las herramientas para ejecutar operaciones en paralelo"
+xpReward: 100
+---
+
+## Las Tres Herramientas
+
+Python asyncio ofrece tres mecanismos principales para paralelizar:
+
+| Herramienta | Caso de uso | Bloquea el caller? |
+|-------------|-------------|-------------------|
+| `asyncio.gather` | N coroutines independientes | Sí, hasta que todas terminan |
+| `asyncio.create_task` | Fire-and-forget o pre-start | No, corre en background |
+| `asyncio.to_thread` | Código sync/blocking en thread | Sí, pero no bloquea el event loop |
+
+## asyncio.gather: Paralelismo Explícito
+
+Ejecuta N coroutines en paralelo y espera a que **todas** terminen:
+
+```python
+# ANTES (secuencial): ~500ms total
+memories = await search_memories(embedding)    # ~150ms
+notes = await search_notes(embedding)          # ~100ms
+summary = await get_summary(conv_id)           # ~100ms
+recent = await get_recent_messages(conv_id)    # ~80ms
+projects = await get_projects_summary()         # ~70ms
+
+# DESPUÉS (paralelo): ~150ms total (max de las 5)
+memories, notes, summary, recent, projects = await asyncio.gather(
+    search_memories(embedding),
+    search_notes(embedding),
+    get_summary(conv_id),
+    get_recent_messages(conv_id),
+    get_projects_summary(),
+)
+```
+
+<Callout variant="warning" title="Solo funciona con operaciones independientes">
+`asyncio.gather` solo paraleliza operaciones que no dependen entre sí. Si `search_notes` necesitara el resultado de `search_memories`, no podrías ponerlas en el mismo gather.
+</Callout>
+
+### Before/After con timing
+
+```
+ANTES (secuencial):
+  search_memories ████████████████ 150ms
+                  search_notes ██████████ 100ms
+                              get_summary ██████████ 100ms
+                                          recent ████████ 80ms
+                                                  projects ███████ 70ms
+  Total: ────────────────────────────────────────────── 500ms
+
+DESPUÉS (paralelo):
+  search_memories ████████████████ 150ms
+  search_notes    ██████████       100ms
+  get_summary     ██████████       100ms
+  recent          ████████          80ms
+  projects        ███████           70ms
+  Total: ─────────────────── 150ms (max de las 5)
+```
+
+## asyncio.create_task: Pre-Start
+
+Lanza una coroutine sin esperar su resultado. Ideal para "empezar temprano":
+
+```python
+async def _handle_message(phone, text, ...):
+    # Lanzar classify_intent ANTES de Phase A
+    classify_task = asyncio.create_task(
+        classify_intent(text, ollama_client)
+    )
+
+    # Phase A: corre en paralelo con classify_task
+    query_embedding, _, daily_logs = await asyncio.gather(
+        _get_query_embedding(text, ollama),
+        repository.save_message(conv_id, "user", text),
+        daily_log.get_context(days=2),
+    )
+
+    # Phase B: classify_task sigue corriendo...
+    memories, notes, summary, recent, projects = await asyncio.gather(
+        search_memories(query_embedding),
+        # ...
+    )
+
+    # Phase C: ahora sí esperamos classify
+    categories = await classify_task  # Probablemente ya terminó
+```
+
+<Concept title="Pre-start pattern">
+`create_task` no es "fire-and-forget" aquí. Guardamos la referencia (`classify_task`) para hacer `await` después. La ventaja: el task corre durante Phase A y B, ganando ~200ms gratis.
+</Concept>
+
+## asyncio.to_thread: Código Blocking
+
+Algunas operaciones son sync y bloquearían el event loop. `to_thread` las ejecuta en un thread separado:
+
+```python
+# app/memory/daily_log.py
+import asyncio
+
+class DailyLog:
+    async def get_context(self, days: int = 2) -> str:
+        """Leer archivos de daily log (I/O blocking)."""
+        return await asyncio.to_thread(self._read_logs_sync, days)
+
+    def _read_logs_sync(self, days: int) -> str:
+        """Versión sync que lee archivos del disco."""
+        content = []
+        for date in self._get_dates(days):
+            path = self._log_path(date)
+            if path.exists():
+                content.append(path.read_text())
+        return "\n".join(content)
+```
+
+```python
+# app/memory/markdown.py
+async def sync_to_file(memories: list[str], file_path: Path) -> None:
+    """Escribir MEMORY.md (blocking file write)."""
+    await asyncio.to_thread(_write_sync, memories, file_path)
+
+def _write_sync(memories: list[str], file_path: Path) -> None:
+    content = "\n".join(f"- {m}" for m in memories)
+    file_path.write_text(content)
+```
+
+<Callout variant="error" title="NUNCA bloquear el event loop">
+Funciones como `open()`, `path.read_text()`, `langdetect.detect()` son blocking. Si las llamás directamente en una coroutine, bloquean TODOS los tasks async (incluyendo otros mensajes). Siempre usar `to_thread` para operaciones sync.
+</Callout>
+
+## Combinando las Tres
+
+```python
+async def _handle_message(phone, text, settings, ...):
+    # 1. create_task: pre-start classify
+    classify_task = asyncio.create_task(classify_intent(text, ollama))
+
+    # 2. gather: Phase A en paralelo
+    embedding, _, logs = await asyncio.gather(
+        ollama.embed(text),                          # async I/O
+        repository.save_message(conv_id, "user", text),  # async DB
+        asyncio.to_thread(daily_log.read_sync, 2),   # 3. to_thread: blocking I/O
+    )
+
+    # 2. gather: Phase B en paralelo
+    memories, notes, summary = await asyncio.gather(
+        repository.search_similar(embedding),
+        repository.search_notes(embedding),
+        conversation.get_summary(conv_id),
+    )
+
+    # 1. await del pre-started task
+    categories = await classify_task
+```
+
+## Regla General
+
+```
+¿La operación es async?
+  ├── Sí → ¿Hay varias independientes?
+  │         ├── Sí → asyncio.gather()
+  │         └── No → await directo
+  └── No (blocking) → asyncio.to_thread()
+
+¿Querés empezar algo antes de necesitarlo?
+  └── Sí → asyncio.create_task() + await después
+```
+
+<Quiz
+  question="¿Qué pasa si ponés una operación de lectura de archivos (sync) directamente en una coroutine sin to_thread?"
+  options={[
+    "Funciona igual de rápido",
+    "Bloquea el event loop, impidiendo que otros tasks async se ejecuten",
+    "Python convierte automáticamente sync a async",
+    "Lanza una excepción"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Si tenés 5 queries de 100ms cada una, ¿cuánto tarda asyncio.gather con las 5?"
+  options={[
+    "500ms (suma de todas)",
+    "~100ms (la más lenta de las 5)",
+    "250ms (promedio)",
+    "Depende del número de CPUs"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es la diferencia entre asyncio.create_task y asyncio.gather?"
+  options={[
+    "create_task es para código sync y gather para async",
+    "create_task lanza una coroutine sin esperar su resultado (se hace await después), mientras que gather espera a que todas las coroutines terminen antes de continuar",
+    "gather es más rápido que create_task",
+    "No hay diferencia, son sinónimos"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo aplicar caching estratégico para evitar recalcular datos que no cambian.

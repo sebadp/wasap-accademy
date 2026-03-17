@@ -1,0 +1,206 @@
+---
+title: "ConversationManager"
+description: "Wrapper async sobre Repository para el lifecycle de conversaciones"
+xpReward: 50
+---
+
+## Que es ConversationManager
+
+El `ConversationManager` es la capa que orquesta el **ciclo de vida** de una conversacion: crear, agregar mensajes, obtener historial, resumir, y limpiar. Es un wrapper async sobre el Repository que agrega cache y logica de orquestacion.
+
+<Callout variant="info" title="Separacion de responsabilidades">
+Repository sabe **como** hablar con SQLite. ConversationManager sabe **cuando** y **en que orden** hacerlo. Esta separacion permite testear cada capa independientemente.
+</Callout>
+
+## Anatomia de ConversationManager
+
+Veamos la clase completa desde `app/conversation/manager.py`:
+
+```python
+# app/conversation/manager.py
+from collections import OrderedDict
+from app.database.repository import Repository
+from app.models import ChatMessage, Note
+
+_CONV_ID_CACHE_MAX = 10_000
+
+class ConversationManager:
+    def __init__(self, repository: Repository, max_messages: int = 20):
+        self._repo = repository
+        self._max_messages = max_messages
+        self._conv_id_cache: OrderedDict[str, int] = OrderedDict()
+```
+
+Tres cosas importantes aqui:
+- `_repo`: referencia al Repository (no a la conexion directamente)
+- `_max_messages`: limite configurable (default 20, override via `Settings.conversation_max_messages`)
+- `_conv_id_cache`: cache LRU de conversation IDs
+
+<Concept title="OrderedDict como LRU Cache">
+A diferencia de un `dict` comun, `OrderedDict` mantiene el orden de insercion y soporta `move_to_end()`. Esto permite implementar un cache LRU (Least Recently Used) sin dependencias externas. Cuando el cache llega a 10,000 entradas, se elimina la mas antigua.
+</Concept>
+
+## Cache de Conversation IDs con LRU Eviction
+
+Cada mensaje necesita el `conversation_id`. Sin cache, hariamos una query a SQLite por cada mensaje:
+
+```python
+async def _get_conv_id(self, phone_number: str) -> int:
+    """Return conversation ID, creating it if needed. Result is cached with LRU eviction."""
+    if phone_number in self._conv_id_cache:
+        self._conv_id_cache.move_to_end(phone_number)  # Mark as recently used
+        return self._conv_id_cache[phone_number]
+
+    conv_id = await self._repo.get_or_create_conversation(phone_number)
+    self._conv_id_cache[phone_number] = conv_id
+
+    if len(self._conv_id_cache) > _CONV_ID_CACHE_MAX:
+        self._conv_id_cache.popitem(last=False)  # Evict oldest
+    return conv_id
+```
+
+<Callout variant="tip" title="Por que funciona sin invalidacion">
+El mapeo `phone_number -> conv_id` **nunca cambia**. Una vez que se crea la conversacion, el ID es permanente. Por eso este cache no necesita TTL ni invalidacion -- solo eviction por tamano para no consumir memoria infinita.
+</Callout>
+
+## El Lifecycle de una Conversacion
+
+<Step number={1} title="get_or_create_conversation()">
+Cuando llega un mensaje, se obtiene o crea la conversacion para ese phone_number. El ID se cachea.
+</Step>
+
+<Step number={2} title="add_message() — mensaje del usuario">
+Se guarda el mensaje del usuario en la tabla `messages` con role='user'.
+</Step>
+
+<Step number={3} title="get_context() o get_windowed_history()">
+Se obtiene historial + memorias + resumen para construir el prompt del LLM.
+</Step>
+
+<Step number={4} title="add_message() — respuesta del asistente">
+Se guarda la respuesta del asistente con role='assistant'.
+</Step>
+
+<Step number={5} title="maybe_summarize() (background)">
+Si hay muchos mensajes, se genera un resumen y se limpian los viejos.
+</Step>
+
+## Metodos Core
+
+### add_message
+
+```python
+async def add_message(
+    self, phone_number: str, role: str, content: str,
+    wa_message_id: str | None = None,
+) -> None:
+    conv_id = await self._get_conv_id(phone_number)
+    await self._repo.save_message(conv_id, role, content, wa_message_id)
+```
+
+### get_history
+
+```python
+async def get_history(self, phone_number: str) -> list[ChatMessage]:
+    conv_id = await self._get_conv_id(phone_number)
+    return await self._repo.get_recent_messages(conv_id, self._max_messages)
+```
+
+### clear
+
+```python
+async def clear(self, phone_number: str) -> None:
+    conv_id = await self._get_conv_id(phone_number)
+    await self._repo.clear_conversation(conv_id)
+```
+
+El `clear_conversation` del Repository borra mensajes, resumenes y estado en una sola transaccion:
+
+```python
+# Repository.clear_conversation()
+await self._conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+await self._conn.execute("DELETE FROM summaries WHERE conversation_id = ?", (conv_id,))
+await self._conn.execute("DELETE FROM conversation_state WHERE conversation_id = ?", (conv_id,))
+await self._conn.commit()
+```
+
+## get_context(): Construir el Prompt Completo
+
+El metodo `get_context()` arma la lista de mensajes que se envia al LLM, incluyendo system prompt, memorias, notas, daily logs y historial:
+
+```python
+async def get_context(
+    self, phone_number: str, system_prompt: str,
+    memories: list[str], skills_summary: str | None = None,
+    daily_logs: str | None = None, relevant_notes: list[Note] | None = None,
+) -> list[ChatMessage]:
+    conv_id = await self._get_conv_id(phone_number)
+    summary, history = await asyncio.gather(
+        self._repo.get_latest_summary(conv_id),
+        self._repo.get_recent_messages(conv_id, self._max_messages),
+    )
+
+    # Note: skills_summary, daily_logs, and relevant_notes are used by
+    # _build_context() in router.py for the optimized hot path, not shown here.
+    context = [ChatMessage(role="system", content=system_prompt)]
+    if memories:
+        memory_block = "Important user information:\n" + "\n".join(f"- {m}" for m in memories)
+        context.append(ChatMessage(role="system", content=memory_block))
+    if summary:
+        context.append(ChatMessage(role="system", content=f"Previous conversation summary:\n{summary}"))
+    context.extend(history)
+    return context
+```
+
+<Callout variant="warning" title="asyncio.gather para paralelismo">
+Nota que `summary` y `history` se obtienen en paralelo con `asyncio.gather()`. Ambas son queries independientes a SQLite, asi que no hay razon para ejecutarlas secuencialmente.
+</Callout>
+
+## Bypass en el Hot Path
+
+En el critical path de `_handle_message`, LocalForge **bypasea** ConversationManager para llamar al Repository directamente:
+
+```python
+# En router.py — flujo optimizado
+conv_id = await conversation._get_conv_id(phone_number)
+await repository.save_message(conv_id, "user", user_text)  # Directo, sin wrapper
+```
+
+<Callout variant="info" title="Optimizacion de produccion">
+En el hot path, LocalForge llama al Repository directamente para ahorrar overhead de metodos wrapper. ConversationManager se usa en flujos menos criticos como `/clear`, el summarizer y `get_context()`.
+</Callout>
+
+<Quiz
+  question="Cual es la responsabilidad principal de ConversationManager?"
+  options={[
+    "Ejecutar queries SQL directamente",
+    "Orquestar el ciclo de vida de una conversacion con cache y logica de orden",
+    "Formatear mensajes para WhatsApp",
+    "Conectarse a la base de datos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que se cachea el conversation_id en memoria?"
+  options={[
+    "Para soportar multiples bases de datos",
+    "Porque el mapeo phone_number a conv_id nunca cambia, evitando una query por mensaje",
+    "Para permitir conversaciones offline",
+    "Porque SQLite no soporta UNIQUE constraints"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que tipo de cache usa ConversationManager y por que?"
+  options={[
+    "dict simple porque los IDs nunca cambian",
+    "Redis para compartir entre instancias",
+    "OrderedDict como LRU con eviction a 10,000 entradas para limitar memoria",
+    "functools.lru_cache en los metodos async"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como el historial con ventana evita saturar el contexto del LLM.

@@ -1,0 +1,219 @@
+---
+title: "Repository Pattern"
+description: "Separar acceso a datos de logica de negocio con 100+ metodos async"
+xpReward: 75
+---
+
+## Que es el Repository Pattern
+
+El Repository Pattern separa la **logica de acceso a datos** de la **logica de negocio**. En vez de escribir SQL en tus handlers de webhook, delegas a un objeto `Repository` que encapsula todas las queries.
+
+<Callout variant="tip" title="Por que importa">
+Sin este patron, tendrias SQL mezclado con logica de LLM, formato de mensajes, y envio a WhatsApp. El Repository centraliza todo el acceso a datos en un solo lugar testeable.
+</Callout>
+
+## Repository en LocalForge
+
+`app/database/repository.py` tiene **mas de 100 metodos async**. Veamos la clase base:
+
+```python
+# app/database/repository.py
+import struct
+from typing import Any
+import aiosqlite
+from app.models import ChatMessage, Memory, Note, Project
+
+class Repository:
+    def __init__(self, conn: aiosqlite.Connection):
+        self._conn = conn
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        """Expose the underlying connection for ontology registry."""
+        return self._conn
+
+    async def ping(self) -> bool:
+        """Lightweight DB liveness check."""
+        await self._conn.execute("SELECT 1")
+        return True
+
+    async def commit(self) -> None:
+        """Explicit commit for batch operations."""
+        await self._conn.commit()
+```
+
+<Concept title="Conexion compartida">
+El Repository recibe una sola conexion `aiosqlite.Connection` que se comparte entre todas las queries. aiosqlite serializa el acceso internamente, asi que no hay race conditions. Esto simplifica enormemente el manejo de conexiones.
+</Concept>
+
+## Metodos Core: Messages
+
+Los metodos de mensajes son los mas llamados en el hot path:
+
+```python
+async def save_message(
+    self,
+    conversation_id: int,
+    role: str,
+    content: str,
+    wa_message_id: str | None = None,
+) -> int:
+    cursor = await self._conn.execute(
+        "INSERT INTO messages (conversation_id, role, content, wa_message_id) "
+        "VALUES (?, ?, ?, ?)",
+        (conversation_id, role, content, wa_message_id),
+    )
+    await self._conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+async def get_recent_messages(
+    self, conversation_id: int, limit: int
+) -> list[ChatMessage]:
+    cursor = await self._conn.execute(
+        "SELECT role, content FROM messages "
+        "WHERE conversation_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        (conversation_id, limit),
+    )
+    rows = await cursor.fetchall()
+    # reversed() porque SELECT DESC trae los mas recientes primero
+    return [ChatMessage(role=r[0], content=r[1]) for r in reversed(rows)]
+```
+
+<Callout variant="warning" title="reversed() en get_recent_messages">
+La query usa `ORDER BY ... DESC LIMIT ?` para obtener los N mas recientes eficientemente. Pero para pasarlos al LLM, necesitamos orden cronologico (mas viejo primero). Por eso se usa `reversed()` al construir la lista.
+</Callout>
+
+## Operaciones Atomicas
+
+Un patron critico es `get_or_create_conversation()`:
+
+```python
+async def get_or_create_conversation(self, phone_number: str) -> int:
+    # Atomic upsert: INSERT OR IGNORE + UPDATE + SELECT in single commit
+    await self._conn.execute(
+        "INSERT OR IGNORE INTO conversations (phone_number) VALUES (?)",
+        (phone_number,),
+    )
+    await self._conn.execute(
+        "UPDATE conversations SET updated_at = datetime('now') "
+        "WHERE phone_number = ?",
+        (phone_number,),
+    )
+    cursor = await self._conn.execute(
+        "SELECT id FROM conversations WHERE phone_number = ?",
+        (phone_number,),
+    )
+    row = await cursor.fetchone()
+    await self._conn.commit()
+    return row[0]
+```
+
+<Concept title="INSERT OR IGNORE + UPDATE + SELECT">
+Este patron atomico maneja tres cosas en un solo commit: crea la conversacion si no existe (IGNORE si ya existe), actualiza el `updated_at`, y retorna el `id`. No necesitas locks ni try/except para manejar concurrencia.
+</Concept>
+
+## Metodos de Memorias
+
+Las memorias usan soft delete y soportan categorias:
+
+```python
+async def add_memory(
+    self, content: str, category: str | None = None,
+    source_trace_id: str | None = None,
+) -> int:
+    cursor = await self._conn.execute(
+        "INSERT INTO memories (content, category, source_trace_id) VALUES (?, ?, ?)",
+        (content, category, source_trace_id),
+    )
+    await self._conn.commit()
+    return cursor.lastrowid
+
+async def get_active_memories(self, limit: int | None = None) -> list[str]:
+    sql = "SELECT content FROM memories WHERE active = 1 ORDER BY id"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    cursor = await self._conn.execute(sql, params)
+    rows = await cursor.fetchall()
+    return [r[0] for r in rows]
+```
+
+## Dependency Injection
+
+El Repository se crea una sola vez al inicio y se inyecta via `app.state`:
+
+```python
+# En main.py (lifespan)
+conn, vec_available = await init_db(settings.database_path)
+repository = Repository(conn)
+app.state.repository = repository
+
+# En dependencies.py
+def get_repository(request: Request) -> Repository:
+    return request.app.state.repository
+```
+
+<Callout variant="info" title="app.state">
+FastAPI permite guardar objetos en `app.state` durante el lifespan. Esto evita crear una nueva conexion a la DB por cada request. Una sola conexion compartida, serializada por aiosqlite, es suficiente para el volumen de un chatbot.
+</Callout>
+
+## Metodos Clave por Subsistema
+
+| Subsistema | Metodos | Ejemplo |
+|------------|---------|---------|
+| **Messages** | save, get_recent, count, delete_old | `save_message(conv_id, role, content)` |
+| **Memories** | add, remove, list, get_active | `get_active_memories(limit=10)` |
+| **Notes** | save, get, search, delete, list | `search_notes(query)` |
+| **Projects** | create, tasks, progress, activity | `get_project_by_name(phone, name)` |
+| **Embeddings** | save, search, delete, backfill | `search_similar_memories(embedding, top_k)` |
+| **Traces** | add, query, cleanup, percentiles | `get_failure_trend(phone, days)` |
+| **Eval** | curate, export, stats, tags | `add_eval_entry(input, output, tags)` |
+| **State** | get/save sticky_categories | `save_sticky_categories(conv_id, cats)` |
+
+## Vector Helper: Serializacion
+
+El Repository incluye un helper estatico para serializar vectores de embeddings:
+
+```python
+@staticmethod
+def _serialize_vector(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+```
+
+Esto convierte una lista de 768 floats en 3072 bytes (768 x 4 bytes por float32), que es el formato que espera sqlite-vec.
+
+<Quiz
+  question="Cual es la ventaja principal del Repository Pattern?"
+  options={[
+    "Hace las queries mas rapidas",
+    "Separa el acceso a datos de la logica de negocio en un solo lugar testeable",
+    "Permite usar multiples bases de datos simultaneamente",
+    "Reemplaza la necesidad de indices"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Como se inyecta el Repository en los endpoints de FastAPI?"
+  options={[
+    "Se crea uno nuevo por cada request",
+    "Se importa como variable global",
+    "Se guarda en app.state durante el lifespan y se accede via dependency injection",
+    "Se pasa como parametro del constructor de FastAPI"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Por que get_recent_messages usa reversed() al retornar los resultados?"
+  options={[
+    "Para ordenar alfabeticamente por role",
+    "Porque la query DESC trae los mas recientes primero, pero el LLM necesita orden cronologico",
+    "Para mezclar mensajes de user y assistant",
+    "Para eliminar mensajes duplicados"
+  ]}
+  correct={1}
+/>
+
+En la siguiente leccion veremos como LocalForge previene el procesamiento duplicado de mensajes sin locks.

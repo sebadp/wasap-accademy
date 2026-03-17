@@ -1,0 +1,151 @@
+---
+title: "Guardrails → Dataset"
+description: "Convertir fallos de guardrails en datos para mejorar el sistema"
+xpReward: 100
+---
+
+## Cerrando el Loop de Mejora
+
+Los guardrails no solo protegen al usuario — también **generan datos**. Cada fallo se cura automáticamente al dataset de evaluación, creando un ciclo de mejora continua.
+
+```
+Guardrail falla
+      │
+      ▼
+eval_dataset (entry_type="failure")
+      │
+      ▼
+Eval pipeline detecta patrones
+      │
+      ▼
+Prompt mejorado / check ajustado
+      │
+      ▼
+Menos fallos en producción
+```
+
+<Callout variant="tip" title="Datos de producción gratuitos">
+No necesitás crear datasets manualmente. Cada fallo real en producción es un caso de prueba que refleja problemas genuinos del sistema.
+</Callout>
+
+## Curación Automática
+
+```python
+async def _curate_guardrail_failure(
+    check_name: str,
+    response: str,
+    context: dict,
+    repository: Repository,
+) -> None:
+    """Registra un fallo de guardrail como entrada del dataset."""
+    await repository.add_eval_entry(
+        input_text=context["user_message"],
+        output_text=response,
+        expected_output=None,  # No sabemos cuál debería ser la respuesta correcta
+        entry_type="failure",
+        tags=[f"guardrail:{check_name}"],
+        metadata={
+            "check_name": check_name,
+            "phone_number": context.get("phone_number"),
+            "timestamp": datetime.utcnow().isoformat(),
+        },
+    )
+```
+
+<Concept title="Tags para filtrado">
+Cada entrada se tagea con `guardrail:{check_name}` (ej: `guardrail:no_pii`, `guardrail:language_match`). Esto permite filtrar el dataset por tipo de fallo para diagnóstico.
+</Concept>
+
+## Scores en Tracing
+
+Además del dataset, cada check registra un **score** en Langfuse:
+
+```python
+async def _record_guardrail_scores(
+    report: GuardrailReport,
+    trace_ctx: TraceContext,
+) -> None:
+    """Registra cada check como score en la traza."""
+    for result in report.results:
+        trace_ctx.add_score(
+            name=result.check_name,
+            value=1.0 if result.passed else 0.0,
+            source="system",
+            comment=result.message,
+        )
+```
+
+Esto genera datos para dashboards en Langfuse:
+
+| Métrica | Fórmula | Ejemplo |
+|---------|---------|---------|
+| Pass rate por check | `count(passed) / total` | `no_pii: 99.5%` |
+| Tasa de remediación | `count(remediated) / count(failed)` | `75%` |
+| Checks más problemáticos | Ordenar por fail rate | `language_match: 8%` |
+
+## El Loop Completo
+
+<Step number={1} title="Producción: Guardrail detecta fallo">
+`check_language_match` detecta respuesta en inglés cuando el usuario habla español.
+</Step>
+
+<Step number={2} title="Remediación: LLM corrige">
+La respuesta se traduce al español en un intento single-shot.
+</Step>
+
+<Step number={3} title="Dataset: Se cura el fallo">
+Entrada añadida con `entry_type="failure"`, tag `guardrail:language_match`.
+</Step>
+
+<Step number={4} title="Score: Se registra en Langfuse">
+`language_match=0.0` en la traza. Visible en dashboard.
+</Step>
+
+<Step number={5} title="Eval: Se analiza el patrón">
+El eval pipeline (Módulo 14) detecta que `language_match` falla el 8% del tiempo.
+</Step>
+
+<Step number={6} title="Mejora: Se ajusta el system prompt">
+Se agrega "Siempre responde en el idioma del usuario" al system prompt. Se evalúa antes de activar.
+</Step>
+
+## Automation: Alerta por Degradación
+
+El módulo de automation (Módulo 20) tiene una regla built-in:
+
+```python
+# Built-in rule: guardrail_degraded
+{
+    "name": "guardrail_degraded",
+    "condition": {"type": "metric", "name": "guardrail_pass_rate", "threshold": 0.7},
+    "action": {"type": "notify_admin", "message": "Guardrail pass rate below 70%"},
+    "cooldown_hours": 4,
+}
+```
+
+Si la tasa de éxito cae debajo del 70% en 24 horas, se notifica al admin automáticamente.
+
+<Quiz
+  question="¿Qué entry_type se usa para guardrail failures en el eval dataset?"
+  options={["golden", "candidate", "failure", "system"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué valor tiene un score de Langfuse cuando un guardrail pasa?"
+  options={["0.0", "0.5", "1.0", "true"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cuál es el beneficio principal de curar fallos de guardrails al dataset?"
+  options={[
+    "Ahorra espacio en disco",
+    "Crea datos de entrenamiento reales para mejorar el sistema",
+    "Permite revertir cambios",
+    "Notifica al usuario del error"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Guardrails & Quality Control. Ahora entendés la cadena completa: checks → remediación → dataset → mejora.

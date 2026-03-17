@@ -1,0 +1,239 @@
+---
+title: "Reglas Custom y Gestión via Chat"
+description: "Definir reglas personalizadas, APScheduler integration, y tools para gestión de automatizaciones"
+xpReward: 100
+---
+
+## Creando una Regla Custom
+
+Más allá de las 5 reglas built-in, podés definir reglas completamente nuevas. El flujo es:
+
+<Step number={1} title="Definir la condición">
+Elegir tipo (`query`, `metric`, `schedule`) y configurar los parámetros.
+</Step>
+
+<Step number={2} title="Definir la acción">
+Elegir tipo (`notify_user`, `notify_admin`, `run_task`, `log`) y configurar los parámetros.
+</Step>
+
+<Step number={3} title="Establecer cooldown">
+Definir cuántos minutos deben pasar entre ejecuciones consecutivas.
+</Step>
+
+<Step number={4} title="Activar la regla">
+La regla se guarda en la DB y el engine la evalúa automáticamente en cada ciclo.
+</Step>
+
+## Ejemplo End-to-End
+
+Queremos una regla que avise al admin si hay más de 100 mensajes sin procesar:
+
+```python
+# Definición completa
+custom_rule = AutomationRule(
+    name="message_backlog",
+    description="Alertar si hay muchos mensajes pendientes",
+    enabled=True,
+
+    # Condición: query SQL custom
+    condition_type="query",
+    condition_config={
+        "sql": """
+            SELECT COUNT(*) FROM messages
+            WHERE processed = 0
+            AND created_at > datetime('now', '-1 hour')
+        """,
+        "operator": "gt",
+        "threshold": 100,
+    },
+
+    # Acción: notificar al admin
+    action_type="notify_admin",
+    action_config={
+        "message": "Backlog de mensajes: más de 100 sin procesar en la última hora."
+    },
+
+    # Cooldown de 2 horas
+    cooldown_minutes=120,
+)
+```
+
+## APScheduler: El Motor de Ejecución
+
+El rule engine corre como un job periódico de APScheduler:
+
+```python
+# app/main.py (lifespan)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    scheduler = AsyncIOScheduler()
+
+    if settings.automation_enabled:
+        scheduler.add_job(
+            evaluate_rules,
+            "interval",
+            minutes=settings.automation_interval_minutes,  # default: 15
+            kwargs={
+                "repository": repository,
+                "ollama_client": ollama,
+                "whatsapp": wa_client,
+                "telegram": tg_client,
+            },
+            id="automation_engine",
+            replace_existing=True,
+        )
+        logger.info(
+            "Automation engine started (every %d min)",
+            settings.automation_interval_minutes,
+        )
+
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+```
+
+<Callout variant="warning" title="AUTOMATION_ENABLED gate">
+El engine completo está gateado por `AUTOMATION_ENABLED=true` en `.env`. En desarrollo, conviene dejarlo desactivado para evitar notificaciones accidentales. En producción, activarlo con `automation_interval_minutes=15`.
+</Callout>
+
+## Configuración
+
+```bash
+# .env
+AUTOMATION_ENABLED=true
+AUTOMATION_INTERVAL_MINUTES=15
+ADMIN_PHONE=5491112345678
+```
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    automation_enabled: bool = False
+    automation_interval_minutes: int = 15
+    admin_phone: str | None = None
+```
+
+## Tools de Gestión
+
+El usuario puede gestionar automatizaciones directamente desde el chat:
+
+### list_automation_rules
+
+```python
+# app/skills/tools/automation_tools.py
+
+async def list_automation_rules() -> dict:
+    """Listar todas las reglas de automatización."""
+    repository = get_repository()
+    rules = await repository.get_all_rules()
+    return {
+        "total": len(rules),
+        "rules": [
+            {
+                "name": r["name"],
+                "enabled": r["enabled"],
+                "condition": r["condition_type"],
+                "action": r["action_type"],
+                "cooldown_min": r["cooldown_minutes"],
+                "last_triggered": r["last_triggered_at"],
+            }
+            for r in rules
+        ],
+    }
+```
+
+### toggle_automation_rule
+
+```python
+async def toggle_automation_rule(rule_name: str, enabled: bool) -> dict:
+    """Activar o desactivar una regla de automatización."""
+    repository = get_repository()
+    rule = await repository.get_rule_by_name(rule_name)
+    if not rule:
+        return {"error": f"Rule '{rule_name}' not found"}
+
+    await repository.update_rule(rule["id"], enabled=enabled)
+    action = "activada" if enabled else "desactivada"
+    return {"status": "ok", "message": f"Regla '{rule_name}' {action}"}
+```
+
+### get_automation_log
+
+```python
+async def get_automation_log(limit: int = 10) -> dict:
+    """Ver las últimas ejecuciones de automatización."""
+    repository = get_repository()
+    log = await repository.get_automation_log(limit=limit)
+    return {
+        "entries": [
+            {
+                "rule": entry["rule_name"],
+                "triggered_at": entry["triggered_at"],
+                "action": entry["action_type"],
+                "result": entry["result"],
+            }
+            for entry in log
+        ],
+    }
+```
+
+## Ejemplo de Uso via Chat
+
+```
+Usuario: "¿Qué reglas de automatización tengo?"
+
+LLM → list_automation_rules() →
+"Tenés 6 reglas:
+ 1. project_inactive ✅ (notifica cada 24h)
+ 2. guardrail_degraded ✅ (notifica admin cada 4h)
+ 3. embeddings_desync ✅ (backfill cada 6h)
+ 4. db_large ✅ (vacuum cada 24h)
+ 5. consolidation_pending ✅ (consolida cada 12h)
+ 6. message_backlog ✅ (notifica admin cada 2h)"
+
+Usuario: "Desactivá la regla de project_inactive"
+
+LLM → toggle_automation_rule("project_inactive", false) →
+"Listo, la regla 'project_inactive' fue desactivada."
+```
+
+<Callout variant="tip" title="Gestión sin tocar código">
+El usuario puede ver, activar y desactivar reglas directamente desde WhatsApp o Telegram. No necesita acceder al servidor ni editar archivos.
+</Callout>
+
+<Quiz
+  question="¿Cada cuántos minutos corre el rule engine por defecto?"
+  options={[
+    "1 minuto",
+    "5 minutos",
+    "15 minutos",
+    "60 minutos"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Qué variable de entorno activa el sistema de automatización?"
+  options={[
+    "RULES_ENABLED",
+    "AUTOMATION_ENABLED",
+    "SCHEDULER_ACTIVE",
+    "AUTO_RULES"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué tool permite al usuario desactivar una regla de automatización desde el chat sin tocar código?"
+  options={[
+    "list_automation_rules",
+    "delete_automation_rule",
+    "toggle_automation_rule",
+    "update_rule_config"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo de Operational Automation. Tu asistente ahora puede auto-mantenerse con reglas declarativas que se evalúan periódicamente.

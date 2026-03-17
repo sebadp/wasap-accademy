@@ -1,0 +1,206 @@
+---
+title: "Schema Design"
+description: "10 grupos de tablas que sostienen memoria, conversaciones, trazas y mas"
+xpReward: 75
+---
+
+## La Arquitectura de Datos de LocalForge
+
+LocalForge usa **mas de 50 tablas** organizadas en 10 grupos logicos. Cada grupo encapsula un subsistema del asistente. Todo el schema vive en `app/database/db.py` como strings SQL constantes.
+
+<Callout variant="info" title="Idempotencia">
+Todas las tablas se crean con `CREATE TABLE IF NOT EXISTS`. Podes ejecutar `init_db()` multiples veces sin romper nada. Esto es fundamental para updates sin downtime.
+</Callout>
+
+## Los 10 Grupos de Schema
+
+<FileTree>
+  database/
+  ├── MAIN (4 tablas)
+  │   ├── conversations       # Una por usuario (phone_number)
+  │   ├── messages             # Historial de mensajes
+  │   ├── summaries            # Resumenes de conversaciones
+  │   └── processed_messages   # Dedup atomico
+  ├── MEMORY (2 tablas)
+  │   ├── memories             # Memorias semanticas del usuario
+  │   └── memory_versions      # Historial de cambios (append-only)
+  ├── NOTES (1 tabla)
+  │   └── notes                # Notas personales del usuario
+  ├── PROJECTS (4 tablas)
+  │   ├── projects             # Proyectos del usuario
+  │   ├── project_tasks        # Tareas por proyecto
+  │   ├── project_activity     # Log de actividad
+  │   └── project_notes        # Notas por proyecto
+  ├── PROFILES (1 tabla)
+  │   └── user_profiles        # Onboarding state + data JSON
+  ├── STATE (1 tabla)
+  │   └── conversation_state   # Sticky categories por conv
+  ├── TRACING (3 tablas)
+  │   ├── traces               # Trazas principales
+  │   ├── trace_spans          # Spans dentro de cada traza
+  │   └── trace_scores         # Scores de calidad
+  ├── EVAL (2 tablas)
+  │   ├── eval_dataset         # Dataset vivo de evaluacion
+  │   └── eval_dataset_tags    # Tags por entrada
+  ├── VECTORS (4 tablas virtuales)
+  │   ├── vec_memories         # sqlite-vec: float[768]
+  │   ├── vec_notes            # sqlite-vec: float[768]
+  │   ├── vec_project_notes    # sqlite-vec: float[768]
+  │   └── vec_tools            # sqlite-vec: float[768]
+  └── OTROS
+      ├── agent_command_log    # Audit de comandos shell
+      ├── user_cron_jobs       # Recordatorios programados
+      ├── prompt_versions      # Versionado de prompts
+      ├── entities             # Ontology graph
+      └── automation_rules     # Reglas automaticas
+</FileTree>
+
+## Tablas Core: conversations y messages
+
+Las dos tablas mas importantes del sistema. Toda interaccion empieza aqui:
+
+```sql
+-- app/database/db.py — SCHEMA
+CREATE TABLE IF NOT EXISTS conversations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_number  TEXT UNIQUE NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content         TEXT NOT NULL,
+    wa_message_id   TEXT UNIQUE,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_message_id);
+```
+
+<Concept title="phone_number como identificador">
+En LocalForge, cada usuario se identifica por su numero de telefono (WhatsApp) o `tg_&lt;chat_id&gt;` (Telegram). Esto evita una migracion de schema al agregar plataformas — zero schema migration. Un solo campo `TEXT UNIQUE` sirve para cualquier plataforma.
+</Concept>
+
+## La Tabla de Memorias
+
+Las memorias son hechos persistentes que el asistente recuerda entre conversaciones:
+
+```sql
+CREATE TABLE IF NOT EXISTS memories (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    content         TEXT NOT NULL,
+    category        TEXT,                              -- 'self_correction', null, etc.
+    active          INTEGER NOT NULL DEFAULT 1,        -- Soft delete
+    source_trace_id TEXT,                              -- Trazabilidad
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active, id);
+```
+
+<Callout variant="tip" title="Soft Delete">
+Las memorias nunca se borran fisicamente. `active = 0` las marca como inactivas. Esto permite auditoria y recuperacion, y es necesario para el sistema de provenance que trackea el historial completo.
+</Callout>
+
+## Indices para Performance
+
+Los indices son criticos para las queries mas frecuentes del hot path:
+
+```sql
+-- Buscar memorias activas rapidamente
+CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active, id);
+
+-- Buscar resumenes por conversacion (con tiebreaker por id)
+CREATE INDEX IF NOT EXISTS idx_summaries_conversation
+    ON summaries(conversation_id, id);
+
+-- Mensajes recientes por conversacion
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(conversation_id, created_at);
+
+-- Dedup por wa_message_id
+CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_message_id);
+```
+
+<Callout variant="warning" title="ORDER BY id DESC">
+SQLite `datetime('now')` puede producir timestamps identicos en el mismo segundo. Por eso LocalForge usa `ORDER BY created_at DESC, id DESC` como tiebreaker para resultados deterministicos. Siempre incluye `id` en tus ORDER BY cuando usas timestamps.
+</Callout>
+
+## Tablas de Estado: conversation_state
+
+El state entre turnos de conversacion se guarda en una tabla KV simple:
+
+```sql
+CREATE TABLE IF NOT EXISTS conversation_state (
+    conversation_id   INTEGER PRIMARY KEY REFERENCES conversations(id),
+    sticky_categories TEXT NOT NULL DEFAULT '[]',
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+<Concept title="Sticky Categories">
+Cuando el usuario habla de proyectos y luego pregunta "como va?", el classifier podria no detectar la intencion. `sticky_categories` recuerda el contexto activo y mantiene las herramientas correctas disponibles.
+</Concept>
+
+## Migration Strategy
+
+LocalForge no usa un framework de migrations (como Alembic). En vez de eso, usa un enfoque pragmatico de 3 pasos:
+
+<Step number={1} title="CREATE TABLE IF NOT EXISTS">
+Todas las tablas se crean idempotentemente en `init_db()`. Si la tabla ya existe, no pasa nada.
+</Step>
+
+<Step number={2} title="Deteccion de constraints obsoletos">
+Para cambios como agregar un valor a un CHECK constraint, LocalForge detecta el constraint viejo via `sqlite_master` y recrea la tabla con el nuevo schema.
+</Step>
+
+<Step number={3} title="ALTER TABLE ADD COLUMN">
+Columnas nuevas se agregan con `ALTER TABLE ... ADD COLUMN`. LocalForge verifica con `PRAGMA table_info()` si la columna ya existe antes de agregarla:
+</Step>
+
+```python
+# Ejemplo real: agregar source_trace_id a memories
+cursor = await conn.execute("PRAGMA table_info(memories)")
+mem_cols = {row[1] for row in await cursor.fetchall()}
+if "source_trace_id" not in mem_cols:
+    logger.info("Migrating memories: adding 'source_trace_id' column")
+    await conn.execute("ALTER TABLE memories ADD COLUMN source_trace_id TEXT")
+```
+
+<Quiz
+  question="Por que se usa ORDER BY id DESC en vez de solo ORDER BY created_at DESC?"
+  options={[
+    "Porque id es mas rapido de comparar que timestamps",
+    "Porque datetime('now') puede producir timestamps identicos en el mismo segundo",
+    "Porque created_at no tiene indice",
+    "Porque id es un UUID unico"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que las memorias usan soft delete (active = 0) en vez de DELETE?"
+  options={[
+    "Porque SQLite no soporta DELETE",
+    "Para ahorro de espacio en disco",
+    "Para permitir auditoria, recuperacion y trazabilidad del historial completo",
+    "Porque es mas rapido que DELETE"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Como detecta LocalForge si una migracion ya fue aplicada?"
+  options={[
+    "Usa una tabla de migraciones como Alembic",
+    "Inspecciona sqlite_master y PRAGMA table_info() para verificar el schema actual",
+    "Compara checksums del archivo .db",
+    "Lee un archivo de version en disco"
+  ]}
+  correct={1}
+/>
+
+En la siguiente leccion veremos como el Repository Pattern abstrae el acceso a todas estas tablas.

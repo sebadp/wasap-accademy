@@ -1,0 +1,194 @@
+---
+title: "SQLite Performance Tuning"
+description: "PRAGMAs, WAL mode, indexes y EXPLAIN QUERY PLAN para optimizar SQLite"
+xpReward: 100
+---
+
+## SQLite No Es Lento
+
+SQLite tiene fama de ser "la DB para prototipos", pero con la configuración correcta es extremadamente rápida para workloads de lectura y escritura moderada como LocalForge.
+
+<Callout variant="info" title="SQLite en producción">
+WhatsApp usa SQLite para almacenar mensajes en cada dispositivo. Airbus lo usa en aviones. Es la base de datos más deployada del mundo. El truco es configurarla correctamente.
+</Callout>
+
+## PRAGMAs de Performance
+
+Los PRAGMAs son configuraciones de SQLite que se aplican al conectarse:
+
+```python
+# app/database/db.py
+
+async def init_db(db_path: str) -> tuple[aiosqlite.Connection, bool]:
+    conn = await aiosqlite.connect(db_path, check_same_thread=False)
+
+    # Performance PRAGMAs
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA synchronous=NORMAL")
+    await conn.execute("PRAGMA cache_size=-32000")
+    await conn.execute("PRAGMA temp_store=MEMORY")
+    await conn.execute("PRAGMA mmap_size=30000000")
+
+    # ... crear tablas ...
+    return conn, vec_available
+```
+
+### Qué hace cada PRAGMA
+
+| PRAGMA | Valor | Efecto |
+|--------|-------|--------|
+| `journal_mode=WAL` | Write-Ahead Logging | Lecturas no bloquean escrituras y viceversa |
+| `synchronous=NORMAL` | Sync reducido | ~2x más rápido en escrituras (mínimo riesgo de pérdida en crash del OS) |
+| `cache_size=-32000` | 32 MB de cache | Más páginas en memoria = menos lecturas de disco |
+| `temp_store=MEMORY` | Temp tables en RAM | Sorts y temp tables no tocan disco |
+| `mmap_size=30000000` | 30 MB mmap | OS mapea la DB en memoria virtual |
+
+<Concept title="WAL mode">
+En el modo journal por defecto, una escritura bloquea TODAS las lecturas. En WAL (Write-Ahead Logging), las escrituras van a un archivo separado. Las lecturas ven un snapshot consistente sin esperar la escritura. Es EL cambio más impactante para concurrencia.
+</Concept>
+
+## Impacto de WAL
+
+```
+Sin WAL (journal mode DELETE):
+  Writer: ████████████████████  LOCK
+  Reader1:                      ⏳⏳⏳⏳ (blocked)
+  Reader2:                      ⏳⏳⏳⏳ (blocked)
+
+Con WAL:
+  Writer:  ████████████████████ (WAL file)
+  Reader1: ████████████████     (snapshot)
+  Reader2: ████████████████     (snapshot)
+  No bloqueo entre lectores y escritores!
+```
+
+## Indexes Estratégicos
+
+Los indexes correctos hacen la diferencia entre una query de 100ms y una de 1ms:
+
+```sql
+-- Tiebreaker por id: cuando datetime() produce timestamps idénticos
+CREATE INDEX IF NOT EXISTS idx_messages_conv_time
+    ON messages(conversation_id, created_at DESC, id DESC);
+
+-- Búsqueda de memorias activas
+CREATE INDEX IF NOT EXISTS idx_memories_active
+    ON memories(active) WHERE active = 1;
+
+-- Audit log por entidad
+CREATE INDEX IF NOT EXISTS idx_audit_entity
+    ON entity_audit_log(entity_type, entity_id);
+
+-- Processed messages dedup
+CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_msg
+    ON processed_messages(message_id);
+```
+
+<Callout variant="warning" title="ORDER BY id DESC para tiebreaking">
+`datetime('now')` en SQLite puede producir timestamps idénticos para operaciones en el mismo segundo. Agregar `id DESC` como tiebreaker garantiza un orden determinístico.
+</Callout>
+
+## EXPLAIN QUERY PLAN
+
+Para verificar que los indexes se usan correctamente:
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT content FROM memories
+WHERE active = 1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Resultado ideal:
+
+```
+SEARCH memories USING INDEX idx_memories_active (active=?)
+```
+
+Resultado malo (full table scan):
+
+```
+SCAN memories
+```
+
+```python
+# Verificación programática en tests
+async def test_index_usage(db_conn):
+    result = await db_conn.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM messages "
+        "WHERE conversation_id = 1 ORDER BY created_at DESC LIMIT 8"
+    )
+    plan = await result.fetchall()
+    plan_text = str(plan)
+    assert "USING INDEX" in plan_text, f"Missing index: {plan_text}"
+```
+
+## Covering Indexes
+
+Un covering index incluye todas las columnas que la query necesita, evitando acceder a la tabla:
+
+```sql
+-- Covering index: todas las columnas en el index
+CREATE INDEX IF NOT EXISTS idx_messages_covering
+    ON messages(conversation_id, created_at DESC, role, content);
+
+-- Con este index, la query:
+-- SELECT role, content FROM messages
+-- WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 8
+-- Solo lee el index, nunca toca la tabla
+```
+
+<Concept title="Covering index">
+Un index normal tiene las columnas indexadas + un puntero a la fila. En SQLite, un covering index incluye todas las columnas directamente en la definición del index (no existe INCLUDE como en PostgreSQL). Si la query solo necesita columnas del index, SQLite no necesita hacer el "table lookup". Es significativamente más rápido para queries frecuentes.
+</Concept>
+
+## synchronous=NORMAL vs FULL
+
+```
+FULL (default):  write → fsync → WAL → fsync → confirm
+NORMAL:          write → WAL → confirm (sin fsync extra)
+
+Riesgo de NORMAL:
+- Si el SISTEMA OPERATIVO crashea (kernel panic, corte de luz),
+  podés perder la última transacción
+- Si solo crashea la APP, NO se pierde nada
+
+Para un AI assistant: NORMAL es aceptable.
+Para un banco: usar FULL.
+```
+
+<Quiz
+  question="¿Qué PRAGMA tiene el mayor impacto en la concurrencia de SQLite?"
+  options={[
+    "synchronous=NORMAL",
+    "journal_mode=WAL",
+    "cache_size=-32000",
+    "temp_store=MEMORY"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué se agrega 'id DESC' como tiebreaker en ORDER BY?"
+  options={[
+    "Porque id es más rápido que datetime",
+    "Porque datetime('now') puede producir timestamps idénticos en el mismo segundo",
+    "Porque id siempre es mayor que datetime",
+    "Es una convención sin razón técnica"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué ventaja tiene un covering index sobre un index normal?"
+  options={[
+    "Ocupa menos espacio en disco",
+    "Incluye todas las columnas que la query necesita, evitando el table lookup y leyendo solo el index",
+    "Permite indexar más de una tabla a la vez",
+    "Se actualiza automáticamente sin costo de escritura"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos las mejores prácticas para mantener el event loop sano.

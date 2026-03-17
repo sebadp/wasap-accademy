@@ -2,25 +2,46 @@ import { Lock, CheckCircle, Circle, Zap } from "lucide-react";
 import type { ModuleInfo } from "@/types";
 
 const MODULES: ModuleInfo[] = [
-  { id: "module-0", title: "Setup & Onboarding", description: "Estructura del proyecto, Docker, entorno local", tier: "Foundation", lessonCount: 5 },
-  { id: "module-1", title: "Webhook Pipeline", description: "Recibir mensajes de WhatsApp via webhooks", tier: "Foundation", lessonCount: 7 },
-  { id: "module-2", title: "LLM Integration", description: "Conectar con Claude y otros LLMs", tier: "Foundation", lessonCount: 7 },
-  { id: "module-3", title: "Database & State", description: "PostgreSQL, modelos de datos, estado", tier: "Core", lessonCount: 5 },
-  { id: "module-4", title: "Conversation Memory", description: "Memoria de contexto para conversaciones", tier: "Core", lessonCount: 5 },
-  { id: "module-5", title: "Skills Framework", description: "Sistema de skills extensible", tier: "Core", lessonCount: 5 },
-  { id: "module-6", title: "Tool Calling", description: "Function calling con LLMs", tier: "Core", lessonCount: 5 },
-  { id: "module-7", title: "RAG Pipeline", description: "Retrieval Augmented Generation", tier: "Advanced", lessonCount: 5 },
-  { id: "module-8", title: "Guardrails", description: "Seguridad y filtros para LLMs", tier: "Advanced", lessonCount: 5 },
-  { id: "module-9", title: "Tracing & Observability", description: "Monitoreo y debugging de agentes", tier: "Advanced", lessonCount: 5 },
-  { id: "module-10", title: "Multi-Agent Patterns", description: "Orquestacion de multiples agentes", tier: "Advanced", lessonCount: 5 },
+  // Tier 1: Foundation
+  { id: "module-0", title: "Setup & Onboarding", description: "Estructura del proyecto, Docker y entorno local", tier: "Foundation", lessonCount: 5 },
+  { id: "module-1", title: "Webhook Pipeline", description: "Recibir y procesar mensajes de WhatsApp via webhooks", tier: "Foundation", lessonCount: 5 },
+  { id: "module-2", title: "LLM Integration", description: "Conectar con Ollama y LLMs locales para generar respuestas", tier: "Foundation", lessonCount: 5 },
+  // Tier 2: Core
+  { id: "module-3", title: "Database & Persistence", description: "SQLite async, repository pattern y vector storage", tier: "Core", lessonCount: 5 },
+  { id: "module-4", title: "Conversation & State", description: "Historial con ventana, summarizer y compactacion", tier: "Core", lessonCount: 5 },
+  { id: "module-5", title: "Memory System", description: "Memorias semanticas, daily logs y consolidacion", tier: "Core", lessonCount: 5 },
+  { id: "module-6", title: "Skills Framework", description: "SKILL.md, registry pattern y tool definitions", tier: "Core", lessonCount: 5 },
+  // Tier 3: Intermediate
+  { id: "module-7", title: "Tool Calling & Execution", description: "Loop de ejecucion de tools, paralelismo y meta-tools", tier: "Intermediate", lessonCount: 5 },
+  { id: "module-8", title: "Intent Classification & Routing", description: "Two-stage routing, classify_intent y sticky categories", tier: "Intermediate", lessonCount: 5 },
+  { id: "module-9", title: "Semantic Search & RAG", description: "Embeddings, sqlite-vec y retrieval-augmented generation", tier: "Intermediate", lessonCount: 5 },
+  { id: "module-10", title: "Context Engineering", description: "Token budgets, ContextBuilder y prompt assembly", tier: "Intermediate", lessonCount: 5 },
+  // Tier 4: Advanced
+  { id: "module-11", title: "Multimedia Processing", description: "Audio con faster-whisper, vision con LLaVA y formatting", tier: "Advanced", lessonCount: 5 },
+  { id: "module-12", title: "Guardrails & Quality", description: "Checks deterministicos, LLM checks y remediacion", tier: "Advanced", lessonCount: 5 },
+  { id: "module-13", title: "Tracing & Observability", description: "Langfuse v3, TraceContext y scores de calidad", tier: "Advanced", lessonCount: 5 },
+  { id: "module-14", title: "Evaluation & Self-Improvement", description: "Dataset vivo, LLM-as-judge y prompt versioning", tier: "Advanced", lessonCount: 5 },
+  // Tier 5: Expert
+  { id: "module-15", title: "Agent Sessions & Reactive Loop", description: "Sesiones agénticas, scratchpad y loop detection", tier: "Expert", lessonCount: 5 },
+  { id: "module-16", title: "Planner-Orchestrator", description: "Patron planner-worker, replanificacion y sintesis", tier: "Expert", lessonCount: 5 },
+  { id: "module-17", title: "Agentic Security & HITL", description: "PolicyEngine, audit trail y human-in-the-loop", tier: "Expert", lessonCount: 5 },
+  // Tier 6: Specialist
+  { id: "module-18", title: "Multi-Platform & MCP", description: "PlatformClient Protocol, Telegram y MCP hot-reload", tier: "Specialist", lessonCount: 5 },
+  { id: "module-19", title: "Knowledge Graphs & Provenance", description: "Entidades, relaciones, BFS traversal y data lineage", tier: "Specialist", lessonCount: 5 },
+  { id: "module-20", title: "Operational Automation", description: "Rule engine, condiciones, acciones y reglas custom", tier: "Specialist", lessonCount: 5 },
+  // Tier 7: Production
+  { id: "module-21", title: "Performance Optimization", description: "Paralelizacion asyncio, caching y SQLite tuning", tier: "Production", lessonCount: 5 },
+  { id: "module-22", title: "Production Deployment & CI/CD", description: "Docker, health checks, CI pipeline y eval en CI", tier: "Production", lessonCount: 5 },
 ];
 
 const TIER_COLORS: Record<string, string> = {
-  Foundation: "text-emerald-400 border-emerald-400/30 bg-emerald-400/10",
-  Core: "text-blue-400 border-blue-400/30 bg-blue-400/10",
-  Advanced: "text-purple-400 border-purple-400/30 bg-purple-400/10",
-  Specialist: "text-amber-400 border-amber-400/30 bg-amber-400/10",
-  Capstone: "text-red-400 border-red-400/30 bg-red-400/10",
+  Foundation:   "text-emerald-400 border-emerald-400/30 bg-emerald-400/10",
+  Core:         "text-blue-400 border-blue-400/30 bg-blue-400/10",
+  Intermediate: "text-cyan-400 border-cyan-400/30 bg-cyan-400/10",
+  Advanced:     "text-purple-400 border-purple-400/30 bg-purple-400/10",
+  Expert:       "text-orange-400 border-orange-400/30 bg-orange-400/10",
+  Specialist:   "text-amber-400 border-amber-400/30 bg-amber-400/10",
+  Production:   "text-red-400 border-red-400/30 bg-red-400/10",
 };
 
 function ModuleStatusIcon({ index }: { index: number }) {

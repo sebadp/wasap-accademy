@@ -81,33 +81,79 @@ Students don't learn from toy examples. They learn by understanding, modifying, 
 - [x] Sidebar con streak indicator, layout con XPBar (top-24)
 - [x] Build 34 páginas estáticas + lint: 0 errores, 0 warnings
 
-### Fase 2: Advanced Content (future)
-- [ ] Modules 3-16
-- [ ] Leaderboard
-- [ ] Social features
-- [ ] Advanced challenges
+### Fase 2: Curriculum Expansion v2 — DONE
+- [x] Modules 3-10 (Core + Intermediate) — 40 lessons
+- [x] Modules 11-14 (Advanced) — 20 lessons
+- [x] Modules 15-17 (Expert: Agent Mode) — 15 lessons
+- [x] Modules 18-20 (Specialist) — 15 lessons
+- [x] Modules 21-22 (Production) — 10 lessons
+- [x] Updated PRODUCT_PLAN.md curriculum to 23 modules
+- [x] Updated Module 0 welcome lesson for 7 tiers
+- [x] Created docs/curriculum/SYLLABUS.md
+- [x] Created docs/exec-plans/04-curriculum-expansion_prd.md
 
-## Curriculum — 17 Modules
+### Fase 3: Polish & Challenges (future)
+- [ ] Tier challenges (coding exercises per tier)
+- [ ] New badges (10 proposed in SYLLABUS.md)
+- [ ] Leaderboard enhancements
+- [ ] Advanced challenges with Pyodide
 
-| # | Module | WasAP Source | Tier |
-|---|--------|-------------|------|
-| 0 | Setup & Onboarding | Project root, docker | Foundation |
-| 1 | Webhook Pipeline | `app/webhook/` | Foundation |
-| 2 | LLM Integration | `app/llm/`, `app/whatsapp/` | Foundation |
-| 3 | Database & State | `app/database/` | Core |
-| 4 | Conversation Memory | `app/memory/` | Core |
-| 5 | Skills Framework | `app/skills/registry.py` | Core |
-| 6 | Tool Calling | `app/llm/client.py` tools | Core |
-| 7 | RAG Pipeline | `app/rag/` | Advanced |
-| 8 | Guardrails | `app/guardrails/` | Advanced |
-| 9 | Tracing & Observability | `app/tracing/` | Advanced |
-| 10 | Multi-Agent Patterns | `app/agents/` | Advanced |
-| 11 | Media Processing | `app/media/` | Specialist |
-| 12 | Scheduling | `app/skills/scheduling/` | Specialist |
-| 13 | Web Search | `app/skills/web_search/` | Specialist |
-| 14 | Performance Tuning | Various | Specialist |
-| 15 | Testing Mastery | `tests/` | Specialist |
-| 16 | Production Deploy | Docker, CI/CD | Capstone |
+## Curriculum — 23 Modules (v2)
+
+> Syllabus detallado: [`docs/curriculum/SYLLABUS.md`](docs/curriculum/SYLLABUS.md)
+
+### Tier 1: Foundation (Modules 0-2) ✅
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 0 | Setup & Onboarding | Project root, docker | ✅ 5 lessons |
+| 1 | Webhook Pipeline | `app/webhook/` | ✅ 5 lessons |
+| 2 | LLM Integration | `app/llm/`, `app/whatsapp/` | ✅ 5 lessons |
+
+### Tier 2: Core (Modules 3-6) ✅
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 3 | Database & Persistence | `app/database/` | ✅ 5 lessons |
+| 4 | Conversation & State | `app/conversation/`, `app/formatting/` | ✅ 5 lessons |
+| 5 | Memory System | `app/memory/` | ✅ 5 lessons |
+| 6 | Skills Framework | `app/skills/` | ✅ 5 lessons |
+
+### Tier 3: Intermediate (Modules 7-10) ✅
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 7 | Tool Calling & Execution | `app/skills/executor.py` | ✅ 5 lessons |
+| 8 | Intent Classification & Routing | `app/skills/router.py` | ✅ 5 lessons |
+| 9 | Semantic Search & RAG | `app/embeddings/` | ✅ 5 lessons |
+| 10 | Context Engineering | `app/context/` | ✅ 5 lessons |
+
+### Tier 4: Advanced (Modules 11-14)
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 11 | Multimedia Processing | `app/audio/`, `app/formatting/` | ✅ 5 lessons |
+| 12 | Guardrails & Quality Control | `app/guardrails/` | ✅ 5 lessons |
+| 13 | Tracing & Observability | `app/tracing/` | ✅ 5 lessons |
+| 14 | Evaluation & Self-Improvement | `app/eval/` | ✅ 5 lessons |
+
+### Tier 5: Expert — Agent Mode (Modules 15-17)
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 15 | Agent Sessions & Reactive Loop | `app/agent/loop.py` | ✅ 5 lessons |
+| 16 | Planner-Orchestrator | `app/agent/` | ✅ 5 lessons |
+| 17 | Agentic Security & HITL | `app/security/` | ✅ 5 lessons |
+
+### Tier 6: Specialist (Modules 18-20)
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 18 | Multi-Platform & MCP | `app/platforms/`, `app/mcp/` | ✅ 5 lessons |
+| 19 | Knowledge Graphs & Provenance | `app/ontology/`, `app/provenance/` | ✅ 5 lessons |
+| 20 | Operational Automation | `app/automation/` | ✅ 5 lessons |
+
+### Tier 7: Production (Modules 21-22)
+| # | Module | WasAP Source | Status |
+|---|--------|-------------|--------|
+| 21 | Performance Optimization | Various (`router.py`, `db.py`) | ✅ 5 lessons |
+| 22 | Production Deploy & CI/CD | Docker, `.github/`, `scripts/` | ✅ 5 lessons |
+
+**Total: 23 modules · 115 lessons · ~12,875 XP available**
 
 ## Gamification System
 

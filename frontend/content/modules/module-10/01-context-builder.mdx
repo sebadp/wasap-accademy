@@ -1,0 +1,234 @@
+---
+title: "ContextBuilder"
+description: "Consolidar múltiples secciones en un system message con XML tags"
+xpReward: 100
+---
+
+## El Problema: Muchas Fuentes de Contexto
+
+El LLM necesita información de 7+ fuentes para responder bien: system prompt, memorias, notas, notas de proyecto, historial, proyectos activos, daily logs, capabilities, y conversation summary. Enviar cada una como un mensaje separado es ineficiente y confuso para el modelo.
+
+<Callout variant="info" title="Una sola fuente de verdad">
+ContextBuilder consolida todo en **un solo system message** con secciones delimitadas por XML tags. Ollama (y qwen3.5 en particular) procesa mejor un sistema de prompt estructurado que múltiples mensajes separados.
+</Callout>
+
+## La Clase ContextBuilder
+
+```python
+# app/context/context_builder.py
+class ContextBuilder:
+    """Builds a structured system prompt with XML-delimited sections.
+
+    Each section is wrapped in <tag>...</tag> blocks appended after the base prompt.
+    Empty or None sections are skipped automatically.
+    """
+
+    def __init__(self, system_prompt: str) -> None:
+        self._base_prompt = system_prompt
+        self._sections: list[tuple[str, str]] = []  # (tag_name, content)
+
+    def add_section(self, tag: str, content: str | None) -> ContextBuilder:
+        """Add a named section. Skipped if content is empty or None."""
+        if content:
+            self._sections.append((tag, content))
+        return self
+
+    def build_system_message(self) -> str:
+        """Consolidate into a single system prompt with XML sections."""
+        if not self._sections:
+            return self._base_prompt
+        parts = [self._base_prompt]
+        for tag, content in self._sections:
+            parts.append(f"\n<{tag}>\n{content}\n</{tag}>")
+        return "\n".join(parts)
+```
+
+<Concept title="Fluent API con return self">
+`add_section` retorna `self` (el `ContextBuilder`), lo que permite encadenar llamadas: `builder.add_section("a", text_a).add_section("b", text_b)`. Este patrón se llama **fluent interface**.
+</Concept>
+
+## Uso en _build_context()
+
+Así se usa el builder en el router para ensamblar el prompt final:
+
+```python
+# app/webhook/router.py
+def _build_context(
+    system_prompt: str,
+    memories: list[str],
+    relevant_notes: list[Note],
+    daily_logs: str | None,
+    skills_summary: str | None,
+    summary: str | None,
+    history: list[ChatMessage],
+    projects_summary: str | None = None,
+    project_notes: list | None = None,
+) -> list[ChatMessage]:
+    """Build LLM context from pre-fetched data (sync, no DB calls)."""
+    from app.context.context_builder import ContextBuilder
+
+    builder = ContextBuilder(system_prompt)
+    builder.add_section("user_memories", _format_memories(memories))
+    builder.add_section("active_projects", projects_summary)
+    builder.add_section("project_notes", _format_project_notes(project_notes or []))
+    builder.add_section("relevant_notes", _format_notes(relevant_notes))
+    builder.add_section("recent_activity", daily_logs)
+    builder.add_section("capabilities", skills_summary)
+    if summary:
+        builder.add_section("conversation_summary",
+                            f"Previous conversation summary:\n{summary}")
+
+    context: list[ChatMessage] = [
+        ChatMessage(role="system", content=builder.build_system_message())
+    ]
+    context.extend(history)
+    return context
+```
+
+<Callout variant="warning" title="Función sync sin DB calls">
+`_build_context()` es **sincrónica**. No hace ninguna query a la base de datos ni llamada a Ollama. Solo ensambla strings que ya fueron recolectadas por `ConversationContext.build()` en las fases anteriores. Esto mantiene la separación entre I/O (async) y formateo (sync).
+</Callout>
+
+## Las Secciones XML
+
+El resultado del builder es un string como este:
+
+```xml
+You are a helpful personal assistant on WhatsApp...
+
+<user_memories>
+Important user information:
+- Es desarrollador Python senior
+- Trabaja en fintech, Buenos Aires
+- GitHub username: sebadp
+</user_memories>
+
+<active_projects>
+Active projects:
+  - API v2: 3/5 tasks (60%)
+</active_projects>
+
+<project_notes>
+Project documents and notes:
+- [12] Architecture: Microservices con FastAPI, PostgreSQL, Redis cache
+</project_notes>
+
+<relevant_notes>
+Relevant notes:
+- [42] Deploy Guide: Usar Docker Compose en producción con nginx
+</relevant_notes>
+
+<recent_activity>
+## 2026-03-16
+- Discutió arquitectura de microservicios
+- Completó tarea "diseño de endpoints"
+</recent_activity>
+
+<capabilities>
+Available tools: get_weather, save_note, list_notes, web_search
+</capabilities>
+
+<conversation_summary>
+Previous conversation summary:
+El usuario viene trabajando en su API v2, discutimos autenticación JWT
+y estrategias de rate limiting para los endpoints públicos...
+</conversation_summary>
+```
+
+## Skip-If-Empty: Ahorrar Tokens
+
+La magia de `add_section` está en la primera línea: si `content` es falsy (None, string vacío), no se agrega nada:
+
+```python
+def add_section(self, tag: str, content: str | None) -> ContextBuilder:
+    if content:  # Skip si None o vacío
+        self._sections.append((tag, content))
+    return self
+```
+
+Esto significa que:
+
+```python
+builder = ContextBuilder(system_prompt)
+builder.add_section("user_memories", _format_memories([]))      # memories=[] → None → skip
+builder.add_section("active_projects", None)                     # None → skip
+builder.add_section("relevant_notes", _format_notes(notes))     # hay notas → se agrega
+builder.add_section("recent_activity", "")                       # "" → skip
+builder.add_section("capabilities", "Available tools: save_note") # contenido → se agrega
+```
+
+Solo `relevant_notes` y `capabilities` aparecen en el output. Los tags vacíos no desperdician tokens.
+
+<Concept title="Ahorro de tokens por omisión">
+Si un usuario no tiene notas de proyecto, `_format_project_notes([])` retorna `None`. La sección `<project_notes>` no aparece en el prompt. Esto ahorra ~20 tokens por tag que se omite (el tag + newlines). Con 4 secciones vacías, son ~80 tokens ahorrados, que se pueden usar para historial o respuesta.
+</Concept>
+
+## Por Qué XML Tags y No Otros Formatos
+
+| Formato | Pros | Contras |
+|---------|------|---------|
+| **XML tags** | Estructura clara, LLM puede referenciar secciones, estándar de la industria | Ligeramente más verbose |
+| JSON | Parseable, compacto | LLMs tienen trouble con JSON anidado largo |
+| Markdown headers | Legible para humanos | Ambiguo para el LLM (no hay cierre explícito) |
+| Sin estructura | Mínimo overhead | LLM confunde las secciones entre sí |
+
+Razones para elegir XML:
+
+- **Estructura clara**: el LLM puede distinguir memorias de notas de proyectos
+- **Referenciables**: el modelo puede decir "según tus `<user_memories>`, trabajás en fintech"
+- **Cierre explícito**: `</tag>` marca inequívocamente dónde termina cada sección
+- **Estándar**: Anthropic, Google, y la industria en general recomiendan XML para structured prompts
+
+## El Orden de las Secciones Importa
+
+El orden en `_build_context()` no es arbitrario:
+
+```python
+# Orden intencional: de más importante a menos importante
+builder.add_section("user_memories", ...)       # 1. Quién es el usuario
+builder.add_section("active_projects", ...)     # 2. En qué trabaja
+builder.add_section("project_notes", ...)       # 3. Documentos del proyecto
+builder.add_section("relevant_notes", ...)      # 4. Notas relevantes al query
+builder.add_section("recent_activity", ...)     # 5. Qué hizo recientemente
+builder.add_section("capabilities", ...)        # 6. Qué herramientas tiene
+builder.add_section("conversation_summary", ...)# 7. Resumen (redundante con historial)
+```
+
+<Callout variant="tip" title="Atención decreciente">
+Los LLMs tienden a prestar más atención al inicio y al final del prompt (efecto "lost in the middle"). Las memorias del usuario van primero porque son las más importantes para personalización. El summary va último porque es el más redundante (el historial ya contiene la información detallada).
+</Callout>
+
+<Quiz
+  question="¿Por qué ContextBuilder usa un solo system message en vez de varios?"
+  options={[
+    "Porque Ollama solo soporta un system message",
+    "Porque un solo mensaje estructurado con XML es más eficiente para el modelo",
+    "Para reducir la latencia de red",
+    "Porque XML requiere un solo bloque"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa con una sección que tiene contenido vacío o None?"
+  options={[
+    "Se agrega con tags vacíos como <section></section>",
+    "Se reemplaza con un placeholder '[no data]'",
+    "Se omite completamente, ahorrando tokens",
+    "Se lanza un error porque todas las secciones son obligatorias"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué _build_context() es una función sync en vez de async?"
+  options={[
+    "Porque Python no soporta funciones async que retornen strings",
+    "Porque solo ensambla strings ya recolectados — no hace I/O ni queries",
+    "Para evitar deadlocks con el event loop",
+    "Porque ContextBuilder no es compatible con async"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos `ConversationContext.build()` -- el factory que recolecta todos los datos que ContextBuilder ensambla.

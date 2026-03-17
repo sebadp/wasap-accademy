@@ -1,0 +1,216 @@
+---
+title: "Tipos de Condiciones"
+description: "Condiciones query, metric y schedule: cómo evaluar cuándo disparar una regla"
+xpReward: 100
+---
+
+## Tres Formas de Evaluar
+
+El rule engine soporta tres tipos de condiciones, cada una diseñada para un caso de uso distinto:
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│  query   │     │  metric  │     │ schedule │
+│          │     │          │     │          │
+│ SQL puro │     │ Métricas │     │  Cron    │
+│ flexible │     │ predefs  │     │ temporal │
+└──────────┘     └──────────┘     └──────────┘
+```
+
+## 1. Condición: query
+
+Ejecuta un SELECT SQL y compara el resultado con un umbral:
+
+```python
+# app/automation/conditions.py
+
+async def _check_query(config: dict, repository: Repository) -> bool:
+    """
+    config = {
+        "sql": "SELECT COUNT(*) FROM memories WHERE ...",
+        "operator": "gt",  # gt, lt, eq, gte, lte
+        "threshold": 30
+    }
+    """
+    sql = config["sql"]
+
+    # SEGURIDAD: solo permitir SELECT
+    if not sql.strip().upper().startswith("SELECT"):
+        logger.warning("Blocked non-SELECT query in automation: %s", sql)
+        return False
+
+    result = await repository.execute_scalar(sql)
+    return _compare(result, config["operator"], config["threshold"])
+
+
+def _compare(value: float, operator: str, threshold: float) -> bool:
+    ops = {
+        "gt": lambda v, t: v > t,
+        "lt": lambda v, t: v < t,
+        "eq": lambda v, t: v == t,
+        "gte": lambda v, t: v >= t,
+        "lte": lambda v, t: v <= t,
+    }
+    fn = ops.get(operator)
+    if not fn:
+        return False
+    return fn(value, threshold)
+```
+
+<Callout variant="error" title="Solo SELECT">
+Las queries de automatización SOLO pueden ser SELECT. El check `startswith("SELECT")` bloquea cualquier intento de INSERT, UPDATE, DELETE o DROP. Es una primera línea de defensa. En producción, complementar con roles read-only en la DB y deshabilitar ejecución multi-statement (SQLite `execute()` ya lo hace por defecto) para protección robusta contra inyecciones como `SELECT 1; DROP TABLE`.
+</Callout>
+
+### Ejemplo de query condition
+
+```python
+# "¿Hay más de 30 memorias sin consolidar?"
+condition_config = {
+    "sql": """
+        SELECT COUNT(*) FROM memories
+        WHERE created_at > datetime('now', '-7 days')
+        AND id NOT IN (
+            SELECT entity_id FROM entity_audit_log
+            WHERE action = 'MERGE'
+        )
+    """,
+    "operator": "gt",
+    "threshold": 30,
+}
+```
+
+## 2. Condición: metric
+
+Evalúa métricas predefinidas por nombre, sin SQL custom:
+
+```python
+METRIC_FUNCTIONS = {
+    "guardrail_pass_rate": _metric_guardrail_pass_rate,
+    "embedding_desync": _metric_embedding_desync,
+    "db_size_mb": _metric_db_size,
+    "pending_consolidation": _metric_pending_consolidation,
+    "inactive_projects_days": _metric_inactive_projects,
+}
+
+async def _check_metric(config: dict, repository: Repository) -> bool:
+    """
+    config = {
+        "name": "guardrail_pass_rate",
+        "operator": "lt",
+        "threshold": 0.7
+    }
+    """
+    name = config["name"]
+    fn = METRIC_FUNCTIONS.get(name)
+    if not fn:
+        logger.warning("Unknown metric: %s", name)
+        return False
+
+    value = await fn(repository)
+    return _compare(value, config["operator"], config["threshold"])
+```
+
+### Las 5 Métricas Predefinidas
+
+```python
+async def _metric_guardrail_pass_rate(repo: Repository) -> float:
+    """Porcentaje de respuestas que pasaron guardrails (últimas 24h)."""
+    stats = await repo.get_guardrail_stats(hours=24)
+    if stats["total"] == 0:
+        return 1.0  # Sin datos = todo OK
+    return stats["passed"] / stats["total"]
+
+async def _metric_embedding_desync(repo: Repository) -> int:
+    """Cantidad de memorias sin embedding indexado."""
+    return await repo.count_memories_without_embedding()
+
+async def _metric_db_size(repo: Repository) -> float:
+    """Tamaño de la DB en megabytes."""
+    size_bytes = await repo.get_db_size()
+    return size_bytes / (1024 * 1024)
+
+async def _metric_pending_consolidation(repo: Repository) -> int:
+    """Memorias creadas en la última semana sin consolidar."""
+    return await repo.count_unconsolidated_memories(days=7)
+
+async def _metric_inactive_projects(repo: Repository) -> int:
+    """Días desde la última actividad en cualquier proyecto."""
+    return await repo.get_max_project_inactivity_days()
+```
+
+<Concept title="Métricas predefinidas vs queries">
+Las métricas son más seguras y simples (no hay SQL raw) pero menos flexibles. Para casos comunes, usá métricas. Para queries específicas, usá el tipo `query`.
+</Concept>
+
+## 3. Condición: schedule
+
+Evalúa si la hora actual coincide con una expresión cron:
+
+```python
+from croniter import croniter
+from datetime import datetime
+
+def _check_schedule(config: dict) -> bool:
+    """
+    config = {
+        "cron": "0 2 * * *"  # Todos los días a las 2 AM
+    }
+    """
+    cron_expr = config.get("cron", "")
+    try:
+        cron = croniter(cron_expr, datetime.utcnow())
+        prev = cron.get_prev(datetime)
+        # Si la ejecución anterior fue hace menos de automation_interval
+        elapsed = (datetime.utcnow() - prev).total_seconds()
+        return elapsed < 900  # 15 min window
+    except (ValueError, KeyError):
+        logger.warning("Invalid cron expression: %s", cron_expr)
+        return False
+```
+
+<Callout variant="info" title="Ventana de 15 minutos">
+Como el engine corre cada 15 minutos (por defecto), la condición schedule chequea si el cron debería haber disparado en los últimos 15 minutos. Esto evita perder ejecuciones si el engine no corre al segundo exacto.
+</Callout>
+
+## Resumen
+
+| Tipo | Cuándo usar | Flexibilidad | Seguridad |
+|------|-------------|-------------|-----------|
+| `query` | Condiciones SQL custom | Alta | Media (SELECT-only) |
+| `metric` | Métricas conocidas del sistema | Baja | Alta (predefinidas) |
+| `schedule` | Ejecución temporal | Baja | Alta (solo cron) |
+
+<Quiz
+  question="¿Qué tipo de condición usarías para chequear si hay más de 10 memorias sin embedding?"
+  options={[
+    "query con SQL custom",
+    "metric con nombre 'embedding_desync'",
+    "schedule con cron expression",
+    "Cualquiera de las tres sirve igual"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué las queries de automatización solo permiten SELECT?"
+  options={[
+    "Porque SQLite no soporta otros tipos",
+    "Para evitar que una regla mal configurada pueda destruir datos",
+    "Porque las queries son más rápidas que INSERT",
+    "Es una limitación temporal que se va a resolver"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué la condición schedule usa una ventana de 15 minutos en vez de comparar al segundo exacto?"
+  options={[
+    "Porque croniter no soporta precisión de segundos",
+    "Porque el engine corre periódicamente y podría no ejecutarse en el segundo exacto del cron",
+    "Para que las reglas schedule se disparen más seguido",
+    "Porque UTC no tiene segundos precisos"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos los cuatro tipos de acciones que puede ejecutar el engine.

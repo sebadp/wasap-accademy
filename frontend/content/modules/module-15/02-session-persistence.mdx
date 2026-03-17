@@ -1,0 +1,245 @@
+---
+title: "Session Persistence"
+description: "Append-only JSONL para sesiones agénticas y task memory tools"
+xpReward: 75
+---
+
+## El Problema: Sesiones que Sobreviven a Reinicio
+
+Una sesión agéntica puede durar minutos. Si la app se reinicia durante una sesión, ¿se pierde todo el trabajo? No — cada ronda se persiste en un archivo JSONL append-only.
+
+<Callout variant="info" title="Append-only = nunca perder datos">
+JSONL (JSON Lines) es un formato donde cada línea es un objeto JSON independiente. Append-only significa que nunca se modifica ni borra — solo se agregan líneas. Si la app crashea a mitad de escritura, las líneas anteriores están intactas.
+</Callout>
+
+## Estructura de Archivos
+
+```
+data/agent_sessions/
+├── 5491100000_a1b2c3d4.jsonl     # Sesión de usuario WA
+├── 5491100000_e5f6a7b8.jsonl     # Otra sesión del mismo usuario
+└── tg_12345_c9d0e1f2.jsonl       # Sesión de usuario Telegram
+```
+
+El nombre del archivo: `{safe_phone}_{session_id}.jsonl`
+
+```python
+# app/agent/persistence.py
+from pathlib import Path
+
+SESSIONS_DIR = Path("data/agent_sessions")
+
+def _session_path(phone: str, session_id: str) -> Path:
+    safe_phone = phone.replace("+", "").replace(" ", "")
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    return SESSIONS_DIR / f"{safe_phone}_{session_id}.jsonl"
+```
+
+## Append: Guardar una Ronda
+
+```python
+def append_to_session(
+    phone: str,
+    session_id: str,
+    data_dict: dict,
+) -> None:
+    """Append a single round to the session JSONL file. Atomic."""
+    path = _session_path(phone, session_id)
+    line = json.dumps(data_dict, ensure_ascii=False) + "\n"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line)
+```
+
+Cada ronda se guarda como un objeto JSON:
+
+```json
+{"iteration": 0, "task_id": null, "task_status": null, "task_plan": "- [ ] Leer repo\n- [ ] Analizar", "reply": "Voy a empezar leyendo la estructura del repositorio..."}
+{"iteration": 1, "task_id": 1, "task_status": "done", "task_plan": "- [x] Leer repo\n- [ ] Analizar", "reply": "Encontré un Makefile con targets de test..."}
+{"iteration": 2, "task_id": 2, "task_status": "done", "task_plan": "- [x] Leer repo\n- [x] Analizar", "reply": "La cobertura es del 45%, faltarían tests E2E..."}
+```
+
+<Concept title="JSONL vs JSON">
+Un archivo JSON es un solo objeto/array. Si querés agregar datos, tenés que leer todo, parsear, agregar, y reescribir. Con JSONL, cada línea es independiente — solo hacés `append`. Es ideal para logs y sesiones.
+</Concept>
+
+## Load: Reconstruir una Sesión
+
+```python
+def load_session_history(
+    phone: str,
+    session_id: str,
+) -> list[dict]:
+    """Load all rounds from a session JSONL file."""
+    path = _session_path(phone, session_id)
+    if not path.exists():
+        return []
+    entries = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # Skip corrupt lines
+    return entries
+```
+
+<Callout variant="tip" title="Tolerancia a corrupción">
+Si una línea está corrupta (crash a mitad de escritura), `json.loads` falla y se salta. Las demás líneas se cargan normalmente. Esto es una ventaja de JSONL sobre un archivo JSON monolítico — una línea corrupta no destruye todo el archivo.
+</Callout>
+
+## Encontrar la Última Sesión
+
+```python
+def get_latest_session_id(phone: str) -> str | None:
+    """Find the most recent session for a phone number."""
+    safe_phone = phone.replace("+", "").replace(" ", "")
+    if not SESSIONS_DIR.exists():
+        return None
+
+    # Buscar archivos que matcheen el phone
+    pattern = f"{safe_phone}_*.jsonl"
+    files = sorted(
+        SESSIONS_DIR.glob(pattern),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        return None
+
+    # Extraer session_id del filename
+    name = files[0].stem  # "5491100000_a1b2c3d4"
+    return name.split("_", 1)[1]  # "a1b2c3d4"
+```
+
+## Task Memory: 3 Tools para el Agente
+
+El agente tiene 3 herramientas especiales para gestionar su propio plan:
+
+```python
+# app/agent/task_memory.py
+def register_task_memory_tools(
+    registry: SkillRegistry,
+    session_getter: Callable,
+):
+    """Register task memory tools with a session getter closure."""
+
+    async def get_task_plan() -> str:
+        """Obtener el plan actual."""
+        session = session_getter()
+        return session.task_plan or "(sin plan)"
+
+    async def create_task_plan(plan: str) -> str:
+        """Crear o reemplazar el plan de tareas."""
+        session = session_getter()
+        session.task_plan = plan
+        items = plan.count("[ ]") + plan.count("[x]")
+        return f"Plan creado con {items} tareas."
+
+    async def update_task_status(
+        task_index: int, done: bool = True
+    ) -> str:
+        """Marcar una tarea como completada o pendiente."""
+        session = session_getter()
+        lines = session.task_plan.split("\n")
+
+        # 1-based index
+        checkbox_lines = [
+            (i, l) for i, l in enumerate(lines)
+            if "[ ]" in l or "[x]" in l
+        ]
+        if task_index < 1 or task_index > len(checkbox_lines):
+            return f"Índice inválido: {task_index}"
+
+        idx, line = checkbox_lines[task_index - 1]
+        if done:
+            lines[idx] = line.replace("[ ]", "[x]")
+        else:
+            lines[idx] = line.replace("[x]", "[ ]")
+
+        session.task_plan = "\n".join(lines)
+        return session.task_plan
+
+    # Registrar las 3 tools
+    registry.register_tool("get_task_plan", get_task_plan, ...)
+    registry.register_tool("create_task_plan", create_task_plan, ...)
+    registry.register_tool("update_task_status", update_task_status, ...)
+```
+
+<Callout variant="warning" title="session_getter lambda">
+Las tools usan un `session_getter` (lambda) en vez de recibir la sesión directamente. Esto es porque las tools se registran una vez pero la sesión puede cambiar de estado durante la ejecución. El lambda siempre obtiene la referencia actual.
+</Callout>
+
+## Registry Copy per Session
+
+Para evitar colisiones entre sesiones concurrentes, cada sesión agéntica recibe una copia del registry de skills:
+
+```python
+# app/agent/loop.py
+def _register_session_tools(session, skill_registry, wa_client):
+    # Crear copia shallow del registry
+    session_registry = SkillRegistry(...)
+    session_registry._tools = dict(skill_registry._tools)
+
+    # Registrar tools de sesión en la copia
+    register_task_memory_tools(
+        session_registry,
+        lambda: session  # Closure sobre esta sesión
+    )
+
+    return session_registry
+```
+
+<Concept title="¿Por qué copiar el registry?">
+Si dos usuarios corren sesiones agénticas simultáneamente, ambos agregarían task_memory tools al mismo registry global. Las closures se pisarían entre sí — el agente de un usuario accedería a la sesión de otro. La copia shallow resuelve esto: cada sesión tiene sus propias tools de sesión.
+</Concept>
+
+## Puente a Conversación
+
+Al terminar, el resultado del agente se inyecta en el historial de conversación para contexto futuro:
+
+```python
+# Al final de run_agent_session
+# Bridge: guardar resultado en el historial de conversación
+await repository.save_message(
+    conv_id=conv_id,
+    role="assistant",
+    content=f"[Sesión agéntica completada] {final_summary[:500]}",
+)
+```
+
+<Quiz
+  question="¿Por qué se usa JSONL en vez de JSON para persistir sesiones?"
+  options={[
+    "Porque JSONL es más compacto",
+    "Porque JSONL permite append atómico — no necesita leer/reescribir todo el archivo",
+    "Porque JSON no soporta listas",
+    "Porque JSONL es más rápido de parsear"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si una línea del JSONL está corrupta?"
+  options={[
+    "El archivo entero falla al cargar",
+    "Se detiene la carga y se pierde el resto",
+    "Se salta la línea corrupta y se cargan las demás normalmente",
+    "Se intenta reparar automáticamente"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué cada sesión agéntica tiene una copia del SkillRegistry?"
+  options={[
+    "Para mejorar el rendimiento",
+    "Para evitar que sesiones concurrentes pisen las closures de task_memory tools de otras sesiones",
+    "Porque el registry original es read-only",
+    "Para tener más tools disponibles"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos la detección de loops en detalle y el circuit breaker.

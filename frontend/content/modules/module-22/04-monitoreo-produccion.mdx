@@ -1,0 +1,254 @@
+---
+title: "Monitoreo en Producción"
+description: "Langfuse para traces y scores, alerting en guardrails, retención de datos, y el loop de mejora continua"
+xpReward: 150
+---
+
+## Observabilidad para AI
+
+En una app tradicional, monitoreo = métricas de requests + logs. En una app de AI, necesitás más:
+
+- **Traces**: qué pasó en cada interacción (classify -> tools -> LLM -> response)
+- **Scores**: calidad de cada respuesta (guardrails, latencia, user feedback)
+- **Costs**: cuántos tokens se consumen y en qué
+- **Trends**: la calidad mejora o se degrada con el tiempo?
+
+<Concept title="Langfuse">
+Langfuse es una plataforma open-source de observabilidad para LLM. Captura traces (cadenas de llamadas a LLM), scores (métricas de calidad), y permite análisis de prompts, costos y latencia. Es el "Datadog para AI".
+</Concept>
+
+## Traces en Langfuse
+
+Cada mensaje procesado genera un trace completo:
+
+```python
+# app/tracing/recorder.py (simplificado)
+
+class TraceRecorder:
+    def __init__(self, langfuse_client: Langfuse):
+        self._lf = langfuse_client
+
+    async def start_trace(self, trace_id: str, name: str, metadata: dict):
+        """Iniciar un trace para un mensaje."""
+        self._lf.trace(
+            id=trace_id,
+            name=name,
+            metadata=metadata,
+        )
+
+    async def start_span(self, trace_id: str, name: str, **kwargs):
+        """Crear un span dentro del trace."""
+        return self._lf.span(
+            trace_id=trace_id,
+            name=name,
+            **kwargs,
+        )
+
+    async def score(self, trace_id: str, name: str, value: float):
+        """Agregar un score al trace."""
+        self._lf.create_score(
+            trace_id=trace_id,
+            name=name,
+            value=value,
+        )
+```
+
+### Anatomía de un Trace
+
+```
+Trace: "handle_message_abc123"
+  │
+  ├── Span: "phase_a" (120ms)
+  │   ├── Generation: "embed_query" (80ms, 0 output tokens)
+  │   ├── Span: "save_message" (15ms)
+  │   └── Span: "load_daily_logs" (25ms)
+  │
+  ├── Span: "phase_b" (90ms)
+  │   ├── Span: "search_memories" (85ms)
+  │   ├── Span: "search_notes" (60ms)
+  │   └── Span: "get_summary" (40ms)
+  │
+  ├── Generation: "classify_intent" (150ms, 50 tokens)
+  │
+  ├── Span: "phase_d" (1200ms)
+  │   └── Generation: "llm_response" (1100ms, 200 tokens)
+  │
+  ├── Span: "guardrails" (30ms)
+  │   ├── Score: "guardrail_pass" = 1.0
+  │   └── Score: "guardrail_language_match" = 1.0
+  │
+  └── Score: "total_latency_ms" = 1590
+```
+
+## Scores: Métricas de Calidad
+
+Los scores se registran automáticamente después de cada respuesta:
+
+```python
+# En el flujo principal (router.py)
+
+# Guardrail scores
+report = await run_guardrails(response_text, user_lang, trace_ctx)
+await recorder.score(trace_id, "guardrail_pass", 1.0 if report.passed else 0.0)
+
+for check in report.results:
+    await recorder.score(trace_id, f"guardrail_{check.name}", check.score)
+
+# Latency score
+elapsed_ms = (time.perf_counter() - start) * 1000
+await recorder.score(trace_id, "latency_ms", elapsed_ms)
+
+# Token usage
+await recorder.score(trace_id, "tokens_used", response.eval_count or 0)
+```
+
+## Dashboards en Langfuse
+
+Langfuse genera dashboards automáticos con los scores:
+
+| Dashboard | Muestra | Alerta si |
+|-----------|---------|-----------|
+| Guardrail Pass Rate | % de respuestas que pasan guardrails | < 70% (24h window) |
+| Latency P50/P95 | Distribución de latencia | P95 > 5s |
+| Token Usage | Tokens por interacción | Promedio > 500 |
+| Trace Volume | Mensajes procesados por hora | Cae a 0 (app caída?) |
+
+<Callout variant="warning" title="Alerting en guardrail degradation">
+La regla built-in `guardrail_degraded` ya notifica al admin. Pero Langfuse da contexto: podés ver QUÉ guardrails fallan, en qué tipo de mensajes, y desde cuándo. La regla dice "hay un problema"; Langfuse dice "este es el problema".
+</Callout>
+
+## Retención de Datos
+
+Los traces ocupan espacio. `trace_retention_days` limpia traces viejos:
+
+```python
+# app/main.py (scheduler job)
+async def cleanup_old_traces(repository: Repository, settings: Settings):
+    """Borrar traces más viejos que retention_days."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.trace_retention_days)
+    deleted = await repository.delete_traces_before(cutoff)
+    if deleted:
+        logger.info("Cleaned up %d old traces", deleted)
+
+# En el scheduler
+scheduler.add_job(
+    cleanup_old_traces,
+    "cron",
+    hour=3,       # A las 3 AM
+    minute=0,
+    kwargs={"repository": repo, "settings": settings},
+)
+```
+
+```bash
+# .env
+TRACE_RETENTION_DAYS=30    # Mantener traces por 30 días
+```
+
+<Callout variant="tip" title="Exportar antes de borrar">
+Si necesitás análisis histórico, exportá los traces a un data warehouse antes de que el cleanup los borre. Langfuse tiene export API para esto.
+</Callout>
+
+## Self-Healing con Automation Rules
+
+Las reglas de automatización cierran el loop de monitoreo:
+
+```
+Langfuse detecta    →  Automation rule    →  Acción
+guardrail < 70%         guardrail_degraded    notify_admin
+
+Langfuse muestra    →  Automation rule    →  Acción
+10+ sin embedding       embeddings_desync     backfill_embeddings
+
+Langfuse muestra    →  Automation rule    →  Acción
+DB growing              db_large              vacuum_db
+```
+
+## El Loop de Mejora Continua
+
+```
+┌─────────────────────────────────────────────────┐
+│                                                  │
+│  Producción                                      │
+│  ├── Traces → Langfuse → Dashboards             │
+│  ├── Scores → Alertas → Admin investiga         │
+│  └── Rules → Self-healing automático            │
+│       │                                          │
+│       ▼                                          │
+│  Análisis                                        │
+│  ├── "El guardrail de PII falla en 20% de msgs" │
+│  ├── "classify_intent confunde weather con news" │
+│  └── "Latencia P95 subió a 4s"                  │
+│       │                                          │
+│       ▼                                          │
+│  Mejora                                          │
+│  ├── Ajustar prompt de classify_intent           │
+│  ├── Agregar caso al dataset de eval             │
+│  └── Optimizar query lenta en search             │
+│       │                                          │
+│       ▼                                          │
+│  CI/CD                                           │
+│  ├── make eval → accuracy mejoró? ✅             │
+│  ├── make check → tests pasan? ✅                │
+│  └── Deploy → volver a monitorear               │
+│       │                                          │
+│       └──────── loop ────────────────────────────┘
+```
+
+<Concept title="Observability-Driven Development">
+El flujo no es lineal (develop → deploy → done). Es cíclico: monitorear → analizar → mejorar → evaluar → deployar → monitorear. Cada iteración mejora la calidad del sistema. Langfuse es el hub de este ciclo.
+</Concept>
+
+## Configuración de Langfuse
+
+```bash
+# .env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com  # o self-hosted
+TRACE_RETENTION_DAYS=30
+```
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_host: str = "https://cloud.langfuse.com"
+    trace_retention_days: int = 30
+```
+
+<Quiz
+  question="¿Qué información captura un trace de Langfuse que un log tradicional no?"
+  options={[
+    "El timestamp del request",
+    "La cadena completa de operaciones (classify → tools → LLM), con latencia y tokens por cada paso",
+    "El status code HTTP",
+    "El IP del usuario"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el flujo correcto del loop de mejora continua?"
+  options={[
+    "Develop → Deploy → Done",
+    "Test → Deploy → Monitor",
+    "Monitor → Analyze → Improve → Eval → Deploy → Monitor (cíclico)",
+    "Code → Push → Pray"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué se configura trace_retention_days para limpiar traces viejos?"
+  options={[
+    "Porque Langfuse tiene un límite de 100 traces",
+    "Para cumplir con regulaciones de privacidad",
+    "Porque los traces ocupan espacio y acumulados sin límite degradan el rendimiento de la base de datos",
+    "Porque los traces viejos contienen datos incorrectos"
+  ]}
+  correct={2}
+/>
+
+Has completado el módulo de Production Deployment y CI/CD. Con Docker, health checks, CI pipeline, evaluaciones automáticas y monitoreo con Langfuse, tu asistente de AI está listo para producción.

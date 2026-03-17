@@ -1,0 +1,287 @@
+---
+title: "Registry Pattern"
+description: "Registro dinámico de skills con SkillRegistry para discovery y ejecución"
+xpReward: 75
+---
+
+## El Problema: Descubrir Herramientas
+
+LocalForge tiene 60+ herramientas de 15+ skills distintos, más herramientas dinámicas de MCP servers. El sistema necesita saber qué herramientas existen, cómo llamarlas, y qué schemas enviar al LLM.
+
+<Callout variant="info" title="Registry Pattern">
+Un **registro central** donde cada skill se inscribe al arrancar. Cualquier parte del sistema puede consultar el registro para descubrir herramientas disponibles, obtener schemas, o ejecutar una herramienta por nombre.
+</Callout>
+
+## SkillRegistry: El Código Real
+
+El registro en `app/skills/registry.py` mantiene tres diccionarios internos:
+
+```python
+# app/skills/registry.py
+class SkillRegistry:
+    def __init__(self, skills_dir: str = "data/skills"):
+        self._skills_dir = skills_dir
+        self._tools: dict[str, ToolDefinition] = {}    # name -> tool completo
+        self._skills: dict[str, SkillMetadata] = {}     # name -> metadata del skill
+        self._loaded_instructions: set[str] = set()     # skills ya inyectados
+```
+
+<Concept title="Tres diccionarios, tres responsabilidades">
+`_tools` mapea nombre de tool a su `ToolDefinition` (handler + schema). `_skills` mapea nombre de skill a su `SkillMetadata` (descripción + instrucciones). `_loaded_instructions` trackea qué skills ya inyectaron sus instrucciones al LLM, para no repetirlas.
+</Concept>
+
+## Registro de Tools
+
+La función `register_tool` es la API principal para agregar herramientas:
+
+```python
+def register_tool(
+    self,
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+    handler: Callable[..., Awaitable[str]],
+    skill_name: str | None = None,
+) -> None:
+    self._tools[name] = ToolDefinition(
+        name=name,
+        description=description,
+        parameters=parameters,
+        handler=handler,
+        skill_name=skill_name,
+    )
+    logger.info(
+        "Registered tool: %s (skill: %s)", name, skill_name or "builtin"
+    )
+```
+
+Cada handler de skill llama a esta función durante el startup. Ejemplo real del calculator:
+
+```python
+# app/skills/tools/calculator_tools.py
+def register(registry: SkillRegistry) -> None:
+    async def calculate(expression: str) -> str:
+        try:
+            result = safe_eval(expression)
+            if isinstance(result, float) and result == int(result):
+                return str(int(result))
+            return str(result)
+        except (ValueError, SyntaxError, TypeError, ZeroDivisionError) as e:
+            return f"Error: {e}"
+
+    registry.register_tool(
+        name="calculate",
+        description="Evaluate a mathematical expression safely",
+        parameters={
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Math expression to evaluate "
+                    "(e.g. '2 + 3 * 4', 'sqrt(16)', 'sin(pi/2)')",
+                },
+            },
+            "required": ["expression"],
+        },
+        handler=calculate,
+        skill_name="calculator",
+    )
+```
+
+## Generación de Schemas para Ollama
+
+El registry genera los schemas en el formato que Ollama espera:
+
+```python
+def get_ollama_tools(self) -> list[dict]:
+    """Return tool schemas in Ollama's expected format."""
+    tools = []
+    for tool in self._tools.values():
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            },
+        })
+    return tools
+```
+
+Este formato sigue la convención de OpenAI function calling que Ollama adoptó:
+
+```json
+{
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": "Evaluate a mathematical expression safely",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Math expression to evaluate"
+                }
+            },
+            "required": ["expression"]
+        }
+    }
+}
+```
+
+## Ejecución de Tools
+
+Cuando el LLM genera un `ToolCall`, el registry lo ejecuta con manejo robusto de errores:
+
+```python
+async def execute_tool(self, tool_call: ToolCall) -> ToolResult:
+    tool = self._tools.get(tool_call.name)
+    if not tool:
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=f"Unknown tool: {tool_call.name}",
+            success=False,
+        )
+    try:
+        result = await tool.handler(**tool_call.arguments)
+        return ToolResult(tool_name=tool_call.name, content=result)
+    except TypeError as e:
+        # Schema mismatch: ayudar al LLM a autocorregirse
+        error_msg = str(e)
+        if "unexpected keyword argument" in error_msg:
+            expected = list(tool.parameters.get("properties", {}).keys())
+            required = tool.parameters.get("required", [])
+            error_msg = (
+                f"Tool error: {e}. "
+                f"Expected parameters: {expected}. Required: {required}. "
+                f"You provided: {list(tool_call.arguments.keys())}."
+            )
+        return ToolResult(
+            tool_name=tool_call.name, content=error_msg, success=False,
+        )
+    except Exception as e:
+        logger.exception("Tool %s execution failed", tool_call.name)
+        return ToolResult(
+            tool_name=tool_call.name,
+            content=f"Tool error: {e}",
+            success=False,
+        )
+```
+
+<Callout variant="warning" title="Self-correction del LLM">
+Cuando el LLM envía parámetros incorrectos (TypeError), el error message incluye los parámetros esperados y los que se recibieron. En la siguiente iteración del tool loop, el LLM puede corregir su llamada automáticamente.
+</Callout>
+
+## Lazy-Loading de Instrucciones
+
+Las instrucciones del SKILL.md se inyectan al LLM solo la primera vez que se usa un tool de ese skill:
+
+```python
+def get_skill_instructions(self, tool_name: str) -> str | None:
+    """Lazy-load skill instructions the first time a tool is used."""
+    tool = self._tools.get(tool_name)
+    if not tool or not tool.skill_name:
+        return None
+
+    skill = self._skills.get(tool.skill_name)
+    if not skill or not skill.instructions:
+        return None
+
+    if tool.skill_name in self._loaded_instructions:
+        return None  # Ya se inyectaron
+
+    self._loaded_instructions.add(tool.skill_name)
+    return skill.instructions
+```
+
+<Concept title="Lazy-loading para ahorrar tokens">
+Si se inyectaran las instrucciones de todos los skills en cada llamada, consumirían muchos tokens. Con lazy-loading, solo se inyectan cuando el LLM usa un tool por primera vez. Después se marcan como cargadas y no se repiten.
+</Concept>
+
+## Hot-Reload de Skills
+
+El registry soporta recargar skills sin reiniciar el servidor:
+
+```python
+def reload(self) -> int:
+    """Re-scan skills directory and refresh SKILL.md metadata."""
+    self._loaded_instructions.clear()
+    new_skills = scan_skills_directory(self._skills_dir)
+    new_skill_names = {skill.name for skill in new_skills}
+
+    # Remove stale skills
+    removed = [name for name in self._skills if name not in new_skill_names]
+    for name in removed:
+        stale_tools = [t for t in self._tools if self._tools[t].skill_name == name]
+        for tool_name in stale_tools:
+            del self._tools[tool_name]
+        del self._skills[name]
+
+    # Add/update skills
+    for skill in new_skills:
+        self._skills[skill.name] = skill
+
+    # Invalidate executor cache
+    from app.skills.executor import reset_tools_cache
+    reset_tools_cache()
+
+    return len(new_skills)
+```
+
+<Callout variant="tip" title="Limitación del hot-reload">
+El hot-reload actualiza metadata y instrucciones (SKILL.md), pero NO re-registra handlers Python. Para cambiar la lógica de un tool, necesitás reiniciar el proceso. Pero para editar instrucciones del LLM, basta con modificar el SKILL.md y recargar.
+</Callout>
+
+## Ventajas del Registry Pattern
+
+<Step number={1} title="Extensibilidad">
+Agregar un skill nuevo = crear SKILL.md + handler Python + registrarlo. Cero cambios en el core.
+</Step>
+
+<Step number={2} title="Discovery centralizado">
+El executor puede preguntar "qué tools existen" sin importar cuántos skills hay.
+</Step>
+
+<Step number={3} title="Schemas automáticos">
+Los schemas para Ollama se generan desde el registro con `get_ollama_tools()`.
+</Step>
+
+<Step number={4} title="Hot-reload">
+MCP servers y skill edits se reflejan sin reiniciar la app.
+</Step>
+
+<Quiz
+  question="¿Qué resuelve el Registry Pattern en LocalForge?"
+  options={[
+    "La comunicación con WhatsApp",
+    "El discovery y organización centralizada de todas las herramientas disponibles",
+    "La autenticación de usuarios",
+    "El almacenamiento de datos en SQLite"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se registran los skills?"
+  options={[
+    "Cuando el usuario envía un mensaje",
+    "Durante el lifespan startup de FastAPI",
+    "Al compilar el código",
+    "Cuando el LLM los necesita por primera vez"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando el LLM envía parámetros incorrectos a un tool?"
+  options={[
+    "El tool falla silenciosamente",
+    "Se retorna un ToolResult con success=False incluyendo los parámetros esperados para self-correction",
+    "Se reinicia el tool loop desde cero",
+    "Se ignora el tool call y se genera texto directamente"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo se parsean los archivos SKILL.md con regex.

@@ -1,0 +1,219 @@
+---
+title: "Integración Completa"
+description: "Cómo se conectan plataformas, MCP, skills y el router en un sistema unificado"
+xpReward: 125
+---
+
+## El Big Picture: Todo Conectado
+
+```
+┌─────────────┐  ┌─────────────┐
+│  WhatsApp   │  │  Telegram   │
+│  Webhook    │  │  Webhook    │
+└──────┬──────┘  └──────┬──────┘
+       │                │
+       ▼                ▼
+┌──────────────────────────────┐
+│     IncomingMessage          │
+│  + PlatformClient Protocol   │
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│   process_message_generic()  │
+│   (shared processing core)   │
+├──────────────────────────────┤
+│  classify_intent → select_tools  │
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│      Tools Map (merged)      │
+│  ┌─────────┐  ┌───────────┐ │
+│  │ Skills  │  │ MCP Tools │ │
+│  │ (local) │  │ (servers) │ │
+│  └─────────┘  └───────────┘ │
+└──────────────────────────────┘
+```
+
+## El Lifecycle Completo
+
+<Step number={1} title="Startup: Inicializar todo">
+```python
+# app/main.py — lifespan
+async with lifespan(app):
+    # 1. Database + Repository
+    conn, vec_available = await init_db(db_path)
+    repository = Repository(conn)
+
+    # 2. Clients por plataforma
+    wa_client = WhatsAppClient(http, settings)
+    if settings.telegram_enabled:
+        tg_client = TelegramClient(http, settings.telegram_bot_token)
+
+    # 3. Ollama + Skills
+    ollama = OllamaClient(http, settings.ollama_base_url, settings.ollama_model)
+    skill_registry = SkillRegistry()
+    load_builtin_skills(skill_registry)
+
+    # 4. MCP: conectar todos los servers habilitados
+    mcp_manager = McpManager(settings.mcp_config_path)
+    await mcp_manager.initialize()  # Conectar servers, cargar tools
+
+    # 5. Merge tools
+    merge_mcp_tools(skill_registry, mcp_manager)
+
+    # 6. Scheduler + webhooks
+    set_scheduler(scheduler, whatsapp=wa_client, telegram=tg_client)
+    if settings.telegram_webhook_url:
+        await tg_client.set_webhook(settings.telegram_webhook_url)
+```
+</Step>
+
+<Step number={2} title="Webhook: Mensaje entrante">
+```python
+# WhatsApp: POST /webhook
+messages = extract_messages(payload)  # Parse WA format
+for msg in messages:
+    background_tasks.add_task(
+        process_message,  # Thin wrapper
+        msg, wa_client, ...
+    )
+
+# Telegram: POST /telegram/webhook
+messages = extract_telegram_messages(payload)  # Parse TG format
+for msg in messages:
+    background_tasks.add_task(
+        process_message_generic,
+        msg, tg_client, ...  # Same function, different client
+    )
+```
+</Step>
+
+<Step number={3} title="Processing: Lógica compartida">
+```python
+async def process_message_generic(msg, platform_client, ...):
+    # Dedup, rate limit, typing → identical for all platforms
+    await platform_client.send_typing_indicator(msg.user_id)
+
+    # Classify → Tools → LLM → Guardrails
+    categories = await classify_intent(msg.text, ollama)
+    tools = select_tools(categories, merged_tools_map)
+    reply = await execute_tool_loop(messages, ollama, tools)
+    reply = await run_guardrails(reply, context)
+
+    # Format para la plataforma
+    formatted = platform_client.format_text(reply)
+    await platform_client.send_message(msg.user_id, formatted)
+```
+</Step>
+
+## Routing de Reminders por Plataforma
+
+```python
+async def _send_reminder(phone_number: str, text: str):
+    """Route reminder to correct platform by prefix."""
+    if phone_number.startswith("tg_"):
+        client = _platform_clients.get("telegram")
+    else:
+        client = _platform_clients.get("whatsapp")
+
+    if client:
+        formatted = client.format_text(text)
+        await client.send_message(phone_number, formatted)
+```
+
+## Tool Execution: Skills + MCP Unified
+
+```python
+# app/skills/executor.py
+async def _execute_single_tool(tool_call, skill_registry, mcp_manager):
+    """Execute a tool, routing to the right system."""
+    # Primero intentar MCP
+    if mcp_manager and mcp_manager.has_tool(tool_call.name):
+        return await mcp_manager.execute_tool(tool_call)
+
+    # Fallback a skills locales
+    return await skill_registry.execute_tool(tool_call)
+```
+
+## Dynamic Categories del Router
+
+Cuando se conecta un nuevo MCP server, sus tools se agregan al router de intent:
+
+```python
+def _update_dynamic_categories(self, server_name: str):
+    """Add MCP tools to router categories."""
+    from app.skills.router import TOOL_CATEGORIES
+
+    tool_names = self._tools_by_server.get(server_name, [])
+    if not tool_names:
+        return
+
+    # Agregar bajo categoría del server
+    category = server_name.replace("-", "_")
+    TOOL_CATEGORIES[category] = tool_names
+```
+
+<Callout variant="tip" title="El router aprende nuevas categorías">
+Si conectás un MCP server "github" con tools como `create_issue`, `list_prs`, etc., el router automáticamente agrega la categoría "github" que se puede clasificar. No necesitás editar el código del router.
+</Callout>
+
+## Resumen del Módulo
+
+| Capa | Componente | Responsabilidad |
+|------|-----------|-----------------|
+| **Plataforma** | PlatformClient Protocol | Abstracción de WA/TG |
+| **Parsing** | extract_messages/extract_telegram_messages | Payload → IncomingMessage |
+| **Processing** | process_message_generic | Lógica compartida |
+| **Formatting** | format_text (markdown_to_whatsapp/html) | Output por plataforma |
+| **Tools locales** | SkillRegistry | Skills en SKILL.md |
+| **Tools externas** | McpManager | Servers MCP (stdio/HTTP) |
+| **Merge** | _get_cached_tools_map | Skills + MCP unified |
+| **Router** | classify_intent + select_tools | Intent → tools relevantes |
+| **Hot-reload** | hot_add/remove_server | Config en runtime |
+
+## Agregar una Nueva Plataforma
+
+Para soportar Discord, solo necesitarías:
+
+1. Crear `app/discord/client.py` implementando `PlatformClient`
+2. Crear `app/discord/parser.py` con `extract_discord_messages()`
+3. Crear `app/discord/router.py` con el webhook endpoint
+4. Registrar el client en el lifespan
+5. Agregar prefijo `dc_` para user IDs
+
+Zero cambios en el core de procesamiento.
+
+<Quiz
+  question="¿Qué necesitarías cambiar en el core de procesamiento para agregar Discord?"
+  options={[
+    "Reescribir process_message_generic",
+    "Nada — solo agregar client, parser, y webhook que implementen el Protocol",
+    "Cambiar la DB para soportar Discord",
+    "Reescribir el tool loop"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo se distingue en runtime si una tool es de un skill local o de MCP?"
+  options={[
+    "Por un flag en la tool definition",
+    "Se intenta MCP primero (mcp_manager.has_tool), si no está se usa skill_registry",
+    "Por el nombre de la tool",
+    "No se distingue"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa cuando se conecta un nuevo MCP server en runtime?"
+  options={[
+    "Solo se cargan las tools",
+    "Se conecta el server, se cargan sus tools, se invalida el cache del executor, se agregan categorías al router, y se persiste la config a disco",
+    "Se reinicia la app",
+    "Se agrega solo al config sin conectar"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo Multi-Platform & MCP. Ahora entendés cómo LocalForge abstrae plataformas, integra tools externas via MCP, y permite extensibilidad sin modificar el core.

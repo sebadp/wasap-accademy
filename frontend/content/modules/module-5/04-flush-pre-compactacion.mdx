@@ -1,0 +1,283 @@
+---
+title: "Flush Pre-Compactación"
+description: "Extraer hechos importantes de mensajes antes de borrarlos"
+xpReward: 75
+---
+
+## No Perder Información
+
+Cuando el Summarizer borra mensajes viejos para liberar contexto, **podría perderse información importante**. El flush pre-compactación previene esto extrayendo hechos y eventos antes de que los mensajes desaparezcan.
+
+<Callout variant="warning" title="Prevención de pérdida de datos">
+Sin flush, si el usuario dijo "Me mudé a Barcelona" en un mensaje viejo que se borra, el asistente olvida ese hecho. Con flush, se extrae como memoria semántica permanente antes de borrar.
+</Callout>
+
+## El Flujo Completo
+
+<Step number={1} title="Threshold alcanzado">
+La conversación supera el límite de mensajes (configurable en `conversation_max_messages`, default 20).
+</Step>
+
+<Step number={2} title="Flush: extraer facts y events">
+El LLM analiza los mensajes que van a ser borrados y extrae hechos relevantes (facts) y eventos notables (events).
+</Step>
+
+<Step number={3} title="Crear memorias con dedup">
+Cada hecho se compara con memorias existentes (difflib ratio > 0.8). Solo se guardan los nuevos.
+</Step>
+
+<Step number={4} title="Indexar embeddings">
+Las nuevas memorias se indexan vectorialmente para búsqueda semántica.
+</Step>
+
+<Step number={5} title="Registrar eventos en daily log">
+Los eventos se escriben en el daily log del día como memoria episódica.
+</Step>
+
+<Step number={6} title="Summarize + borrar mensajes">
+Se genera un resumen de los mensajes viejos y se eliminan de la tabla.
+</Step>
+
+<Step number={7} title="Consolidar">
+El consolidador revisa si las nuevas memorias duplican las existentes.
+</Step>
+
+## El Prompt de Extracción
+
+El prompt real en `app/conversation/summarizer.py` le pide al LLM dos tipos de extracción:
+
+```python
+FLUSH_PROMPT = (
+    "Review this conversation fragment. Extract ONLY "
+    "what's worth remembering long-term.\n\n"
+    "Existing memories (do NOT repeat these):\n"
+    "{existing_memories}\n\n"
+    "Conversation:\n{conversation}\n\n"
+    'Respond in JSON only:\n'
+    '{{"facts": ["new stable fact 1"], '
+    '"events": ["notable event 1"]}}\n'
+    'If nothing new, respond: {{"facts": [], "events": []}}'
+)
+```
+
+<Concept title="Facts vs Events">
+**Facts** son hechos estables sobre el usuario que se convierten en memorias semánticas: "Trabaja en fintech", "Prefiere Python". **Events** son sucesos puntuales que se registran en el daily log: "Discutió la migración de API", "Completó el deploy a producción".
+</Concept>
+
+El prompt incluye las memorias existentes para que el LLM no extraiga duplicados. Esto es una primera línea de defensa (además del dedup por difflib).
+
+## La Función flush_to_memory
+
+El código real de `app/conversation/summarizer.py`:
+
+```python
+async def flush_to_memory(
+    old_messages: list[ChatMessage],
+    repository: Repository,
+    ollama_client: OllamaClient,
+    daily_log: DailyLog,
+    memory_file: MemoryFile,
+    embed_model: str | None = None,
+) -> int:
+    """Extract facts and events from messages before deletion.
+    Returns the number of new facts added."""
+
+    existing_memories = await repository.get_active_memories()
+
+    # Formatear conversación para el prompt
+    conversation_lines = []
+    for msg in old_messages:
+        conversation_lines.append(f"{msg.role}: {msg.content}")
+    conversation_text = "\n".join(conversation_lines)
+
+    # Formatear memorias existentes
+    if existing_memories:
+        memories_text = "\n".join(f"- {m}" for m in existing_memories)
+    else:
+        memories_text = "(none)"
+
+    prompt = FLUSH_PROMPT.format(
+        existing_memories=memories_text,
+        conversation=conversation_text,
+    )
+    messages = [ChatMessage(role="user", content=prompt)]
+    response = await ollama_client.chat(messages, think=False)
+```
+
+## Parseo de la Respuesta JSON
+
+El LLM responde con JSON, pero a veces lo envuelve en code fences. El parser maneja ambos casos:
+
+```python
+    # Parse JSON response
+    text = response.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+    data = json.loads(text)
+
+    facts = data.get("facts", [])
+    events = data.get("events", [])
+```
+
+<Callout variant="info" title="Manejo de code fences">
+qwen3 a veces responde con ` ```json ... ``` ` en lugar de JSON plano. El parser elimina las líneas que empiezan con ` ``` ` para obtener el JSON limpio. Si aun así falla el parse, se loguea un warning y se retorna 0 facts.
+</Callout>
+
+## Dedup Incremental Antes de Guardar
+
+Cada hecho nuevo se compara contra las memorias existentes **Y** contra los hechos recién agregados:
+
+```python
+    added_count = 0
+
+    for fact in facts:
+        if not isinstance(fact, str) or not fact.strip():
+            continue
+        if _is_duplicate(fact, existing_memories):
+            logger.debug("Skipping duplicate fact: %s", fact[:80])
+            continue
+
+        memory_id = await repository.add_memory(fact.strip())
+        existing_memories.append(fact.strip())  # Para check contra las nuevas
+        added_count += 1
+
+        # Embed the new fact (best-effort)
+        if embed_model:
+            try:
+                await embed_memory(
+                    memory_id, fact.strip(),
+                    repository, ollama_client, embed_model,
+                )
+            except Exception:
+                logger.warning("Failed to embed extracted fact %d", memory_id)
+```
+
+<Concept title="Dedup incremental">
+La línea `existing_memories.append(fact.strip())` es clave: cada hecho nuevo se agrega a la lista contra la que se comparan los siguientes. Esto evita duplicados tanto con el pasado como dentro del mismo batch de extracción.
+</Concept>
+
+## Eventos al Daily Log
+
+Los eventos extraídos se escriben en el daily log, no como memorias:
+
+```python
+    # Save events to daily log
+    for event in events:
+        if not isinstance(event, str) or not event.strip():
+            continue
+        await daily_log.append(event.strip())
+        logger.info("Auto-logged event: %s", event[:80])
+
+    # Sync MEMORY.md if facts were added
+    if added_count > 0:
+        memories = await repository.list_memories()
+        await memory_file.sync(memories)
+
+    return added_count
+```
+
+## Integración con maybe_summarize
+
+El flush se ejecuta **antes** de summarizar y borrar mensajes:
+
+```python
+async def maybe_summarize(
+    conversation_id, repository, ollama_client,
+    threshold, max_messages, daily_log=None,
+    memory_file=None, flush_enabled=False, embed_model=None,
+) -> None:
+    count = await repository.get_message_count(conversation_id)
+    if count <= threshold:
+        return
+
+    all_messages = await repository.get_recent_messages(conversation_id, count)
+    old_messages = all_messages[: len(all_messages) - max_messages]
+
+    # Pre-compaction flush: ANTES de summarizar
+    new_facts_count = 0
+    if flush_enabled and daily_log and memory_file:
+        new_facts_count = await flush_to_memory(
+            old_messages, repository, ollama_client,
+            daily_log, memory_file, embed_model=embed_model,
+        )
+
+    # DESPUÉS: summarizar y borrar mensajes
+    summary = await ollama_client.chat(summary_messages, think=False)
+    await repository.save_summary(conversation_id, summary, count)
+    await repository.delete_old_messages(conversation_id, max_messages)
+
+    # Post-flush: consolidar si se agregaron facts
+    if new_facts_count > 0:
+        await consolidate_memories(repository, ollama_client, memory_file)
+```
+
+## Configuración
+
+```python
+class Settings(BaseSettings):
+    memory_flush_enabled: bool = True       # Activar/desactivar flush
+    conversation_max_messages: int = 20     # Threshold del summarizer
+    history_verbatim_count: int = 8         # Mensajes a mantener verbatim
+    memory_dir: str = "data/memory"         # Directorio de daily logs
+```
+
+<Callout variant="tip" title="Configurable via .env">
+Todo es configurable. En desarrollo podés desactivar el flush (`MEMORY_FLUSH_ENABLED=false`) para que no consuma recursos del LLM. El threshold se ajusta con `CONVERSATION_MAX_MESSAGES`.
+</Callout>
+
+## Tracing del Flush
+
+El flush registra spans en el sistema de tracing para observabilidad:
+
+```python
+trace = get_current_trace()
+if trace:
+    async with trace.span("memory:flush", kind="generation") as span:
+        span.set_input({
+            "message_count": len(old_messages),
+            "existing_memories": len(existing_memories),
+        })
+        response = await ollama_client.chat(messages, think=False)
+        span.set_output({
+            "response_length": len(response) if response else 0,
+        })
+```
+
+Esto permite ver en Langfuse cuánto tarda el flush, cuántos mensajes procesó, y si la respuesta fue válida.
+
+<Quiz
+  question="¿Qué hace el flush pre-compactación?"
+  options={[
+    "Comprimir los mensajes en formato ZIP para ahorrar espacio",
+    "Extraer hechos importantes de mensajes antes de borrarlos y guardarlos como memorias",
+    "Enviar los mensajes al usuario por email como backup",
+    "Mover los mensajes a otra tabla de archivo"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cómo evita el flush guardar memorias duplicadas?"
+  options={[
+    "Usa un hash MD5 de cada memoria",
+    "Compara cada hecho nuevo contra memorias existentes con difflib (ratio > 0.8)",
+    "Pide al LLM que verifique duplicados uno por uno",
+    "No los evita, el consolidador se encarga después"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es la diferencia entre facts y events en el flush?"
+  options={[
+    "No hay diferencia, ambos se guardan como memorias",
+    "Facts se guardan como memorias semánticas en SQLite, events se escriben en el daily log",
+    "Facts son del LLM, events son del usuario",
+    "Facts se envían por WhatsApp, events se guardan localmente"
+  ]}
+  correct={1}
+/>
+
+Has completado el módulo de Memory System. Ahora entendés el ciclo completo: crear memorias -> indexar embeddings -> inyectar al contexto -> flush pre-compactación -> consolidación por LLM.

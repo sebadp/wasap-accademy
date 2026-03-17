@@ -1,0 +1,256 @@
+---
+title: "Meta-Tools y Dynamic Tool Budget"
+description: "request_more_tools y distribucion proporcional de herramientas"
+xpReward: 100
+---
+
+## El Problema: Tools Insuficientes
+
+El router clasifica el mensaje y selecciona ~8 tools. Pero a veces el LLM necesita una herramienta que no fue seleccionada. En vez de fallar, puede **pedir mas tools** usando un meta-tool.
+
+<Callout variant="info" title="Meta-tool = herramienta que modifica herramientas">
+`request_more_tools` es una herramienta especial que le permite al LLM expandir su propio pool de herramientas durante una conversacion. No ejecuta logica de negocio -- modifica el entorno de ejecucion.
+</Callout>
+
+## request_more_tools: Schema Completo
+
+El schema se construye dinamicamente en `app/skills/router.py` e incluye dos modos de descubrimiento:
+
+```python
+REQUEST_MORE_TOOLS_NAME = "request_more_tools"
+
+def build_request_more_tools_schema(available_categories: list[str]) -> dict:
+    categories_str = ", ".join(sorted(available_categories))
+    return {
+        "type": "function",
+        "function": {
+            "name": REQUEST_MORE_TOOLS_NAME,
+            "description": (
+                "Request additional tools when the current set is insufficient. "
+                "Use 'query' to describe what you need in plain language, "
+                "or 'categories' to load all tools from a named category. "
+                f"Available categories: {categories_str}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Natural language description of the tool you need "
+                            "(e.g. 'save content to a project'). "
+                            "Preferred over categories when you know what "
+                            "you want to do but not the category name."
+                        ),
+                    },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": f"Category names to load from: {categories_str}",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of why these tools are needed",
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+```
+
+<Concept title="Dos modos de descubrimiento">
+**Modo 1 - Categories**: el LLM sabe que categoria necesita (e.g., `["projects"]`). Carga todas las herramientas de esa categoria. **Modo 2 - Query (Tool RAG)**: el LLM describe lo que necesita en lenguaje natural. Se hace busqueda semantica sobre embeddings de los schemas de herramientas.
+</Concept>
+
+## Ejecucion del Meta-tool en el Loop
+
+El meta-tool se maneja inline dentro de `execute_tool_loop`, sin pasar por seguridad:
+
+```python
+for i in meta_indices:
+    tc = response.tool_calls[i]
+    args = tc.get("function", {}).get("arguments", {})
+    requested_cats = args.get("categories", [])
+    query = args.get("query", "")
+    reason = args.get("reason", "")
+
+    existing_names = {t.get("function", {}).get("name") for t in tools}
+    added: list[str] = []
+
+    # Path 1: category-based
+    if requested_cats:
+        new_tools = select_tools(requested_cats, all_tools_map, max_tools=max_tools)
+        for tool_schema in new_tools:
+            name = tool_schema.get("function", {}).get("name")
+            if name and name not in existing_names:
+                tools.append(tool_schema)
+                existing_names.add(name)
+                added.append(name)
+
+    # Path 2: semantic search (Tool RAG)
+    if query and repository and embed_model:
+        query_emb = await ollama_client.embed([query], model=embed_model)
+        similar_names = await repository.search_similar_tools(
+            query_emb[0], top_k=5
+        )
+        for name in similar_names:
+            if name in all_tools_map and name not in existing_names:
+                tools.append(all_tools_map[name])
+                existing_names.add(name)
+                added.append(name)
+
+    # Feedback al LLM
+    if added:
+        confirmation = (
+            f"Loaded {len(added)} new tools: {', '.join(added)}. "
+            "These tools are now available."
+        )
+    else:
+        confirmation = "No new tools added (already available or unknown)"
+```
+
+<Callout variant="tip" title="Deduplicacion automatica">
+Los tools nuevos solo se agregan si no estan ya en el pool activo (`existing_names`). Esto previene duplicados cuando el LLM pide una categoria que ya tiene parcialmente cargada.
+</Callout>
+
+## Dynamic Tool Budget
+
+Con 60+ herramientas y un limite de ~8 por llamada, la distribucion proporcional es clave. La implementacion real en `app/skills/router.py`:
+
+```python
+def select_tools(
+    categories: list[str],
+    all_tools: dict[str, dict],
+    max_tools: int = 8,
+) -> list[dict]:
+    if not categories:
+        return []
+
+    # Filtrar categorias realmente registradas
+    active_categories = [c for c in categories if c in TOOL_CATEGORIES]
+    if not active_categories:
+        return []
+
+    selected: list[dict] = []
+    seen: set[str] = set()
+    per_cat = max(1, max_tools // len(active_categories))
+
+    for category in active_categories:
+        tool_names = TOOL_CATEGORIES.get(category, [])
+        cat_count = 0
+        for name in tool_names:
+            if name in seen:
+                continue
+            if name in all_tools:
+                selected.append(all_tools[name])
+                seen.add(name)
+                cat_count += 1
+            if cat_count >= per_cat:
+                break
+
+    return selected[:max_tools]
+```
+
+<Concept title="Distribucion proporcional">
+Si hay 3 categorias y budget de 8 tools: cada categoria recibe `max(1, 8 // 3) = 2` tools. El `set seen` evita que herramientas compartidas entre categorias se cuenten doble. La lista final se trunca a `max_tools`.
+</Concept>
+
+## Filtro de Categorias Fantasma
+
+Un detalle sutil pero importante -- las categorias que no existen se filtran *antes* de calcular el budget:
+
+```python
+active_categories = [c for c in categories if c in TOOL_CATEGORIES]
+```
+
+<Callout variant="warning" title="Categorias fantasma desperdician budget">
+Si el clasificador retorna `["fetch", "notes"]` pero el MCP de fetch no esta corriendo, incluir "fetch" en la division infla `len(categories)` y reduce `per_cat`. Al filtrar categorias inexistentes, "notes" recibe el budget completo.
+</Callout>
+
+## Ejemplo de Flujo Completo
+
+```
+Usuario: "Busca el clima en Tokyo y guardalo en mis notas"
+  -> classify: ["weather", "notes"]
+  -> select_tools(["weather", "notes"], max_tools=8):
+     per_cat = max(1, 8 // 2) = 4
+     weather: get_weather (1 tool, < 4 OK)
+     notes: save_note, list_notes, search_notes, delete_note (4 tools)
+     Total: 5 tools + meta-tool = 6
+
+Iteracion 1:
+  LLM -> get_weather(city="Tokyo") -> "Tokyo: 15C, nublado"
+
+Iteracion 2:
+  LLM -> save_note(title="Clima Tokyo", content="15C, nublado") -> OK
+
+  -> Respuesta: "Busque el clima en Tokyo (15C, nublado) y lo guarde en tus notas."
+```
+
+## Por Que Limitar a ~8 Tools
+
+| # Tools | Comportamiento de qwen3.5:9b |
+|---------|-------------------------------|
+| 1-5 | Excelente: selecciona correctamente |
+| 6-8 | Bueno: ocasionalmente ignora alguno |
+| 9-15 | Regular: empieza a inventar tools |
+| 15+ | Malo: ignora todos los tools |
+| 60+ | Catastrofico: output incoherente |
+
+La configuracion vive en `app/config.py`:
+
+```python
+class Settings(BaseSettings):
+    max_tools_per_call: int = 8  # Sweet spot para qwen3.5:9b
+```
+
+<Callout variant="error" title="Limitacion del modelo, no del framework">
+Los modelos grandes (GPT-4, Claude) manejan 50+ tools sin problemas. Pero qwen3.5:9b con 9B de parametros se confunde con mas de ~8. Esta es la razon de existir del two-stage routing que vimos: reducir 60+ herramientas a un subconjunto manejable.
+</Callout>
+
+## Worker Tool Sets (Modo Agente)
+
+En el modo agente, hay conjuntos predefinidos de herramientas por tipo de worker:
+
+```python
+WORKER_TOOL_SETS: dict[str, list[str]] = {
+    "reader": ["search", "fetch", "github", "files", "news", "notes", ...],
+    "analyzer": ["github", "search", "evaluation", "selfcode", ...],
+    "coder": ["selfcode", "shell", "github"],
+    "reporter": ["evaluation", "notes", "debugging"],
+    "general": ["search", "fetch", "github", "files", "shell", ...],
+}
+```
+
+Esto permite que el planner asigne workers especializados con herramientas relevantes, sin sobrecargar a ninguno.
+
+<Quiz
+  question="Que es request_more_tools?"
+  options={[
+    "Un comando del usuario para instalar herramientas",
+    "Un meta-tool que permite al LLM expandir su pool de herramientas disponibles durante una sesion",
+    "Una funcion que descarga nuevos skills desde internet",
+    "Un endpoint de la API REST"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Cuantas herramientas puede manejar bien qwen3.5:9b por llamada LLM?"
+  options={["1-2", "5-8", "15-20", "Ilimitadas"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa si el clasificador retorna una categoria que no tiene MCP server corriendo?"
+  options={[
+    "La app crashea con un error de categoria desconocida",
+    "Se carga igual la categoria con 0 tools",
+    "Se filtra antes de calcular el budget para no desperdiciar slots",
+    "Se reemplaza automaticamente por la categoria default"
+  ]}
+  correct={2}
+/>
+
+Has completado el modulo Tool Calling & Execution. Ahora entendes el loop completo de herramientas, desde la clasificacion hasta la limpieza de contexto.

@@ -1,0 +1,244 @@
+---
+title: "Summarizer Background"
+description: "Resumir conversaciones como tarea de fondo con FastAPI BackgroundTasks"
+xpReward: 75
+---
+
+## El Summarizer
+
+Cuando una conversacion acumula muchos mensajes, el Summarizer se activa como **tarea de fondo** para generar un resumen, extraer hechos importantes, y liberar espacio en la tabla de mensajes.
+
+<Callout variant="info" title="Background, no bloqueante">
+El Summarizer NUNCA bloquea la respuesta al usuario. Se ejecuta despues de que el mensaje fue entregado. El usuario no sabe que esta pasando detras de escena.
+</Callout>
+
+## Cuando se Activa: maybe_summarize()
+
+La funcion `maybe_summarize` en `app/conversation/summarizer.py` decide si es momento de resumir:
+
+```python
+# app/conversation/summarizer.py
+async def maybe_summarize(
+    conversation_id: int,
+    repository: Repository,
+    ollama_client: OllamaClient,
+    threshold: int,       # Settings.summary_threshold (default: 40)
+    max_messages: int,    # Settings.conversation_max_messages (default: 20)
+    daily_log: DailyLog | None = None,
+    memory_file: MemoryFile | None = None,
+    flush_enabled: bool = False,
+    embed_model: str | None = None,
+) -> None:
+    try:
+        count = await repository.get_message_count(conversation_id)
+        if count <= threshold:
+            return  # No hay suficientes mensajes
+
+        previous_summary = await repository.get_latest_summary(conversation_id)
+        all_messages = await repository.get_recent_messages(conversation_id, count)
+        old_messages = all_messages[: len(all_messages) - max_messages]
+
+        if not old_messages:
+            return
+```
+
+<Concept title="threshold vs max_messages">
+`threshold=40` es el minimo para activar la summarization. `max_messages=20` es cuantos mensajes se conservan despues de resumir. La diferencia (40 - 20 = 20 mensajes) es lo que se resume y borra. Esto crea un "buffer" que evita resumir en cada mensaje.
+</Concept>
+
+## Fase 1: Flush Pre-Compactacion
+
+Antes de borrar mensajes viejos, el Summarizer extrae hechos importantes y los guarda como memorias permanentes:
+
+```python
+# Pre-compaction flush: extract facts and events before summarizing
+new_facts_count = 0
+if flush_enabled and daily_log and memory_file:
+    try:
+        new_facts_count = await flush_to_memory(
+            old_messages, repository, ollama_client,
+            daily_log, memory_file, embed_model=embed_model,
+        )
+    except Exception:
+        logger.exception("Memory flush failed for conversation %d", conversation_id)
+```
+
+La funcion `flush_to_memory` usa un prompt especifico para extraer hechos:
+
+```python
+FLUSH_PROMPT = (
+    "Review this conversation fragment. Extract ONLY what's worth remembering long-term.\n\n"
+    "Existing memories (do NOT repeat these):\n{existing_memories}\n\n"
+    "Conversation:\n{conversation}\n\n"
+    'Respond in JSON only:\n{{"facts": ["new stable fact 1"], "events": ["notable event 1"]}}\n'
+    'If nothing new, respond: {{"facts": [], "events": []}}'
+)
+```
+
+<Callout variant="warning" title="think=False obligatorio">
+El flush usa `think=False` porque es una tarea de extraccion simple que necesita respuesta rapida en formato JSON. El chain-of-thought de qwen3 produciria XML thinking tags que romperian el parsing JSON.
+</Callout>
+
+## Dedup de Hechos Extraidos
+
+Antes de guardar un hecho, se verifica que no sea duplicado de una memoria existente:
+
+```python
+DEDUP_THRESHOLD = 0.8
+
+def _is_duplicate(new_fact: str, existing: list[str]) -> bool:
+    """Check if a fact is too similar to any existing memory."""
+    for existing_fact in existing:
+        ratio = difflib.SequenceMatcher(
+            None, new_fact.lower(), existing_fact.lower()
+        ).ratio()
+        if ratio > DEDUP_THRESHOLD:
+            return True
+    return False
+```
+
+<Concept title="SequenceMatcher con threshold 0.8">
+`difflib.SequenceMatcher` compara dos strings y retorna un ratio entre 0.0 (totalmente diferentes) y 1.0 (identicos). Con un threshold de 0.8, dos frases que comparten el 80% de su contenido se consideran duplicadas. Esto evita memorias como "Le gusta Python" y "Le gusta mucho Python".
+</Concept>
+
+## Fase 2: Generar el Resumen
+
+Despues del flush, se genera el resumen con LLM:
+
+```python
+SUMMARIZE_PROMPT = (
+    "Summarize the following conversation in 2-3 short paragraphs, "
+    "capturing the main topics, decisions, and important details. "
+    "Write the summary in the same language the conversation is in."
+)
+
+# Construir prompt con resumen anterior si existe
+prompt_parts = [summarize_prompt]
+if previous_summary:
+    prompt_parts.append(f"\nPrevious summary:\n{previous_summary}")
+prompt_parts.append("\nConversation to summarize:")
+for msg in old_messages:
+    prompt_parts.append(f"{msg.role}: {msg.content}")
+
+messages = [ChatMessage(role="user", content="\n".join(prompt_parts))]
+summary = await ollama_client.chat(messages, think=False)
+```
+
+<Callout variant="tip" title="Resumen incremental">
+Si ya existe un resumen anterior, se incluye en el prompt. El LLM genera un nuevo resumen que incorpora tanto el viejo como los mensajes nuevos. Asi la informacion nunca se pierde completamente, solo se compacta progresivamente.
+</Callout>
+
+## Fase 3: Guardar y Limpiar
+
+```python
+await repository.save_summary(conversation_id, summary, count)
+await repository.delete_old_messages(conversation_id, max_messages)
+
+logger.info(
+    "Summarized conversation %d: %d messages -> kept %d (flushed %d facts)",
+    conversation_id, count, max_messages, new_facts_count,
+)
+```
+
+El `delete_old_messages` usa una subquery para mantener los N mas recientes:
+
+```python
+# Repository.delete_old_messages()
+async def delete_old_messages(self, conversation_id: int, keep_last: int) -> int:
+    cursor = await self._conn.execute(
+        "DELETE FROM messages WHERE conversation_id = ? AND id NOT IN "
+        "(SELECT id FROM messages WHERE conversation_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?)",
+        (conversation_id, conversation_id, keep_last),
+    )
+    await self._conn.commit()
+    return cursor.rowcount
+```
+
+## Fase 4: Consolidacion de Memorias
+
+Si se extrajeron hechos nuevos, el Summarizer dispara la consolidacion de memorias:
+
+```python
+if new_facts_count > 0 and daily_log and memory_file:
+    try:
+        from app.memory.consolidator import consolidate_memories
+        await consolidate_memories(repository, ollama_client, memory_file)
+    except Exception:
+        logger.exception("Memory consolidation failed")
+```
+
+El consolidador revisa todas las memorias activas buscando duplicados y contradicciones que pudo haber introducido el flush.
+
+## Graceful Shutdown
+
+LocalForge trackea todas las tareas de fondo para shutdown limpio:
+
+```python
+_in_flight: set[asyncio.Task] = set()
+
+# Al crear una tarea de background:
+task = asyncio.create_task(coro)
+_in_flight.add(task)
+task.add_done_callback(_in_flight.discard)
+
+# En shutdown:
+if _in_flight:
+    await asyncio.gather(*_in_flight, return_exceptions=True)
+```
+
+<Callout variant="warning" title="No perder trabajo">
+Sin tracking de tareas, un shutdown mata las tareas de fondo inmediatamente. Si el Summarizer estaba a mitad de un flush, se pierden las memorias extraidas. Con tracking, esperamos a que terminen antes de cerrar.
+</Callout>
+
+## El Flujo Completo
+
+```
+Mensaje llega
+  -> procesar y responder al usuario (hot path)
+  -> maybe_summarize (background task)
+       -> count > threshold?
+            NO -> return
+            SI -> flush_to_memory (extraer hechos)
+               -> _is_duplicate? (dedup con SequenceMatcher)
+               -> save facts as memories
+               -> generate summary with LLM
+               -> save summary to DB
+               -> delete old messages
+               -> consolidate_memories (dedup global)
+```
+
+<Quiz
+  question="Que hace flush_to_memory antes de borrar mensajes?"
+  options={[
+    "Hace un backup de toda la conversacion",
+    "Extrae hechos importantes y los guarda como memorias permanentes",
+    "Envia los mensajes al usuario por email",
+    "Comprime los mensajes en formato ZIP"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que se usa think=False en el prompt del flush?"
+  options={[
+    "Para ahorrar electricidad",
+    "Porque el modelo no soporta thinking",
+    "Para obtener una respuesta rapida en JSON sin chain-of-thought que romperia el parsing",
+    "Para evitar alucinaciones"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Que hace _is_duplicate() para evitar memorias repetidas?"
+  options={[
+    "Compara hashes MD5 de los strings",
+    "Busca coincidencia exacta en la base de datos",
+    "Usa difflib.SequenceMatcher con threshold 0.8 para detectar similitud textual",
+    "Envia ambos textos al LLM para que decida"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como LocalForge mantiene estado entre turnos de conversacion.

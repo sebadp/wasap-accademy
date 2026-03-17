@@ -1,0 +1,264 @@
+---
+title: "Compactacion Inteligente"
+description: "3 niveles de compactacion para outputs de herramientas que saturan el contexto"
+xpReward: 75
+---
+
+## El Problema: Tool Outputs Gigantes
+
+Cuando una herramienta retorna JSON grande (ej: busqueda en GitHub con 10 repositorios, o un archivo de 500 lineas), ese output va al historial de mensajes. Si el LLM se llama de nuevo en un tool calling loop, todo ese JSON se re-envia.
+
+<Callout variant="warning" title="Contexto limitado">
+Un solo tool output de 20,000 chars puede consumir una parte significativa de la ventana de 32K tokens. Con 3-4 tool calls, ya perdiste la mitad del contexto disponible para historial y memorias.
+</Callout>
+
+## Estrategia de 3 Niveles
+
+`app/formatting/compaction.py` implementa **compactacion progresiva**:
+
+<Step number={1} title="Nivel 1: Extraccion JSON de campos clave">
+Si el output es JSON, extraer solo los campos mas relevantes. Determinista, sin LLM, sin riesgo de alucinacion. De ~20,000 chars a ~2,000 chars tipicamente.
+</Step>
+
+<Step number={2} title="Nivel 2: Resumen por LLM">
+Si aun es muy largo, pedir al LLM que resuma preservando identifiers exactos. Usa `think=False` para velocidad.
+</Step>
+
+<Step number={3} title="Nivel 3: Truncado duro">
+Ultimo recurso: cortar al presupuesto maximo con `...[truncated]`. Nunca deberia llegar aca si los niveles anteriores funcionan.
+</Step>
+
+## Nivel 1: Extraccion JSON Inteligente
+
+El compactador conoce los campos mas utiles de APIs comunes (GitHub, busquedas, etc.):
+
+```python
+# app/formatting/compaction.py
+_JSON_KEY_FIELDS: list[str] = [
+    "name", "full_name", "id", "number", "title",
+    "description", "html_url", "url", "clone_url",
+    "updated_at", "created_at", "language", "state",
+    "private", "stargazers_count", "open_issues_count",
+    "default_branch", "login", "body", "content",
+    "path", "type", "size",
+]
+```
+
+La funcion `_try_json_extraction` intenta parsear el output como JSON y extraer solo estos campos:
+
+```python
+def _try_json_extraction(text: str, max_length: int) -> str | None:
+    """Try to extract key fields from a JSON payload without using LLM."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    # GitHub Search API: {"total_count": N, "items": [...]}
+    if isinstance(data, dict) and "items" in data:
+        items = data["items"]
+        total = data.get("total_count")
+        return _extract_item_list(items, max_length, total_count=total)
+
+    # Direct list response (list_repos, list_issues, etc.)
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return _extract_item_list(data, max_length)
+
+    # Single object — just filter to key fields
+    if isinstance(data, dict):
+        compact = _pick_fields(data)
+        if not compact:
+            return None  # No known fields -> fall through to LLM
+        result = json.dumps(compact, indent=2, ensure_ascii=False)
+        return result if len(result) <= max_length else None
+
+    return None
+```
+
+<Concept title="Zero hallucination risk">
+La extraccion JSON es completamente determinista. No hay LLM involucrado, asi que no hay riesgo de que "localforge-assistant" se convierta en "[repo-name]". Esto es critico cuando el output contiene IDs, URLs y nombres exactos que el LLM necesita para tool calls posteriores.
+</Concept>
+
+## _pick_fields: Filtrado Inteligente
+
+El filtrado de campos maneja casos especiales como objetos user anidados y campos de texto largo:
+
+```python
+def _pick_fields(item: dict, content_limit: int = 12000) -> dict:
+    """Pick only key fields from a dict, flattening known nested objects."""
+    compact: dict = {}
+    for k in _JSON_KEY_FIELDS:
+        if k not in item:
+            continue
+        val = item[k]
+        # Flatten user objects like {"login": "sebadp", "id": 12345} -> "sebadp"
+        if isinstance(val, dict) and "login" in val:
+            compact[k] = val["login"]
+        elif isinstance(val, str) and k == "body" and len(val) > 300:
+            compact[k] = val[:300] + "..."
+        elif isinstance(val, str) and k == "content" and len(val) > content_limit:
+            compact[k] = val[:content_limit] + "\n...[truncated]"
+        else:
+            compact[k] = val
+    return compact
+```
+
+## Nivel 2: LLM Summarization
+
+Si la extraccion JSON no es suficiente (o el output no es JSON), se usa el LLM:
+
+```python
+# Step 2: LLM-based summarization
+prompt = (
+    f"The tool '{tool_name}' returned {len(text)} characters.\n"
+    f'The user\'s request was: "{user_request}"\n\n'
+    "Summarize, extracting ONLY fields that answer the user's request.\n"
+    "CRITICAL RULES:\n"
+    "1. PRESERVE EXACT names, IDs, URLs — NEVER substitute with [placeholder].\n"
+    "2. Discard metadata not useful for answering the request.\n"
+    "3. Output must be readable by another AI or a human.\n\n"
+    f"--- PAYLOAD ---\n{text[:15000]}\n--- END ---"
+)
+
+messages = [
+    ChatMessage(
+        role="system",
+        content="You are a context-compaction agent. "
+                "Preserve exact identifiers. Never hallucinate placeholder names.",
+    ),
+    ChatMessage(role="user", content=prompt),
+]
+summary = await ollama_client.chat(messages, model=None, think=False)
+```
+
+<Callout variant="warning" title="PRESERVE EXACT names">
+La regla mas importante del prompt de compactacion: **nunca** reemplazar nombres reales con placeholders como `[repo-name]`. Esto causo bugs reales donde el LLM de compactacion destruia IDs que el LLM principal necesitaba para la siguiente tool call.
+</Callout>
+
+## Nivel 3: Truncado Duro
+
+```python
+# Hard truncate as last resort
+return text[:max_length] + "\n...[truncated]"
+```
+
+Solo se usa si el LLM de compactacion falla o retorna un resultado vacio.
+
+## La Funcion Principal: compact_tool_output
+
+Todo se orquesta en una sola funcion:
+
+```python
+async def compact_tool_output(
+    tool_name: str, text: str, user_request: str,
+    ollama_client: OllamaClient, max_length: int | None = None,
+) -> str:
+    if max_length is None:
+        max_length = Settings().compaction_threshold  # Default: 20000
+
+    if len(text) <= max_length:
+        return text  # No compaction needed
+
+    # Step 1: JSON extraction (fast, deterministic)
+    structured = _try_json_extraction(text, max_length)
+    if structured:
+        return structured
+
+    # Step 2: LLM summarization
+    # messages built from prompt (see Nivel 2 section above)
+    try:
+        summary = await ollama_client.chat(messages, think=False)
+        if summary and not summary.isspace():
+            return summary
+    except Exception:
+        pass
+
+    # Step 3: Hard truncate
+    return text[:max_length] + "\n...[truncated]"
+```
+
+<Callout variant="info" title="Tracing integrado">
+La compactacion tiene spans de tracing: `llm:compact_output` registra el `tool_name`, `original_len` y `compacted_len`. Esto permite monitorear que tools necesitan compactacion frecuente y optimizar sus outputs.
+</Callout>
+
+## Configuracion
+
+El threshold de compactacion es configurable:
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    compaction_threshold: int = 20000  # Chars, not tokens
+```
+
+## Impacto en el Context Budget
+
+```
+Sin compactacion:
+  3 tool outputs x 20,000 chars = 60,000 chars (~15,000 tokens) -> 47% del contexto
+
+Con compactacion (Nivel 1 JSON):
+  3 tool outputs x 2,000 chars = 6,000 chars (~1,500 tokens) -> 5% del contexto
+
+Ahorro: ~42% del contexto disponible para historial y memorias
+```
+
+## Progressive Item Dropping
+
+Para listas JSON, el compactador dropea items del final hasta que el resultado cabe en el budget:
+
+```python
+def _extract_item_list(items: list, max_length: int, total_count: int | None = None) -> str | None:
+    extracted = [_pick_fields(item) for item in items]
+
+    # Progressively drop items from the end until it fits
+    while extracted:
+        suffix = ""
+        if total_count and total_count > len(extracted):
+            suffix = f"\n\n(Showing {len(extracted)} of {total_count} total results)"
+        result = json.dumps(extracted, indent=2, ensure_ascii=False) + suffix
+        if len(result) <= max_length:
+            return result
+        extracted.pop()
+
+    return None  # Could not fit even one item
+```
+
+<Concept title="Showing N of M total results">
+Cuando se dropean items, se agrega un sufijo que indica cuantos resultados se muestran del total. Asi el LLM sabe que hay mas resultados disponibles y puede pedirlos si es necesario.
+</Concept>
+
+<Quiz
+  question="Cuales son los 3 niveles de compactacion en orden?"
+  options={[
+    "Truncar -> Resumir -> Comprimir",
+    "Extraccion JSON de campos clave -> Resumen con LLM -> Truncado duro",
+    "Comprimir ZIP -> Base64 -> Truncar",
+    "LLM resumen -> Regex -> Eliminar"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que la extraccion JSON (Nivel 1) es preferida sobre el resumen LLM (Nivel 2)?"
+  options={[
+    "Porque es mas barata en tokens de API",
+    "Porque es determinista, rapida, y no tiene riesgo de alucinacion sobre IDs y URLs",
+    "Porque produce mejor formato visual",
+    "Porque funciona sin conexion a internet"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que hace _extract_item_list cuando el resultado no cabe en el budget?"
+  options={[
+    "Trunca cada item individual",
+    "Comprime todo con gzip",
+    "Dropea items del final progresivamente hasta que quepa, mostrando 'N of M total'",
+    "Falla con una excepcion"
+  ]}
+  correct={2}
+/>
+
+Has completado el modulo de Conversation & State Management. Ahora entendes como LocalForge mantiene el flujo conversacional eficiente desde windowed history hasta compactacion de tool outputs.

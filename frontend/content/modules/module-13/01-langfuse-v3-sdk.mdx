@@ -1,0 +1,138 @@
+---
+title: "Langfuse v3 SDK"
+description: "API de trazabilidad para LLMs: spans, scores, y trace IDs"
+xpReward: 75
+---
+
+## Qué es Langfuse
+
+**Langfuse** es una plataforma open-source de observabilidad para aplicaciones LLM. Permite visualizar trazas, registrar scores de calidad, y analizar el comportamiento del modelo.
+
+<Callout variant="info" title="Open-source">
+Langfuse se puede correr self-hosted o usar el cloud. WasAP soporta ambas opciones via configuración (`langfuse_host`).
+</Callout>
+
+## v3: Cambios Importantes
+
+WasAP usa Langfuse v3, que tiene cambios significativos respecto a v2:
+
+| Aspecto | v2 (viejo) | v3 (actual) |
+|---------|-----------|-------------|
+| Crear span | `trace.span(name=...)` | `start_span(name=...)` retorna objeto stateful |
+| Crear generation | `trace.generation(...)` | `start_generation(...)` retorna objeto stateful |
+| Registrar score | `trace.score(...)` | `create_score(...)` |
+| Uso de tokens | `usage={"input": N}` | `usage_details={"input": N}` |
+| Trace IDs | Cualquier string | **Debe ser 32 caracteres hex** |
+
+## Trace IDs: 32 Hex Characters
+
+```python
+from langfuse import Langfuse
+
+# ❌ v2: cualquier string
+trace_id = "my-custom-trace-id"
+
+# ✅ v3: 32 hex chars obligatorio
+trace_id = Langfuse.create_trace_id(seed=str(our_uuid))
+# → "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+```
+
+<Concept title="¿Por qué 32 hex?">
+Langfuse v3 usa formato UUID sin guiones como trace ID. `create_trace_id(seed=...)` genera un hash determinístico a partir de nuestro UUID, garantizando que el mismo mensaje siempre produce el mismo trace ID.
+</Concept>
+
+## API v3: Spans y Generations
+
+```python
+from langfuse import Langfuse
+
+langfuse = Langfuse(
+    public_key=settings.langfuse_public_key,
+    secret_key=settings.langfuse_secret_key,
+    host=settings.langfuse_host,
+)
+
+# Crear un trace
+trace = langfuse.trace(
+    id=Langfuse.create_trace_id(seed=str(message_id)),
+    name="message_processing",
+    metadata={"phone": phone_number},
+)
+
+# Crear un span (operación genérica)
+span = trace.start_span(name="phase_a")
+# ... hacer trabajo ...
+span.end()
+
+# Crear una generation (llamada a LLM)
+gen = trace.start_generation(
+    name="llm_chat",
+    model="qwen3.5:9b",
+    input=messages,
+)
+response = await ollama_client.chat(messages)
+gen.end(
+    output=response.content,
+    usage_details={
+        "input": response.input_tokens,
+        "output": response.output_tokens,
+    },
+)
+
+# Registrar un score
+langfuse.create_score(
+    trace_id=trace.id,
+    name="guardrail:no_pii",
+    value=1.0,
+    source="system",
+)
+```
+
+## Actualizar Metadata del Trace
+
+```python
+# v3: usar root_span.update_trace() para agregar metadata después
+root_span = trace.start_span(name="root")
+# ... más adelante, cuando tenemos más info:
+root_span.update_trace(
+    metadata={
+        "categories": categories,
+        "tools_used": tool_names,
+        "guardrails_passed": True,
+    }
+)
+```
+
+<Callout variant="warning" title="update_trace, no update">
+En v3, para actualizar metadata del trace desde un span hijo, se usa `span.update_trace()`, no `trace.update()`. Esto es porque los spans son los objetos stateful que mantienen la referencia.
+</Callout>
+
+<Quiz
+  question="¿Cuántos caracteres hex debe tener un trace ID en Langfuse v3?"
+  options={["16", "24", "32", "64"]}
+  correct={2}
+/>
+
+<Quiz
+  question="En Langfuse v3, ¿cómo se registra un score de calidad?"
+  options={[
+    "trace.score(name, value)",
+    "langfuse.create_score(trace_id, name, value, source)",
+    "span.add_score(name, value)",
+    "langfuse.log_score(name, value)"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es la diferencia entre span y generation en Langfuse?"
+  options={[
+    "No hay diferencia",
+    "Span es para operaciones genéricas, generation es específicamente para llamadas a LLM",
+    "Span es más rápido",
+    "Generation solo funciona con OpenAI"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo WasAP propaga el contexto de trazas en código async.

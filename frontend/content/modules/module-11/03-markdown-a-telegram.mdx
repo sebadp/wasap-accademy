@@ -1,0 +1,234 @@
+---
+title: "Markdown a Telegram HTML"
+description: "Escape-first pattern para convertir markdown a HTML sin double-escape ni inyección"
+xpReward: 75
+---
+
+## Telegram Usa HTML
+
+A diferencia de WhatsApp (que tiene su propia sintaxis), Telegram soporta `parse_mode=HTML` con tags estándar:
+
+| Tag HTML | Resultado | Markdown equivalente |
+|----------|-----------|---------------------|
+| `<b>text</b>` | **bold** | `**text**` |
+| `<i>text</i>` | _italic_ | `*text*` |
+| `<s>text</s>` | ~~strike~~ | `~~text~~` |
+| `<code>text</code>` | `code` | `` `text` `` |
+| `<pre>text</pre>` | code block | ` ```text``` ` |
+| `<a href="url">text</a>` | link | `[text](url)` |
+
+## El Problema: Orden de Escape
+
+<Callout variant="error" title="CRÍTICO: El orden importa">
+Si convertís markdown a HTML tags **primero** y después escapás HTML entities, tus propios tags se escapan:
+
+```
+Paso 1: **bold** → <b>bold</b>
+Paso 2: <b>bold</b> → &lt;b&gt;bold&lt;/b&gt;  ← ¡Se ve como texto!
+```
+
+El orden correcto es: **escapar PRIMERO, convertir DESPUÉS**.
+</Callout>
+
+## La Solución: 4 Fases
+
+```python
+# app/formatting/telegram_md.py
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert Markdown to Telegram HTML (parse_mode=HTML)."""
+    placeholders: list[str] = []
+
+    def _protect(m: re.Match) -> str:
+        placeholders.append(m.group(0))
+        return f"\x00CODE{len(placeholders) - 1}\x00"
+
+    # ── Fase 1: Proteger code blocks ──
+    text = re.sub(r"```[\s\S]*?```", _protect, text)
+    text = re.sub(r"`[^`]+`", _protect, text)
+
+    # ── Fase 2: Escapar HTML entities ──
+    text = (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+    # ── Fase 3: Convertir markdown → HTML tags ──
+    # Headers
+    text = re.sub(
+        r"^#{1,6}\s+(.+)$", r"<b>\1</b>",
+        text, flags=re.MULTILINE,
+    )
+    # Links
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        r'<a href="\2">\1</a>', text,
+    )
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    # Italic: *text*
+    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
+    # Italic: _text_ (no word boundaries)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
+    # Strikethrough
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+    # ── Fase 4: Restaurar code blocks ──
+    def _restore(m: re.Match) -> str:
+        idx = int(m.group(1))
+        original = placeholders[idx]
+        if original.startswith("```"):
+            inner = re.sub(r"^```[^\n]*\n?", "", original)
+            inner = re.sub(r"```\s*$", "", inner)
+            inner = (inner
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            return f"<pre>{inner}</pre>"
+        else:
+            inner = original[1:-1]  # Strip backticks
+            inner = (inner
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            return f"<code>{inner}</code>"
+
+    text = re.sub(r"\x00CODE(\d+)\x00", _restore, text)
+
+    return text
+```
+
+## Fase por Fase
+
+### Fase 1: Proteger Code Blocks
+
+Igual que en WhatsApp, los code blocks se extraen primero para que su contenido no sea afectado por las conversiones:
+
+```python
+text = re.sub(r"```[\s\S]*?```", _protect, text)  # Fenced
+text = re.sub(r"`[^`]+`", _protect, text)          # Inline
+```
+
+### Fase 2: Escapar HTML — El Paso Crítico
+
+```python
+text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+```
+
+<Concept title="¿Por qué funciona este orden?">
+Los markdown markers (`**`, `*`, `~~`, `_`, `#`, `[`, `]`) **no son caracteres HTML**. Al escapar `&`, `<`, `>` en la Fase 2, protegemos el contenido del usuario (ej: `<script>` → `&lt;script&gt;`) sin afectar los markers de markdown que todavía no se convirtieron.
+
+Cuando en la Fase 3 convertimos `**text**` a `<b>text</b>`, estos tags **no se escapan** porque la Fase 2 ya pasó.
+</Concept>
+
+Ejemplo del flujo correcto:
+
+```
+Input:    "**bold** y <script>alert('xss')</script>"
+Fase 2:   "**bold** y &lt;script&gt;alert('xss')&lt;/script&gt;"
+Fase 3:   "<b>bold</b> y &lt;script&gt;alert('xss')&lt;/script&gt;"
+```
+
+El `<b>` funciona como tag. El `<script>` se muestra como texto inofensivo.
+
+<Callout variant="warning" title="Prevención de XSS">
+Este pattern no es solo una cuestión de formato — es **seguridad**. Sin escapar HTML del usuario, alguien podría enviar `<b onload="malicious()">` y Telegram podría interpretar atributos maliciosos. El escape-first pattern previene inyección de HTML.
+</Callout>
+
+### Fase 3: Convertir Markdown → HTML Tags
+
+El orden de conversión es importante:
+
+1. **Bold primero** (`**text**` → `<b>text</b>`) — consume los dobles asteriscos
+2. **Italic después** (`*text*` → `<i>text</i>`) — solo matchea asteriscos simples restantes
+
+```python
+# Bold: **text** → <b>text</b>
+text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+
+# Italic: *text* → <i>text</i>  (solo * simples, ** ya consumidos)
+text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
+```
+
+#### Italic con underscore: Word Boundary
+
+```python
+# Italic: _text_ — solo cuando NO está rodeado de word characters
+text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
+```
+
+<Concept title="Lookbehind y lookahead para underscores">
+`(?<!\w)_(.+?)_(?!\w)` usa negative lookbehind y lookahead para evitar convertir underscores dentro de nombres de variables:
+
+- `_italic_` → `<i>italic</i>` (funciona: no hay word chars alrededor)
+- `my_variable_name` → `my_variable_name` (no matchea: rodeado de letras)
+
+Sin estos assertions, `my_variable_name` se convertiría a `my<i>variable</i>name`.
+</Concept>
+
+### Fase 4: Restaurar Code Blocks con Escape
+
+Los code blocks se restauran **con su propio HTML escape**:
+
+```python
+if original.startswith("```"):
+    # Strip fences y language tag
+    inner = re.sub(r"^```[^\n]*\n?", "", original)
+    inner = re.sub(r"```\s*$", "", inner)
+    # Escape HTML DENTRO del código
+    inner = inner.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"<pre>{inner}</pre>"
+```
+
+<Callout variant="tip" title="Doble escape para code blocks">
+El contenido de code blocks se escapó durante la Fase 1 (protección), así que no pasó por la Fase 2 (escape general). Por eso necesita su **propio** escape en la Fase 4. De lo contrario, `<div>` dentro de un code block se interpretaría como HTML.
+</Callout>
+
+## Comparación: WhatsApp vs Telegram
+
+| Aspecto | WhatsApp (`whatsapp.py`) | Telegram (`telegram_md.py`) |
+|---------|--------------------------|----------------------------|
+| Bold | `\x01BOLD\x01` placeholder | Conversión directa `<b>` |
+| Italic conflict | Sí (`*` es bold en WA) | No (`*` no es HTML) |
+| Escape needed | No (texto plano) | Sí (HTML entities) |
+| Security concern | Bajo | Alto (inyección HTML) |
+| Code blocks | Preservados as-is | `<pre>` / `<code>` con escape |
+
+<Quiz
+  question="¿Qué pasa si escapás HTML DESPUÉS de convertir markdown a tags?"
+  options={[
+    "Funciona correctamente",
+    "Los tags HTML generados por el formatter se escapan y Telegram muestra el código crudo (<b> en vez de bold)",
+    "Se duplican los tags",
+    "Telegram ignora todo el formato"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué el regex de italic con underscore usa (?<!\\w) y (?!\\w)?"
+  options={[
+    "Para mejorar performance",
+    "Para evitar convertir underscores dentro de variable_names como italic",
+    "Para soportar Unicode",
+    "Para ser compatible con WhatsApp"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué los code blocks necesitan su propio HTML escape en la Fase 4?"
+  options={[
+    "Porque el código tiene más caracteres especiales",
+    "Porque fueron protegidos ANTES de la Fase 2 (escape general), así que su contenido nunca fue escapado",
+    "Porque Telegram requiere doble escape",
+    "Para preservar la indentación"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo dividir mensajes largos respetando breakpoints naturales.

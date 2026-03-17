@@ -1,0 +1,132 @@
+---
+title: "Intro a Observabilidad"
+description: "Los 3 pilares: Logs, Métricas y Trazas — y por qué las trazas son críticas para LLMs"
+xpReward: 50
+---
+
+## Los 3 Pilares de Observabilidad
+
+En sistemas de software tradicionales, la observabilidad se basa en tres pilares:
+
+| Pilar | Qué es | Ejemplo |
+|-------|--------|---------|
+| **Logs** | Eventos puntuales con timestamp | `2026-03-16 10:30:00 ERROR: Ollama timeout` |
+| **Métricas** | Valores numéricos agregados | `avg_response_time: 1.2s`, `error_rate: 0.5%` |
+| **Trazas** | El camino completo de un request | `webhook → parse → classify → tools → guardrails → send` |
+
+<Callout variant="info" title="LLMs necesitan trazas">
+Para apps de IA, las trazas son el pilar más importante. Los logs te dicen QUE algo falló. Las trazas te dicen POR QUE falló — qué vio el modelo, qué herramientas usó, y cómo llegó a esa respuesta.
+</Callout>
+
+## JSON Structured Logging
+
+WasAP usa **JSON structured logging** en vez de text plano:
+
+```python
+# app/logging_config.py
+import logging
+from pythonjsonlogger import jsonlogger
+
+def setup_logging(log_level: str = "INFO", log_json: bool = True):
+    handler = logging.StreamHandler()
+    if log_json:
+        formatter = jsonlogger.JsonFormatter(
+            "%(asctime)s %(name)s %(levelname)s %(message)s",
+            rename_fields={"asctime": "timestamp", "levelname": "level"},
+        )
+        handler.setFormatter(formatter)
+
+    logging.root.handlers = [handler]
+    logging.root.setLevel(log_level)
+```
+
+Ejemplo de output:
+```json
+{
+  "timestamp": "2026-03-16T10:30:00",
+  "level": "INFO",
+  "name": "app.webhook.router",
+  "message": "Message processed",
+  "phone": "+5491100000",
+  "latency_ms": 1250,
+  "tools_used": ["get_weather"],
+  "guardrails_passed": true
+}
+```
+
+<Concept title="¿Por qué JSON?">
+JSON structured logs se pueden indexar, filtrar y agregar con herramientas como Elasticsearch, Grafana Loki, o CloudWatch. Con text plano, necesitás regex para extraer datos.
+</Concept>
+
+## Logs vs Trazas: La Diferencia Clave
+
+```
+LOGS (eventos independientes):
+  10:30:00 INFO  webhook received message_id=abc123
+  10:30:01 INFO  classify_intent categories=["weather"]
+  10:30:02 INFO  tool called: get_weather
+  10:30:03 INFO  guardrails passed
+  10:30:03 INFO  message sent
+
+TRAZAS (árbol jerárquico vinculado):
+  [Trace: abc123]
+    ├─ [Span: phase_a] 200ms
+    │   ├─ embed: 150ms
+    │   └─ save_message: 50ms
+    ├─ [Span: phase_b] 300ms
+    │   ├─ search_memories: 200ms
+    │   └─ search_notes: 100ms
+    ├─ [Span: llm_generation] 800ms
+    │   └─ [Span: tool:get_weather] 500ms
+    ├─ [Span: guardrails] 50ms
+    └─ [Span: delivery] 100ms
+```
+
+<Callout variant="tip" title="La traza vincula todo">
+Con logs, tenés eventos sueltos que necesitás correlacionar manualmente. Con trazas, todo está vinculado en un árbol: podés ver exactamente qué pasó en cada fase, cuánto tardó, y dónde está el cuello de botella.
+</Callout>
+
+## La Arquitectura de Tracing en WasAP
+
+<FileTree>
+  app/tracing/
+  ├── context.py     # TraceContext — async context manager
+  └── recorder.py    # TraceRecorder — singleton, Langfuse + SQLite
+</FileTree>
+
+WasAP usa **Langfuse** como plataforma de trazabilidad, con persistencia dual: Langfuse cloud + SQLite local.
+
+<Quiz
+  question="¿Cuáles son los 3 pilares de observabilidad?"
+  options={[
+    "Inputs, Outputs, Errors",
+    "Logs, Métricas, Trazas",
+    "CPU, Memoria, Disco",
+    "Frontend, Backend, Database"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué las trazas son especialmente importantes para apps de LLM?"
+  options={[
+    "Porque los LLMs generan muchos logs",
+    "Porque permiten ver qué vio el modelo, qué herramientas usó, y cómo llegó a su respuesta",
+    "Porque las métricas no funcionan con LLMs",
+    "Porque Langfuse lo requiere"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué WasAP usa JSON structured logging?"
+  options={[
+    "Porque es más legible para humanos",
+    "Porque JSON se puede indexar, filtrar y agregar con herramientas de observabilidad",
+    "Porque Python solo soporta JSON",
+    "Porque es más compacto que text plano"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo funciona Langfuse v3.

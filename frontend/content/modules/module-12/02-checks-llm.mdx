@@ -1,0 +1,168 @@
+---
+title: "Checks LLM (Opt-in)"
+description: "Coherencia de herramientas y detección de alucinaciones con IA"
+xpReward: 100
+---
+
+## Cuando los Regex No Alcanzan
+
+Algunos problemas de calidad solo los puede detectar otra IA. ¿La respuesta es coherente con lo que el usuario pidió? ¿Inventó información? Esas preguntas requieren **comprensión semántica**.
+
+<Callout variant="info" title="Opt-in">
+Los checks LLM están desactivados por defecto (`guardrails_llm_checks=False`). Se activan en producción cuando la latencia extra (~500ms por check) es aceptable.
+</Callout>
+
+## Check 1: Tool Coherence
+
+¿El LLM usó correctamente los resultados de las herramientas para responder?
+
+```python
+async def check_tool_coherence(
+    user_message: str,
+    tool_results: list[ToolResult],
+    response: str,
+    ollama_client: OllamaClient,
+) -> GuardrailResult:
+    """Verifica que la respuesta use correctamente los tool results."""
+    if not tool_results:
+        return GuardrailResult(check_name="tool_coherence", passed=True)
+
+    results_text = "\n".join(
+        f"- {r.tool_name}: {r.content[:200]}" for r in tool_results
+    )
+
+    prompt = f"""Evaluate if this response correctly uses the tool results.
+
+User asked: {user_message}
+
+Tool results:
+{results_text}
+
+Assistant response: {response}
+
+Does the response correctly reflect the tool results?
+Answer ONLY 'yes' or 'no'."""
+
+    result = await ollama_client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        think=False,  # Binary answer, no reasoning needed
+        temperature=0.0,  # Deterministic
+    )
+
+    passed = "yes" in result.content.lower()
+    return GuardrailResult(
+        check_name="tool_coherence",
+        passed=passed,
+        message="" if passed else "Response doesn't match tool results",
+    )
+```
+
+<Concept title="¿Qué atrapa este check?">
+Ejemplo: el usuario pide el clima en Tokyo. `get_weather` retorna "15°C, nublado". Pero el LLM responde "Hoy en Tokyo hay 25°C y sol". El check detecta que la respuesta no corresponde a los datos reales de la herramienta.
+</Concept>
+
+## Check 2: Hallucination
+
+¿El LLM inventó información que no está en el contexto?
+
+```python
+async def check_hallucination(
+    context: str,
+    response: str,
+    ollama_client: OllamaClient,
+) -> GuardrailResult:
+    """Detecta si la respuesta fabrica hechos no presentes en el contexto."""
+    prompt = f"""Review this response for fabricated information.
+
+Available context:
+{context[:2000]}
+
+Response to check:
+{response}
+
+Does the response contain facts NOT supported by the context?
+Answer ONLY 'yes' (has hallucinations) or 'no' (all facts are grounded)."""
+
+    result = await ollama_client.chat(
+        messages=[{"role": "user", "content": prompt}],
+        think=False,
+        temperature=0.0,
+    )
+
+    has_hallucination = "yes" in result.content.lower()
+    return GuardrailResult(
+        check_name="hallucination",
+        passed=not has_hallucination,
+        message="Possible hallucination detected" if has_hallucination else "",
+    )
+```
+
+<Callout variant="warning" title="Limitaciones">
+Un LLM verificando a otro LLM no es infalible. Puede haber falsos positivos (marcar información correcta como alucinación) o falsos negativos (no detectar alucinaciones sutiles). Pero es mejor que nada.
+</Callout>
+
+## Configuración y Timeouts
+
+```python
+# app/config.py
+class Settings(BaseSettings):
+    guardrails_enabled: bool = True
+    guardrails_llm_checks: bool = False    # Opt-in
+    guardrails_llm_timeout: float = 3.0    # Seconds
+    guardrails_language_check: bool = True
+    guardrails_pii_check: bool = True
+```
+
+El timeout de 3 segundos es estricto. Si el LLM no responde a tiempo, el check se considera "passed" (fail-open).
+
+```python
+try:
+    result = await asyncio.wait_for(
+        check_tool_coherence(user_msg, tools, response, client),
+        timeout=settings.guardrails_llm_timeout,
+    )
+except asyncio.TimeoutError:
+    result = GuardrailResult(check_name="tool_coherence", passed=True)
+    logger.warning("Tool coherence check timed out")
+```
+
+## think=False: Obligatorio
+
+<Callout variant="error" title="Regla crítica">
+Los checks LLM SIEMPRE usan `think=False`. Necesitan respuestas binarias (sí/no), no razonamiento. Con `think=True`, el modelo genera párrafos de análisis antes del "yes/no", desperdiciando tokens y tiempo.
+</Callout>
+
+<Quiz
+  question="¿Por qué los checks LLM son opt-in en vez de activos por defecto?"
+  options={[
+    "Porque son menos confiables que los determinísticos",
+    "Porque agregan ~500ms de latencia por check, lo cual puede ser inaceptable",
+    "Porque necesitan una API key de pago",
+    "Porque solo funcionan con modelos específicos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué evalúa check_hallucination?"
+  options={[
+    "Si la respuesta es gramaticalmente correcta",
+    "Si la respuesta contiene hechos fabricados que no están en el contexto",
+    "Si la respuesta es demasiado larga",
+    "Si la respuesta contiene código"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si un check LLM excede el timeout de 3 segundos?"
+  options={[
+    "Se reintenta una vez más",
+    "El check se marca como 'passed' (fail-open)",
+    "Se bloquea el mensaje",
+    "Se cancela todos los guardrails"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo el pipeline orquesta todos estos checks y remedia los fallos.

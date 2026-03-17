@@ -1,88 +1,227 @@
 ---
-title: "El SDK de Anthropic"
-description: "Integrar Claude en Python con el SDK oficial"
+title: "OllamaClient: el cliente LLM"
+description: "Integrar Ollama en Python con httpx async y el patron de LocalForge"
 xpReward: 75
 ---
 
-## Instalar el SDK
+## Por que un Cliente Dedicado
 
-<Terminal title="Instalar anthropic SDK">
-pip install anthropic
-</Terminal>
+En lugar de hacer requests HTTP crudos a Ollama en cada lugar del codigo, LocalForge encapsula toda la comunicacion con el LLM en una clase: `OllamaClient`. Este patron centraliza la logica de requests, parseo de respuestas, manejo de errores, y metricas en un solo lugar.
 
-## Tu primera llamada a Claude
+<Callout variant="info" title="httpx, no requests">
+LocalForge usa **httpx** (no `requests`) porque httpx soporta `AsyncClient` nativo. En una app FastAPI async, usar un cliente HTTP sincrono bloquearia el event loop. httpx es el estandar para HTTP async en Python moderno.
+</Callout>
 
-```python title="primer_ejemplo.py"
-import anthropic
+## La Clase OllamaClient
 
-client = anthropic.Anthropic(api_key="sk-ant-...")
-
-message = client.messages.create(
-    model="claude-sonnet-4-6",
-    max_tokens=1024,
-    messages=[
-        {"role": "user", "content": "¿Cuál es la capital de Argentina?"}
-    ]
-)
-
-print(message.content[0].text)
-# → "La capital de Argentina es Buenos Aires."
-```
-
-## La versión async (la que usa WasAP)
-
-```python title="app/llm/client.py"
-import anthropic
-from app.config import Settings
-
-
-class LLMClient:
-    def __init__(self, settings: Settings) -> None:
-        self.client = anthropic.AsyncAnthropic(
-            api_key=settings.anthropic_api_key,
-        )
-        self.model = "claude-sonnet-4-6"
-
-    async def complete(
-        self,
-        messages: list[dict],
-        system: str | None = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
-    ) -> str:
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system or "",
-            messages=messages,
-        )
-        return response.content[0].text
-```
-
-<Concept term="AsyncAnthropic">
-La versión asíncrona del cliente. Es esencial en FastAPI porque todas las operaciones son async. Usar el cliente síncrono en un servidor async bloquearía el event loop.
-</Concept>
-
-## La estructura de messages
-
-El parámetro `messages` sigue el formato de OpenAI que se volvió estándar:
+Este es el cliente real de LocalForge, simplificado para entender la estructura:
 
 ```python
-messages = [
-    {"role": "user",      "content": "¿Cuál es la capital de Francia?"},
-    {"role": "assistant", "content": "La capital de Francia es París."},
-    {"role": "user",      "content": "¿Y de Italia?"},
-]
-# Claude entiende el contexto: pregunta sobre Italia después de Francia
+# app/llm/client.py
+import httpx
+from dataclasses import dataclass
+from app.models import ChatMessage
+
+@dataclass
+class ChatResponse:
+    content: str
+    tool_calls: list[dict] | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    model: str | None = None
+    total_duration_ms: float | None = None
+
+
+class OllamaClient:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        base_url: str,
+        model: str,
+    ):
+        self._http = http_client
+        self._base_url = base_url.rstrip("/")
+        self._model = model
 ```
 
-<Callout variant="info">
-El historial de conversación se construye alternando `user` y `assistant`. Claude nunca debe ser el primer mensaje ni haber dos del mismo rol seguidos.
+<Concept title="Inyeccion de httpx.AsyncClient">
+El `OllamaClient` no crea su propio `httpx.AsyncClient`: lo recibe por constructor. Esto permite compartir un solo cliente HTTP en toda la app (connection pooling) y facilita el testing con mocks.
+</Concept>
+
+## ChatResponse: mas que solo texto
+
+La respuesta del LLM no es solo un string. `ChatResponse` es un dataclass que captura todo lo que Ollama retorna:
+
+```python
+@dataclass
+class ChatResponse:
+    content: str                        # Texto de la respuesta
+    tool_calls: list[dict] | None       # Tool calls (si el LLM quiere usar herramientas)
+    input_tokens: int | None            # Tokens del prompt (de Ollama)
+    output_tokens: int | None           # Tokens generados
+    model: str | None                   # Modelo usado
+    total_duration_ms: float | None     # Duracion total en ms
+```
+
+<Callout variant="tip" title="Metricas de rendimiento">
+`input_tokens` y `output_tokens` vienen directo de Ollama (`prompt_eval_count` y `eval_count`). LocalForge los usa para calibrar el estimador de tokens y para tracing con Langfuse.
+</Callout>
+
+## El Metodo Principal: chat_with_tools
+
+Este es el metodo central. Maneja chat normal, tool calling, y el parametro `think` de qwen3:
+
+```python
+async def chat_with_tools(
+    self,
+    messages: list[ChatMessage],
+    tools: list[dict] | None = None,
+    model: str | None = None,
+    think: bool | None = None,
+) -> ChatResponse:
+    url = f"{self._base_url}/api/chat"
+    use_model = model or self._model
+
+    payload: dict = {
+        "model": use_model,
+        "messages": self._build_message_dicts(messages),
+        "stream": False,
+    }
+
+    if tools:
+        # think: True es incompatible con tools en qwen3
+        payload["tools"] = tools
+        payload["think"] = False
+    elif think is False:
+        payload["think"] = False
+    elif model is None:
+        payload["think"] = True
+
+    resp = await self._http.post(url, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    msg = data["message"]
+
+    return ChatResponse(
+        content=msg.get("content", ""),
+        tool_calls=msg.get("tool_calls"),
+        input_tokens=data.get("prompt_eval_count"),
+        output_tokens=data.get("eval_count"),
+        model=use_model,
+        total_duration_ms=data.get("total_duration", 0) / 1_000_000,
+    )
+```
+
+<Concept title="think vs tools: incompatibilidad de qwen3">
+qwen3 tiene un modo `think: True` que activa chain-of-thought interno (el modelo razona antes de responder). Pero cuando hay `tools` en el payload, `think` debe estar desactivado porque qwen3 no puede razonar y usar herramientas al mismo tiempo. El `OllamaClient` maneja esto automaticamente.
+</Concept>
+
+## Stripping de Reasoning Blocks
+
+Cuando `think=True`, qwen3 envuelve su razonamiento en tags `<think>...</think>`. LocalForge los elimina antes de enviar al usuario:
+
+```python
+import re
+
+_RE_THINK = re.compile(r"<think>.*?</think>\n*", re.DOTALL)
+
+# Dentro de chat_with_tools:
+if content:
+    content = _RE_THINK.sub("", content)
+    # Edge-cases: tags truncados
+    content = content.split("</think>")[-1]
+    content = content.split("<think>")[0].strip()
+```
+
+<Callout variant="warning" title="Regex pre-compilado">
+El regex `_RE_THINK` se compila una sola vez a nivel de modulo (no dentro del metodo). Esto es importante porque se ejecuta en **cada** respuesta del LLM. Pre-compilar evita el costo de compilacion repetida.
+</Callout>
+
+## El Metodo Simplificado: chat
+
+Para llamadas simples sin tools, existe `chat()` que retorna directamente un string:
+
+```python
+async def chat(
+    self,
+    messages: list[ChatMessage],
+    model: str | None = None,
+    think: bool | None = None,
+) -> str:
+    response = await self.chat_with_tools(
+        messages, tools=None, model=model, think=think
+    )
+    return response.content
+```
+
+## Embeddings: Busqueda Semantica
+
+El mismo cliente tambien genera embeddings para busqueda vectorial:
+
+```python
+async def embed(
+    self,
+    texts: list[str],
+    model: str | None = None,
+) -> list[list[float]]:
+    """Genera embeddings via POST /api/embed."""
+    url = f"{self._base_url}/api/embed"
+    use_model = model or self._model
+    payload = {"model": use_model, "input": texts}
+    resp = await self._http.post(url, json=payload)
+    resp.raise_for_status()
+    return resp.json()["embeddings"]
+```
+
+## Health Check
+
+Para verificar que Ollama esta disponible antes de procesar mensajes:
+
+```python
+async def is_available(self) -> bool:
+    try:
+        resp = await self._http.get(
+            f"{self._base_url}/api/tags",
+            timeout=5.0,
+        )
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+```
+
+## El Modelo ChatMessage
+
+Los mensajes se representan con un Pydantic model que soporta texto, imagenes y tool calls:
+
+```python
+# app/models.py
+from pydantic import BaseModel
+
+class ChatMessage(BaseModel):
+    role: str  # "system", "user", "assistant", o "tool"
+    content: str
+    images: list[str] | None = None       # Para vision (base64)
+    tool_calls: list[dict] | None = None  # Para tool calling
+```
+
+<Callout variant="info" title="Estructura de messages">
+El historial de conversacion se construye alternando `user` y `assistant`. El `system` message va siempre primero. Los mensajes `tool` contienen resultados de herramientas ejecutadas.
 </Callout>
 
 <Quiz
-  question="¿Por qué WasAP usa AsyncAnthropic en lugar de Anthropic (síncrono)?"
-  options={["Porque el cliente async es más barato en tokens", "Porque el cliente síncrono no soporta Claude 3", "Para no bloquear el event loop de FastAPI mientras espera la respuesta del LLM", "Porque el cliente async tiene retry automático"]}
-  correct={2}
+  question="Por que OllamaClient recibe httpx.AsyncClient por constructor en vez de crearlo internamente?"
+  options={["Porque httpx no soporta crear clientes dentro de clases", "Para compartir un solo cliente HTTP en toda la app y facilitar el testing con mocks", "Porque FastAPI requiere que los clientes HTTP se creen en el constructor", "Para poder cambiar entre httpx y requests segun el entorno"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa cuando se envian tools en el payload junto con think=True?"
+  options={["El modelo usa las tools y luego razona sobre el resultado", "qwen3 no soporta tools y think simultaneamente, por eso OllamaClient desactiva think cuando hay tools", "Ollama ignora el parametro think si hay tools", "El request falla con un error 400"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Por que se pre-compila el regex _RE_THINK a nivel de modulo?"
+  options={["Porque Python no permite compilar regex dentro de metodos", "Para evitar el costo de compilacion repetida en cada respuesta del LLM", "Porque re.DOTALL solo funciona con regex pre-compilados", "Para que el regex sea accesible desde otros modulos"]}
+  correct={1}
 />

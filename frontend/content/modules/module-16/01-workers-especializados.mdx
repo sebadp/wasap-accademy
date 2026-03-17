@@ -1,0 +1,234 @@
+---
+title: "Workers Especializados"
+description: "System prompts por tipo, filtrado de tools, e inyección de dependencias"
+xpReward: 100
+---
+
+## Un Worker por Tarea
+
+Cada tarea del plan se ejecuta por un **worker** — una instancia del tool loop con un system prompt especializado y un subconjunto de herramientas. Esto simula un equipo: un investigador lee, un analista estudia, un coder implementa, un reporter escribe.
+
+```python
+# app/agent/workers.py
+async def execute_worker(
+    task: TaskStep,
+    objective: str,
+    ollama_client: OllamaClient,
+    registry: SkillRegistry,
+    plan: AgentPlan,
+) -> str:
+    # 1. Prompt especializado por worker type
+    system_prompt = WORKER_PROMPTS[task.worker_type]
+
+    # 2. Inyectar resultados de dependencias como contexto
+    dep_context = _build_dependency_context(task, plan)
+
+    # 3. Construir mensajes
+    messages = [
+        ChatMessage(role="system", content=system_prompt),
+        ChatMessage(role="user", content=(
+            f"OBJECTIVE: {objective}\n"
+            f"YOUR TASK: {task.description}\n"
+            f"{dep_context}"
+        )),
+    ]
+
+    # 4. Filtrar tools por worker type
+    categories = WORKER_TOOL_SETS.get(task.worker_type)
+
+    # 5. Ejecutar tool loop con tools filtradas
+    result = await execute_tool_loop(
+        messages=messages,
+        ollama_client=ollama_client,
+        skill_registry=registry,
+        pre_classified_categories=categories,
+        max_iterations=8,
+    )
+
+    return result
+```
+
+## System Prompts por Tipo
+
+Cada worker tiene un prompt que enfoca su comportamiento:
+
+```python
+WORKER_PROMPTS = {
+    "reader": (
+        "You are a research specialist. Your job is to gather "
+        "information via web search, fetch pages, and GitHub API. "
+        "Read source code to understand structure. "
+        "Synthesize your findings clearly and completely."
+    ),
+    "analyzer": (
+        "You are an analysis specialist. Provide evidence-based "
+        "findings from deep inspection: source code, patterns, "
+        "CI/CD configs, and metrics. "
+        "Always cite specific file paths and line numbers."
+    ),
+    "coder": (
+        "You are a coding specialist. ALWAYS read code before "
+        "modifying. Use preview_patch before apply_patch. "
+        "Test after changes. Follow existing code style."
+    ),
+    "reporter": (
+        "You are a reporting specialist. Synthesize findings "
+        "into clear, actionable markdown. Include file paths "
+        "and line references. Keep reports concise."
+    ),
+    "general": (
+        "You are a general-purpose worker. Use multiple tools. "
+        "Don't stop after one call — keep working until the "
+        "task is fully addressed."
+    ),
+}
+```
+
+<Concept title="Prompt = restricción de rol">
+El prompt del worker no solo describe qué hacer — restringe qué NO hacer. Un "reader" no va a intentar modificar archivos. Un "reporter" no va a ejecutar comandos. Esto reduce errores y mejora la calidad de cada paso.
+</Concept>
+
+## Tool Sets por Worker
+
+```python
+WORKER_TOOL_SETS = {
+    "reader": ["search", "fetch", "github", "selfcode", "notes"],
+    "analyzer": ["selfcode", "search", "github", "notes", "evaluation"],
+    "coder": ["selfcode", "github", "notes"],
+    "reporter": [],    # Sin tools (solo texto)
+    "general": None,   # None = router decide → todas las tools
+}
+```
+
+<Callout variant="tip" title="Reporter sin tools">
+El reporter no tiene tools — su trabajo es sintetizar los resultados de pasos previos en texto. Darle herramientas lo distraería de su tarea. Los datos ya fueron recolectados por workers anteriores.
+</Callout>
+
+## Inyección de Dependencias
+
+Cuando una tarea depende de otras, los resultados previos se inyectan como contexto:
+
+```python
+def _build_dependency_context(task: TaskStep, plan: AgentPlan) -> str:
+    """Build context from completed dependency tasks."""
+    if not task.depends_on:
+        return ""
+
+    parts = ["\n--- CONTEXT FROM PREVIOUS STEPS ---"]
+    for dep_id in task.depends_on:
+        dep = plan.get_task(dep_id)
+        if dep and dep.result:
+            parts.append(
+                f"\nStep #{dep_id} ({dep.description}):\n"
+                f"{dep.result[:2000]}\n"  # Truncar a 2000 chars
+            )
+    parts.append("--- END CONTEXT ---\n")
+    return "\n".join(parts)
+```
+
+Ejemplo práctico:
+
+```
+--- CONTEXT FROM PREVIOUS STEPS ---
+
+Step #1 (Read repository structure):
+Found: app/ with 15 modules, tests/ with 8 test files.
+Makefile has targets: test, lint, format.
+No .github/workflows/ directory exists.
+
+Step #2 (Run test suite and capture coverage):
+Coverage: 45%. Untested modules: agent/, security/, mcp/.
+8 test files, 42 test functions. All passing.
+
+--- END CONTEXT ---
+
+YOUR TASK: Analyze coverage gaps by module and prioritize improvements.
+```
+
+<Concept title="Truncado a 2000 chars">
+Los resultados de dependencias se truncan a 2000 caracteres. Sin esto, un worker que produce un output largo podría llenar toda la ventana de contexto del worker siguiente. El truncado garantiza espacio para las tools del worker actual.
+</Concept>
+
+## Detección de Resultados Vacíos
+
+```python
+# Al final de execute_worker
+if not result or result.strip() == "":
+    return "(no data found)"
+
+# En el loop del planner
+if task.result == "(no data found)":
+    task.status = "failed"
+    # Cascade failure se activará para dependientes
+```
+
+## Ejecución Secuencial con Progreso
+
+```python
+# app/agent/loop.py — _run_planner_session
+async def _run_planner_session(session, plan, ...):
+    while not plan.all_done():
+        task = plan.next_task()
+        if task is None:
+            break  # No más tareas ejecutables
+
+        task.status = "in_progress"
+        session.iteration += 1
+
+        # Enviar progreso
+        await wa_client.send_message(
+            session.phone_number,
+            f"📋 Paso {task.id}/{len(plan.tasks)}: {task.description}"
+        )
+
+        try:
+            result = await execute_worker(task, plan.objective, ...)
+            task.result = result
+            task.status = "done"
+        except Exception as e:
+            task.result = str(e)
+            task.status = "failed"
+
+        # Persistir ronda
+        append_to_session(session.phone_number, session.session_id, {
+            "iteration": session.iteration,
+            "task_id": task.id,
+            "task_status": task.status,
+            "reply": task.result[:500],
+        })
+```
+
+<Quiz
+  question="¿Por qué el worker 'reporter' no tiene acceso a tools?"
+  options={[
+    "Porque es un bug",
+    "Porque su trabajo es sintetizar datos ya recolectados por workers previos, no buscar datos nuevos",
+    "Porque Ollama no soporta tools con reporters",
+    "Porque los reporters son más lentos"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si el resultado de una dependencia tiene más de 2000 caracteres?"
+  options={[
+    "Se rechaza la tarea",
+    "Se trunca a 2000 chars para no llenar la ventana de contexto del worker siguiente",
+    "Se comprime con LLM",
+    "Se guarda en disco"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuántas tool calls máximas puede hacer un worker por tarea?"
+  options={[
+    "3",
+    "5",
+    "8",
+    "15"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos el mecanismo de replanificación.

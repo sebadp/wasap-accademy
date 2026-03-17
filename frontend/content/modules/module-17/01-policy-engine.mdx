@@ -1,0 +1,263 @@
+---
+title: "PolicyEngine"
+description: "Reglas YAML con regex fullmatch para ALLOW, BLOCK y FLAG"
+xpReward: 100
+---
+
+## Reglas Declarativas en YAML
+
+El PolicyEngine evalúa cada tool call contra un archivo de reglas YAML. Las reglas son declarativas: no necesitás escribir código para agregar nuevas restricciones.
+
+```yaml
+# data/security_policies.yaml
+version: "1.0"
+default_action: block  # Si ninguna regla matchea → BLOCK
+
+rules:
+  - id: "rule_shell_safe_read"
+    target_tool: "run_command"
+    argument_match:
+      command: "^(cat|head|tail|ls|find|grep|wc)\\s[^;&|]+$"
+    action: "allow"
+    reason: "Read-only shell commands are safe"
+
+  - id: "rule_shell_rm_tmp"
+    target_tool: "run_command"
+    argument_match:
+      command: "^rm -rf /tmp/[^;&|]+$"
+    action: "allow"
+    reason: "Deleting temp files is safe"
+
+  - id: "rule_shell_rm_blocked"
+    target_tool: "run_command"
+    argument_match:
+      command: "^rm\\s.*"
+    action: "block"
+    reason: "Direct rm is prohibited (use tmp path)"
+
+  - id: "rule_git_push_flag"
+    target_tool: "git_push"
+    argument_match:
+      branch: "^(main|master)$"
+    action: "flag"
+    reason: "Push to main requires human approval"
+
+  - id: "rule_git_push_other"
+    target_tool: "git_push"
+    argument_match:
+      branch: ".*"
+    action: "allow"
+    reason: "Push to feature branches is safe"
+```
+
+## El Modelo de Reglas
+
+```python
+# app/security/models.py
+@dataclass
+class PolicyRule:
+    id: str                    # "rule_001"
+    target_tool: str           # Tool name a matchear
+    argument_match: dict[str, str]  # {arg_name: regex_pattern}
+    action: PolicyAction       # ALLOW | BLOCK | FLAG
+    reason: str                # Explicación legible
+
+class PolicyAction(StrEnum):
+    ALLOW = "allow"
+    BLOCK = "block"
+    FLAG = "flag"
+
+@dataclass
+class PolicyDecision:
+    action: PolicyAction
+    reason: str | None = None
+    rule_id: str | None = None
+
+    @property
+    def is_allowed(self) -> bool:
+        return self.action == PolicyAction.ALLOW
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.action == PolicyAction.BLOCK
+
+    @property
+    def requires_flag(self) -> bool:
+        return self.action == PolicyAction.FLAG
+```
+
+## El Evaluador
+
+```python
+# app/security/policy_engine.py
+class PolicyEngine:
+    def __init__(self, policy_path: Path):
+        self.policy_path = policy_path
+        self._policy = None
+        self._misconfigured = False
+        self._load_policy()
+
+    def evaluate(
+        self, tool_name: str, arguments: dict
+    ) -> PolicyDecision:
+        """Evaluar una tool call contra las reglas."""
+        if self._misconfigured:
+            # Si el YAML está roto → BLOCK todo (fail-closed)
+            return PolicyDecision(
+                action=PolicyAction.BLOCK,
+                reason="Policy engine misconfigured",
+            )
+
+        for rule in self._policy.rules:
+            # Filtrar por tool name
+            if rule.target_tool != tool_name:
+                continue
+
+            # Verificar TODOS los argument patterns
+            matches_all = True
+            for arg_key, arg_regex in rule.argument_match.items():
+                arg_value = str(arguments.get(arg_key, ""))
+                try:
+                    if not re.fullmatch(arg_regex, arg_value):
+                        matches_all = False
+                        break
+                except re.error:
+                    logger.error("Invalid regex in rule %s", rule.id)
+                    matches_all = False
+                    break
+
+            if matches_all:
+                return PolicyDecision(
+                    action=rule.action,
+                    reason=rule.reason,
+                    rule_id=rule.id,
+                )
+
+        # Ninguna regla matcheó → default action
+        return PolicyDecision(
+            action=self._policy.default_action,
+            reason="No matching rule (default action)",
+        )
+```
+
+<Concept title="re.fullmatch, no re.search">
+La diferencia es crítica: `re.search(r"^ls", "ls && rm -rf /")` matchea (encuentra "ls" al inicio). Pero incluso con `re.fullmatch`, un patrón con `.*` como `^ls\\s.*` matchearía `"ls && rm -rf /"` porque `.*` acepta cualquier carácter. Para seguridad, SIEMPRE usar un allowlist de caracteres seguros: `^ls\\s[a-zA-Z0-9_./ -]+$` — esto solo permite caracteres explícitamente seguros y rechaza metacaracteres de shell como `;`, `&`, `|`, `` ` ``, `>`, `<`, `(`, `)`, `$`, etc.
+</Concept>
+
+## Orden de Evaluación
+
+Las reglas se evalúan **en orden** — la primera que matchea gana:
+
+```yaml
+rules:
+  # Primero: regla específica que permite rm en /tmp
+  - id: "rm_tmp_allow"
+    target_tool: "run_command"
+    argument_match:
+      command: "^rm -rf /tmp/[^;&|]+$"
+    action: "allow"
+
+  # Después: regla general que bloquea todo rm
+  - id: "rm_block"
+    target_tool: "run_command"
+    argument_match:
+      command: "^rm\\s.*"
+    action: "block"
+```
+
+<Callout variant="warning" title="Orden importa">
+`rm -rf /tmp/cache` matchea la primera regla (allow). `rm -rf /home/user` no matchea la primera pero sí la segunda (block). Si invertís el orden, TODOS los `rm` se bloquearían — la regla genérica se comería a la específica.
+</Callout>
+
+## Fail-Closed: Configuración Rota
+
+```python
+def _load_policy(self):
+    try:
+        with self.policy_path.open() as f:
+            data = yaml.safe_load(f)
+        self._policy = BasePolicy(
+            version=data.get("version", "1.0"),
+            default_action=PolicyAction(
+                data.get("default_action", "block")
+            ),
+            rules=[PolicyRule(**r) for r in data.get("rules", [])],
+        )
+    except FileNotFoundError:
+        logger.error(
+            "Policy file not found: %s. Create it.",
+            self.policy_path,
+        )
+        self._misconfigured = True
+    except Exception:
+        logger.exception("Failed to load security policy")
+        self._misconfigured = True
+```
+
+<Callout variant="error" title="Fail-closed, no fail-open">
+Si el archivo YAML no existe o tiene errores, `_misconfigured = True` y TODAS las evaluaciones retornan BLOCK. Esto es **fail-closed** — el sistema prefiere bloquear todo a permitir algo por error de configuración. Contraste con guardrails que son fail-open.
+</Callout>
+
+## Integración con el Tool Loop
+
+```python
+# En execute_tool_loop, antes de ejecutar cada tool
+if policy_engine:
+    decision = policy_engine.evaluate(
+        tool_name=tool_call.name,
+        arguments=tool_call.arguments,
+    )
+
+    if decision.is_blocked:
+        result = f"BLOCKED: {decision.reason}"
+    elif decision.requires_flag:
+        if hitl_callback:
+            approved = await hitl_callback(
+                tool_call.name,
+                tool_call.arguments,
+                decision.reason,
+            )
+            if not approved:
+                result = "DENIED by user"
+            else:
+                result = await execute_tool(tool_call)
+        else:
+            result = f"BLOCKED: HITL required but no callback"
+    else:
+        result = await execute_tool(tool_call)
+```
+
+<Quiz
+  question="¿Qué pasa si el archivo security_policies.yaml tiene un error de sintaxis?"
+  options={[
+    "Se ignoran las reglas y se permite todo",
+    "Se usa un archivo default",
+    "Se bloquea TODO (fail-closed: _misconfigured = True)",
+    "Se reinicia la app"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué se usa re.fullmatch en vez de re.search?"
+  options={[
+    "Porque es más rápido",
+    "Porque fullmatch requiere que el patrón coincida con TODO el string, evitando bypasses parciales",
+    "Porque search no soporta regex",
+    "No hay diferencia"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Si hay dos reglas y ambas matchean, ¿cuál se aplica?"
+  options={[
+    "La más restrictiva",
+    "La menos restrictiva",
+    "La primera en orden de aparición en el YAML",
+    "Se combinan ambas"
+  ]}
+  correct={2}
+/>
+
+En la siguiente lección veremos el AuditTrail con hash chain SHA-256.

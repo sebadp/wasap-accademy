@@ -1,0 +1,260 @@
+---
+title: "TelegramClient"
+description: "Implementación del Protocol para Telegram Bot API con HTML formatting"
+xpReward: 100
+---
+
+## Telegram Bot API: Las Diferencias Clave
+
+| Aspecto | WhatsApp | Telegram |
+|---------|----------|----------|
+| Formato texto | WhatsApp markdown | HTML (`<b>`, `<i>`, `<code>`) |
+| Media download | Dos pasos (get URL → download) | Dos pasos (getFile → download) |
+| Typing indicator | Emoji reaction (⏳) | `sendChatAction(typing)` auto-expire |
+| Max mensaje | 4096 chars | 4096 chars |
+| Webhook secret | HMAC-SHA256 | X-Telegram-Bot-Api-Secret-Token header |
+| Message IDs | String UUID | Integer |
+
+## El Client
+
+```python
+# app/telegram/client.py
+class TelegramClient:
+    BASE_URL = "https://api.telegram.org"
+
+    def __init__(self, http_client: httpx.AsyncClient, token: str):
+        self._http = http_client
+        self._token = token
+        self._api = f"{self.BASE_URL}/bot{token}"
+
+    async def send_message(self, chat_id: str, text: str) -> str | None:
+        """Enviar mensaje. Strip 'tg_' prefix."""
+        cid = chat_id.removeprefix("tg_")
+
+        # Formatear markdown → HTML
+        formatted = self.format_text(text)
+
+        # Split si > 4096 chars
+        chunks = split_message(formatted, max_length=4096)
+
+        last_id = None
+        for chunk in chunks:
+            resp = await self._http.post(
+                f"{self._api}/sendMessage",
+                json={
+                    "chat_id": cid,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                },
+            )
+            if resp.is_success:
+                data = resp.json()
+                last_id = str(data["result"]["message_id"])
+
+        return last_id
+```
+
+<Callout variant="warning" title="removeprefix('tg_')">
+Internamente LocalForge usa `tg_12345` como identificador. Pero la API de Telegram espera solo `12345`. El `removeprefix` maneja ambos casos: si viene con prefijo lo quita, si no viene no hace nada.
+</Callout>
+
+## Descargar Media
+
+```python
+    async def download_media(self, file_id: str) -> bytes:
+        """Descargar archivo por file_id (Telegram Bot API)."""
+        # Paso 1: obtener file_path
+        resp = await self._http.post(
+            f"{self._api}/getFile",
+            json={"file_id": file_id},
+        )
+        resp.raise_for_status()
+        file_path = resp.json()["result"]["file_path"]
+
+        # Paso 2: descargar el archivo
+        file_url = (
+            f"{self.BASE_URL}/file/bot{self._token}/{file_path}"
+        )
+        file_resp = await self._http.get(file_url)
+        file_resp.raise_for_status()
+        return file_resp.content
+```
+
+## Typing Indicator
+
+```python
+    async def send_typing_indicator(self, chat_id: str) -> None:
+        """Enviar 'typing...' indicator."""
+        cid = chat_id.removeprefix("tg_")
+        await self._http.post(
+            f"{self._api}/sendChatAction",
+            json={"chat_id": cid, "action": "typing"},
+        )
+
+    async def remove_typing_indicator(
+        self, chat_id: str, indicator_id: str | None = None
+    ) -> None:
+        """No-op: Telegram auto-expires typing after ~5 seconds."""
+        pass  # Telegram maneja esto automáticamente
+```
+
+<Concept title="No-op para remove_typing">
+WhatsApp necesita que explícitamente remuevas el emoji de typing (⏳). Telegram auto-expira el indicador después de ~5 segundos o cuando enviás un mensaje. El Protocol requiere el método, pero la implementación es un no-op.
+</Concept>
+
+## Formatting: HTML en vez de Markdown
+
+```python
+# app/formatting/telegram_md.py
+def markdown_to_telegram_html(text: str) -> str:
+    """Convertir markdown a HTML para Telegram.
+
+    IMPORTANTE: HTML escape PRIMERO, luego conversión.
+    Si no, <usuario> se convierte en tag HTML.
+    """
+    # 1. Escapar HTML characters PRIMERO
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+
+    # 2. Convertir markdown a HTML tags
+    # Bold: **text** → <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    # Italic: *text* → <i>text</i>
+    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
+
+    # Code block: ```text``` → <pre>text</pre> (ANTES de inline code)
+    text = re.sub(
+        r"```(?:\w*\n)?(.*?)```",
+        r"<pre>\1</pre>",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Code inline: `text` → <code>text</code>
+    text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
+
+    return text
+```
+
+<Callout variant="error" title="HTML escape PRIMERO">
+El orden es crucial. Si convertís markdown a HTML primero (`**bold**` → `<b>bold</b>`) y después escapás HTML, terminarías con `&lt;b&gt;bold&lt;/b&gt;` — tags visibles en vez de formateo. Escapando primero, protegés el contenido del usuario sin afectar los tags que vos generás.
+</Callout>
+
+## El Parser de Telegram
+
+```python
+# app/telegram/parser.py
+def extract_telegram_messages(payload: dict) -> list[IncomingMessage]:
+    """Parsear Telegram Update → IncomingMessage."""
+    msg = payload.get("message") or payload.get("edited_message")
+    if not msg or "from" not in msg:
+        return []
+
+    from_id = msg["from"]["id"]
+    user_id = f"tg_{from_id}"  # Prefijo para DB
+    message_id = f"tg_{from_id}_{msg['message_id']}"
+
+    # Determinar tipo de contenido
+    if "text" in msg:
+        return [IncomingMessage(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            message_id=message_id,
+            text=msg["text"],
+            type="text",
+            ...
+        )]
+    elif "voice" in msg or "audio" in msg:
+        media = msg.get("voice") or msg["audio"]
+        return [IncomingMessage(
+            type="audio",
+            media_id=media["file_id"],
+            ...
+        )]
+    elif "photo" in msg:
+        # Usar la foto de mayor resolución
+        photo = msg["photo"][-1]
+        return [IncomingMessage(
+            type="image",
+            media_id=photo["file_id"],
+            text=msg.get("caption", ""),
+            ...
+        )]
+    return []
+```
+
+## El Webhook Router
+
+```python
+# app/telegram/router.py
+@router.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks):
+    settings = get_settings(request)
+    if not settings.telegram_enabled:
+        return {"ok": True}
+
+    # Validar secret token
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+    if settings.telegram_webhook_secret:
+        if secret != settings.telegram_webhook_secret:
+            raise HTTPException(403, "Invalid secret")
+
+    payload = await request.json()
+    messages = extract_telegram_messages(payload)
+
+    for msg in messages:
+        # Whitelist check
+        chat_id = msg.user_id.removeprefix("tg_")
+        if settings.allowed_telegram_chat_ids:
+            if chat_id not in settings.allowed_telegram_chat_ids:
+                continue
+
+        # Process via shared function
+        background_tasks.add_task(
+            process_message_generic,
+            msg=msg,
+            platform_client=telegram_client,
+            ...
+        )
+
+    return {"ok": True}
+```
+
+<Quiz
+  question="¿Por qué se escapa HTML ANTES de convertir markdown a HTML tags?"
+  options={[
+    "Porque es más rápido",
+    "Para evitar que contenido del usuario como '<script>' se interprete como HTML, mientras los tags generados por el formatter no se afectan",
+    "Porque Telegram lo requiere",
+    "No importa el orden"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué hace remove_typing_indicator en TelegramClient?"
+  options={[
+    "Envía un mensaje especial",
+    "Borra el indicador via API",
+    "Nada (no-op) — Telegram auto-expira el indicador después de ~5 segundos",
+    "Envía un emoji"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Cómo identifica el sistema de qué plataforma viene un usuario?"
+  options={[
+    "Tabla separada de plataformas",
+    "El user_id tiene prefijo: 'tg_' para Telegram, sin prefijo para WhatsApp",
+    "Header del webhook",
+    "Campo 'platform' en cada mensaje"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos MCP (Model Context Protocol) para integrar tools externas.

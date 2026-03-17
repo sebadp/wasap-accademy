@@ -1,0 +1,201 @@
+---
+title: "El Presupuesto de Tokens"
+description: "Estimar y monitorear el uso de tokens para no exceder la ventana de contexto"
+xpReward: 50
+---
+
+## Cada Token Cuenta
+
+Los LLMs tienen una ventana de contexto finita. qwen3.5:9b tiene **~32K tokens**. Todo lo que envías al modelo -- system prompt, memorias, historial, tool schemas, daily logs -- compite por ese espacio.
+
+<Callout variant="warning" title="Si excedés el límite">
+Si el contexto supera 32K tokens, el modelo trunca silenciosamente la entrada. Puede perder instrucciones del system prompt, memorias del usuario, o historial reciente. El resultado: respuestas genéricas, contradictorias, o que ignoran el contexto.
+</Callout>
+
+## Estimación: chars/4 con Auto-Calibración
+
+LocalForge usa una heurística inicial de **1 token ~ 4 caracteres**, pero se auto-calibra en runtime usando los conteos reales que Ollama devuelve en cada respuesta:
+
+```python
+# app/context/token_estimator.py
+_CONTEXT_LIMIT = 32_000  # qwen3.5:9b context window
+_DEFAULT_RATIO = 4.0     # fallback: chars / 4
+
+# Runtime calibration state
+_token_ratios: dict[str, float] = {}  # model_name → chars_per_token ratio
+_EMA_ALPHA = 0.3  # weight of new observation vs history
+
+def estimate_tokens(text: str, model: str = "default") -> int:
+    """Estimate token count using the calibrated ratio (fallback: chars/4)."""
+    ratio = _token_ratios.get(model, _DEFAULT_RATIO)
+    return max(1, int(len(text) / ratio))
+```
+
+<Concept title="Auto-calibración con EMA">
+Cada vez que Ollama responde, incluye `prompt_eval_count` (tokens reales del prompt). LocalForge usa este dato para actualizar el ratio chars/token con un **Exponential Moving Average**. Después de ~10 requests, el ratio converge a menos del 5% de error vs el tokenizer real.
+</Concept>
+
+## La Función calibrate()
+
+La calibración se activa automáticamente desde `OllamaClient.chat_with_tools()`:
+
+```python
+# app/context/token_estimator.py
+def calibrate(model: str, char_count: int, actual_tokens: int) -> None:
+    """Update chars-per-token ratio using exponential moving average."""
+    if actual_tokens <= 0 or char_count <= 0:
+        return
+    observed_ratio = char_count / actual_tokens
+
+    # Clamp to plausible BPE range (2-6 chars/token)
+    if observed_ratio < 2.0 or observed_ratio > 6.0:
+        return  # Skip outlier
+
+    old_ratio = _token_ratios.get(model)
+    if old_ratio is not None:
+        _token_ratios[model] = _EMA_ALPHA * observed_ratio + (1 - _EMA_ALPHA) * old_ratio
+    else:
+        _token_ratios[model] = observed_ratio
+```
+
+Y se llama desde el client de Ollama:
+
+```python
+# app/llm/client.py — dentro de chat_with_tools()
+# Runtime calibration: update chars-per-token ratio from actual Ollama counts
+# Skip when tools present — tool schemas add tokens not attributable to text chars
+if input_tokens and input_tokens > 0 and not tools:
+    try:
+        from app.context.token_estimator import calibrate
+        prompt_chars = sum(len(d.get("content", "") or "") for d in payload["messages"])
+        calibrate(use_model, prompt_chars, input_tokens)
+    except Exception:
+        pass  # best-effort, never block
+```
+
+<Callout variant="tip" title="¿Por qué skip cuando hay tools?">
+Los tool schemas agregan tokens que no corresponden al texto de los mensajes. Incluirlos corrompería el ratio chars/token. Solo se calibra con llamadas sin tools, donde chars y tokens tienen una relación directa.
+</Callout>
+
+## Monitoreo del Budget
+
+El módulo ofrece múltiples niveles de monitoreo:
+
+```python
+# app/context/token_estimator.py
+def log_context_budget(
+    messages: list[ChatMessage],
+    context_limit: int = _CONTEXT_LIMIT,
+    model: str = "default",
+) -> int:
+    """Log estimated token usage and warn if nearing or exceeding limit."""
+    estimate = sum(estimate_tokens(m.content or "", model) for m in messages)
+
+    if estimate > context_limit:
+        logger.error("context.budget.exceeded: %d estimated tokens (limit=%d)",
+                     estimate, context_limit)
+    elif estimate > context_limit * 0.8:
+        logger.warning("context.budget.near_limit: %d estimated tokens (%.0f%%)",
+                       estimate, estimate / context_limit * 100)
+    else:
+        logger.info("context.budget: %d estimated tokens", estimate)
+
+    return estimate
+```
+
+Niveles de alerta:
+
+| Uso | Nivel de Log | Significado |
+|-----|-------------|-------------|
+| **< 80%** | INFO | Normal, hay margen para la respuesta |
+| **80-100%** | WARNING | Cerca del límite, considerar reducir contexto |
+| **> 100%** | ERROR | Sobre el presupuesto, el modelo va a truncar |
+
+## Breakdown por Sección
+
+Para diagnosticar qué sección consume más tokens:
+
+```python
+# app/context/token_estimator.py
+def estimate_sections(
+    sections: dict[str, str | None], model: str = "default"
+) -> dict[str, int]:
+    """Compute token estimate per named section."""
+    return {
+        name: estimate_tokens(text, model) if text else 0
+        for name, text in sections.items()
+    }
+
+def log_context_budget_breakdown(sections: dict[str, int]) -> None:
+    """Log structured token breakdown per context section."""
+    total = sum(sections.values())
+    if not sections:
+        return
+    largest_section = max(sections, key=lambda k: sections[k])
+    logger.info(
+        "context.budget.breakdown: total=%d largest=%s",
+        total, largest_section,
+        extra={"token_breakdown": sections, "total": total},
+    )
+```
+
+## Budget por Sección (Referencia)
+
+| Sección | Budget aproximado | Prioridad |
+|---------|-------------------|-----------|
+| System prompt | ~2K tokens | Siempre presente |
+| Memorias del usuario | ~1-2K tokens | Alta (top-K semántico) |
+| Historial (8 mensajes) | ~4-6K tokens | Alta |
+| Notas relevantes | ~1K tokens | Media |
+| Notas de proyecto | ~1-2K tokens | Media |
+| Daily logs | ~1K tokens | Media |
+| Tool schemas | ~2-3K tokens | Solo si hay tools activos |
+| Conversation summary | ~0.5-1K tokens | Baja |
+| **Total típico** | **~12-18K** | **~40-55% del contexto** |
+
+<Callout variant="tip" title="Dejar margen para la respuesta">
+El modelo necesita tokens para generar su respuesta. Si usás 30K de los 32K en contexto, solo quedan 2K para la respuesta. La recomendación es mantener el contexto por debajo del 60% del límite.
+</Callout>
+
+## Observabilidad: get_calibration_info()
+
+Para debugging, podés consultar el estado de calibración:
+
+```python
+# app/context/token_estimator.py
+def get_calibration_info(model: str = "default") -> dict:
+    """Return current calibration state for observability."""
+    ratio = _token_ratios.get(model)
+    return {
+        "model": model,
+        "calibrated": ratio is not None,
+        "chars_per_token": round(ratio, 3) if ratio is not None else _DEFAULT_RATIO,
+        "known_models": list(_token_ratios.keys()),
+    }
+# Ejemplo: {"model": "qwen3.5:9b", "calibrated": True, "chars_per_token": 3.412}
+```
+
+<Quiz
+  question="¿Cuántos tokens estima la heurística chars/4 para un texto de 4000 caracteres?"
+  options={["500", "1000", "2000", "4000"]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿A qué porcentaje del budget se emite un WARNING?"
+  options={["50%", "70%", "80%", "95%"]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué se usa un EMA (Exponential Moving Average) para calibrar el ratio?"
+  options={[
+    "Porque es más rápido que un promedio simple",
+    "Para ponderar más las observaciones recientes sin perder el historial",
+    "Porque el tokenizer de Ollama cambia con cada request",
+    "Para evitar que el ratio sea negativo"
+  ]}
+  correct={1}
+/>
+
+En la siguiente lección veremos cómo ContextBuilder ensambla todas las secciones en un solo mensaje.

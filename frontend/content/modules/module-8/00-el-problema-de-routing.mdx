@@ -1,0 +1,176 @@
+---
+title: "El Problema de Routing"
+description: "Por que un LLM pequeno no puede manejar 60+ herramientas"
+xpReward: 50
+---
+
+## 60 Tools vs 6 Tools
+
+LocalForge tiene mas de 60 herramientas distribuidas en 20 categorias. Pero qwen3.5:9b solo puede manejar ~6 tools confiablemente por llamada. Si le pasas las 60, **ignora todas**.
+
+<Callout variant="warning" title="Descubrimiento empirico">
+Esto no esta documentado oficialmente por Ollama ni por los creadores de qwen3. Se descubrio experimentando en produccion: a partir de ~15 tools, el modelo empieza a inventar nombres de tools que no existen.
+</Callout>
+
+## La Escala del Problema
+
+Estas son las categorias reales de LocalForge en `app/skills/router.py`:
+
+```python
+TOOL_CATEGORIES: dict[str, list[str]] = {
+    "time": ["get_current_datetime", "convert_timezone",
+             "schedule_task", "list_schedules", "create_cron", ...],  # 7 tools
+    "math": ["calculate"],                                             # 1 tool
+    "weather": ["get_weather"],                                        # 1 tool
+    "search": ["web_search"],                                          # 1 tool
+    "news": ["search_news", "add_news_preference"],                    # 2 tools
+    "notes": ["save_note", "list_notes", "search_notes", ...],        # 5 tools
+    "files": ["read_file", "write_file", "list_directory", ...],      # 6 tools
+    "memory": ["create_entities", "add_observations", ...],            # 9 tools
+    "github": ["get_file_contents", "search_repositories", ...],      # 7 tools
+    "selfcode": ["get_version_info", "read_source_file", ...],        # 10 tools
+    "expand": ["search_mcp_registry", "install_from_smithery", ...],  # 9 tools
+    "projects": ["create_project", "add_task", ...],                   # 12 tools
+    "evaluation": ["get_eval_summary", "diagnose_trace", ...],        # 9 tools
+    "debugging": ["review_interactions", "write_debug_report", ...],  # 5 tools
+    "shell": ["run_command", "manage_process"],                        # 2 tools
+    # ... y mas categorias
+}
+```
+
+<Concept title="El total crece con MCP">
+Las 60+ herramientas builtin son solo el inicio. Cada MCP server conectado agrega mas. Un setup tipico con GitHub, Fetch, y Filesystem puede tener 80+ tools.
+</Concept>
+
+## Que Pasa Sin Routing
+
+Sin routing, todas las herramientas van al LLM en cada llamada. Los resultados son desastrosos:
+
+| # Tools | Comportamiento de qwen3.5:9b |
+|---------|-------------------------------|
+| 1-5 | Excelente: selecciona el tool correcto |
+| 6-8 | Bueno: a veces ignora un tool relevante |
+| 9-14 | Regular: inventa tools que no existen |
+| 15+ | Malo: ignora todos los tools por completo |
+| 60+ | Catastrofico: output incoherente o vacio |
+
+```
+# Ejemplo real: 60+ tools en el payload
+Usuario: "Que hora es?"
+LLM con 60 tools: "Buenos dias! Son las 14:30 de la tarde."
+                   ^ Invento la hora en vez de usar get_current_datetime
+
+# Mismo mensaje con 5 tools
+LLM con 5 tools: [tool_call: get_current_datetime()]
+                  -> "Son las 14:32 ART (Argentina Time)"
+                  ^ Uso la herramienta correctamente
+```
+
+<Callout variant="error" title="El LLM no dice 'no se'">
+Cuando tiene demasiadas herramientas, el modelo no dice "no encontre la herramienta correcta". Simplemente *inventa* la respuesta o llama a tools inexistentes. Es un fallo silencioso y peligroso.
+</Callout>
+
+## La Solucion: Two-Stage Routing
+
+La solucion es un pipeline de dos etapas que reduce 60+ herramientas a 6-8 por llamada:
+
+```
+                      Stage 1                    Stage 2
+Mensaje --> classify_intent() --> categories --> select_tools() --> 6-8 tools
+            "que tipo de              |          "cuales?"
+             pregunta es?"       ["weather",
+                                  "notes"]
+```
+
+<Step number={1} title="Stage 1: Clasificar intencion (LLM)">
+Una llamada LLM **rapida** (sin tools, con `think=False`) clasifica el mensaje del usuario en categorias. No genera structured output -- solo devuelve nombres de categorias separados por comas.
+
+```python
+# Mensaje: "Busca el clima y guardalo en una nota"
+# LLM retorna: "weather, notes"
+```
+</Step>
+
+<Step number={2} title="Stage 2: Seleccionar tools (deterministico)">
+Un mapeo con diccionario (sin LLM) convierte categorias en herramientas especificas. Se distribuye un budget proporcional y se capea a `max_tools_per_call` (default: 8).
+
+```python
+# ["weather", "notes"] -> [get_weather, save_note, list_notes, ...]
+# Total: 6 tools (dentro del budget)
+```
+</Step>
+
+## Por Que Esta Arquitectura Funciona
+
+| Aspecto | Sin routing | Con routing |
+|---------|------------|-------------|
+| Tools por llamada | 60+ | 6-8 |
+| Confiabilidad | ~10% | ~95% |
+| Latencia classify | 0ms | ~200ms |
+| Latencia total neta | +2s (confusion) | ~200ms overhead |
+| Fallos silenciosos | Frecuentes | Raros |
+
+<Concept title="El overhead se paga solo">
+200ms extra de clasificacion ahorra 2+ segundos de confusion del modelo. Es una inversion neta positiva. Ademas, la clasificacion se ejecuta en paralelo con I/O (Phase C) gracias a `asyncio.create_task`.
+</Concept>
+
+## Principios de Diseno
+
+La arquitectura del router sigue principios claros:
+
+1. **Stage 1 es LLM, Stage 2 es codigo**: separar la parte no-deterministica (clasificacion) de la deterministica (seleccion) permite testear cada una independientemente.
+
+2. **Fail-safe con defaults**: si la clasificacion falla, se usan categorias default que cubren los casos mas comunes.
+
+3. **Extensible via categorias**: agregar un nuevo MCP server no requiere cambiar el clasificador -- solo registrar una nueva categoria en `TOOL_CATEGORIES`.
+
+4. **Meta-tool como escape hatch**: si el router no selecciono la herramienta correcta, el LLM puede pedirla en runtime via `request_more_tools`.
+
+<Callout variant="tip" title="La clasificacion es un chat normal">
+`classify_intent` es simplemente un LLM call **sin tools** (solo texto). Le pedimos al modelo que responda con nombres de categorias. Es rapida porque no necesita generar structured output ni JSON -- solo texto plano con comas.
+</Callout>
+
+## Paralelizacion en el Critical Path
+
+La clasificacion no bloquea el pipeline principal. Se lanza como tarea asincrona temprano:
+
+```python
+# En router.py -- Phase C del critical path
+classify_task = asyncio.create_task(
+    classify_intent(user_message, ollama_client, ...)
+)
+# ... otros computos en paralelo ...
+categories = await classify_task  # Solo esperar cuando se necesita
+```
+
+Esto significa que los ~200ms de clasificacion se superponen con el I/O de base de datos y embeddings.
+
+<Quiz
+  question="Cuantas herramientas puede manejar qwen3.5:9b de forma confiable por llamada?"
+  options={["2-3", "5-6", "15-20", "Ilimitadas"]}
+  correct={1}
+/>
+
+<Quiz
+  question="Cuantos stages tiene el routing de LocalForge?"
+  options={[
+    "1: pasar todos los tools al LLM",
+    "2: classify_intent (LLM) seguido de select_tools (deterministico)",
+    "3: classify, filter y select con tres llamadas LLM",
+    "4: parse, classify, filter y select"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa si la clasificacion LLM falla (timeout, output invalido)?"
+  options={[
+    "La app retorna un error al usuario",
+    "Se reintenta la clasificacion hasta 3 veces",
+    "Se usan DEFAULT_CATEGORIES como fallback seguro",
+    "Se envian todas las 60+ herramientas al LLM"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como funciona classify_intent en detalle.

@@ -1,0 +1,157 @@
+---
+title: "Profiling del Critical Path"
+description: "Las 4 fases de _handle_message y cómo identificar bottlenecks en el procesamiento de mensajes"
+xpReward: 50
+---
+
+## El Camino Crítico
+
+Cada mensaje que llega a LocalForge pasa por un **critical path**: la secuencia de operaciones que determina cuánto tarda la respuesta. Entender este camino es el primer paso para optimizar.
+
+<Concept title="Critical Path">
+En performance, el critical path es la cadena más larga de operaciones dependientes. Si dos operaciones son independientes, se pueden paralelizar. Si son dependientes (una necesita el resultado de la otra), se ejecutan en serie. El tiempo total es la suma del critical path, no de todas las operaciones.
+</Concept>
+
+## Las 4 Fases
+
+`_handle_message` en `router.py` divide el procesamiento en 4 fases:
+
+```
+Mensaje entrante
+    │
+    ▼
+┌─────────────── Phase A ───────────────┐
+│  embed(query) ║ save_message ║ daily  │  paralelo
+└───────────────────────────────────────┘
+    │
+    ▼
+┌─────────────── Phase B ───────────────┐
+│  search_memories ║ search_notes ║     │
+│  get_summary ║ get_recent ║ projects  │  paralelo
+└───────────────────────────────────────┘
+    │
+    ▼
+┌─────────────── Phase C ───────────────┐
+│  classify_intent (ya corriendo) +     │
+│  load sticky_categories +             │  serie
+│  extract user_facts                   │
+└───────────────────────────────────────┘
+    │
+    ▼
+┌─────────────── Phase D ───────────────┐
+│  _build_context() (sync, sin I/O)    │
+│          ▼                            │  serie
+│  LLM principal (chat/tool_loop)      │
+└───────────────────────────────────────┘
+```
+
+<Callout variant="info" title="classify_intent es un async task">
+`classify_intent` se lanza como `asyncio.create_task()` ANTES de Phase A, así corre en paralelo con toda la I/O de las fases A y B. Para cuando llegamos a Phase C, probablemente ya terminó.
+</Callout>
+
+## Tiempos Típicos
+
+| Fase | Operaciones | Tiempo típico |
+|------|-------------|---------------|
+| Phase A | embed + save + daily logs | ~100-200ms |
+| Phase B | 5 queries paralelas | ~50-150ms |
+| Phase C | classify (pre-started) + extras | ~10-50ms |
+| Phase D | build context + LLM | ~500-3000ms |
+
+**Bottleneck claro**: Phase D (el LLM) domina el tiempo total. Las fases A-C juntas toman ~200-400ms, el LLM puede tomar 1-3 segundos.
+
+## Identificando Bottlenecks
+
+```python
+# Instrumentación con logging
+import time
+
+async def _handle_message(phone, text, ...):
+    t0 = time.perf_counter()
+
+    # Phase A
+    t_a = time.perf_counter()
+    query_embedding, _, daily_logs = await asyncio.gather(
+        _get_query_embedding(text, ollama),
+        repository.save_message(conv_id, "user", text),
+        daily_log.get_context(days=settings.daily_log_days),
+    )
+    logger.debug("Phase A: %.0fms", (time.perf_counter() - t_a) * 1000)
+
+    # Phase B
+    t_b = time.perf_counter()
+    memories, notes, summary, recent, projects = await asyncio.gather(
+        _search_memories(query_embedding, repository, settings),
+        _search_notes(query_embedding, repository),
+        conversation.get_summary(conv_id),
+        repository.get_recent_messages(conv_id, limit=8),
+        _get_projects_summary(repository),
+    )
+    logger.debug("Phase B: %.0fms", (time.perf_counter() - t_b) * 1000)
+
+    # ...phases C, D...
+    logger.info("Total: %.0fms", (time.perf_counter() - t0) * 1000)
+```
+
+## Diagrama de Dependencias
+
+```
+embed(query) ─────────┐
+save_message ──────────┤ Phase A (paralelo)
+load_daily_logs ───────┘
+        │
+        ▼
+search_memories ◄── necesita query_embedding de Phase A
+search_notes ◄──── necesita query_embedding de Phase A
+get_summary ───────┤ Phase B (paralelo, depende de A)
+get_recent ────────┤
+get_projects ──────┘
+        │
+        ▼
+classify_intent ◄── ya corriendo desde antes de A
+        │
+        ▼
+_build_context() ◄── necesita TODO lo anterior
+        │
+        ▼
+LLM call ◄── necesita el context construido
+```
+
+<Callout variant="tip" title="La clave: maximizar paralelismo">
+Phase B depende de Phase A (necesita el `query_embedding`), pero las 5 operaciones de Phase B son independientes entre sí. El truco es identificar estas independencias y usar `asyncio.gather`.
+</Callout>
+
+<Quiz
+  question="¿Cuál es el bottleneck principal en el critical path de _handle_message?"
+  options={[
+    "Phase A (embed + save)",
+    "Phase B (search queries)",
+    "Phase C (classify intent)",
+    "Phase D (LLM principal)"
+  ]}
+  correct={3}
+/>
+
+<Quiz
+  question="¿Por qué classify_intent se lanza como asyncio.create_task antes de Phase A?"
+  options={[
+    "Porque es la operación más rápida",
+    "Para que corra en paralelo con la I/O de las fases A y B, aprovechando tiempo que de otra forma sería de espera",
+    "Porque no necesita ningún dato del mensaje",
+    "Para poder cancelarlo si tarda mucho"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Por qué Phase B depende de Phase A pero las 5 operaciones dentro de Phase B son independientes entre sí?"
+  options={[
+    "Porque Phase B necesita el query_embedding calculado en Phase A, pero sus propias queries (memories, notes, summary, recent, projects) no dependen unas de otras",
+    "Porque Phase A es más rápida que Phase B",
+    "Porque asyncio.gather solo permite un nivel de paralelismo",
+    "Porque todas las queries de Phase B usan la misma tabla de SQLite"
+  ]}
+  correct={0}
+/>
+
+En la siguiente lección veremos las técnicas específicas de asyncio que hacen posible esta paralelización.

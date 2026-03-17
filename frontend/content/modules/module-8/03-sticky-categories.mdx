@@ -1,0 +1,208 @@
+---
+title: "Sticky Categories"
+description: "Mantener herramientas disponibles entre turnos de conversacion"
+xpReward: 75
+---
+
+## El Problema de Continuidad
+
+El usuario esta trabajando con proyectos y dice "Como va?". Sin contexto, classify_intent retorna `["none"]` -- sin herramientas. Pero el usuario espera una respuesta sobre sus proyectos.
+
+<Callout variant="warning" title="Perdida de contexto">
+Cada clasificacion es independiente. El LLM clasificador no tiene memoria de turnos anteriores (solo ve los ultimos 3 turnos via `recent_messages`). Mensajes ambiguos como "ambos", "dale", "y lo otro?" se clasifican como "none" sin contexto.
+</Callout>
+
+## Como Funcionan las Sticky Categories
+
+La logica esta dentro de `classify_intent` en `app/skills/router.py`. Cuando el clasificador retorna "none", se intenta rescatar con las categorias del turno anterior:
+
+```python
+async def classify_intent(
+    user_message: str,
+    ollama_client: OllamaClient,
+    recent_messages: list[ChatMessage] | None = None,
+    sticky_categories: list[str] | None = None,
+) -> list[str]:
+    # ... (llamada al LLM, parseo de respuesta) ...
+
+    if raw == "none":
+        # Fast-path: URL override
+        if has_url and "fetch" in TOOL_CATEGORIES:
+            return ["fetch"]
+
+        # Sticky fallback: reusar categorias del turno anterior
+        if sticky_categories:
+            logger.info(
+                "Classifier returned 'none', falling back to sticky: %s",
+                sticky_categories,
+            )
+            return sticky_categories
+
+        return ["none"]
+```
+
+<Concept title="Sticky = herencia de contexto sin LLM">
+Las sticky categories son el mecanismo mas simple de continuidad: si el turno anterior uso herramientas de "projects", y el turno actual es ambiguo, se reusan esas categorias. No requiere una segunda llamada LLM ni re-clasificacion con contexto.
+</Concept>
+
+## Flujo Visual Completo
+
+```
+Turno 1: "Crea un proyecto llamado API v2"
+  classify("Crea un proyecto...") -> ["projects"]
+  save_sticky(["projects"])
+  -> tools: create_project, list_projects, ...
+  -> Respuesta: "Cree el proyecto API v2"
+
+Turno 2: "Agrega 3 tareas"
+  classify("Agrega 3 tareas") -> ["projects"]  (keywords claros)
+  save_sticky(["projects"])
+  -> tools: add_task, ...
+  -> Respuesta: "Agregue 3 tareas al proyecto"
+
+Turno 3: "Como va?"
+  classify("Como va?") -> "none"  (ambiguo, sin keywords)
+  sticky_categories = ["projects"]
+  -> Retorna ["projects"] (sticky fallback)
+  -> tools: project_progress, get_project, ...
+  -> Respuesta: "El proyecto API v2 tiene 3 tareas, 0 completadas"
+
+Turno 4: "Gracias, ahora contame un chiste"
+  classify("Gracias, ahora contame un chiste") -> "none"
+  sticky_categories = ["projects"]
+  -> Pero esta vez es genuinamente chat casual
+  -> Retorna ["projects"] por el sticky  (*falso positivo*)
+  -> El LLM recibe tools pero NO las usa -> responde con texto
+```
+
+<Callout variant="tip" title="Falso positivo controlado">
+Si las sticky categories se activan cuando no deberian, el impacto es menor: el LLM recibe tools pero simplemente no las usa y responde con texto. Es mejor tener tools disponibles de mas que quedarse sin ellas cuando se necesitan.
+</Callout>
+
+## Almacenamiento de Stickies
+
+Las sticky categories se pasan como parametro al executor desde `router.py`. El flujo principal las maneja asi:
+
+```python
+# En _handle_message (router.py, simplificado)
+# Phase C: clasificar intencion
+categories = await classify_intent(
+    user_message,
+    ollama_client,
+    recent_messages=recent_messages,
+    sticky_categories=sticky_categories,  # Del turno anterior
+)
+
+# Las categorias se guardan para el proximo turno
+if categories != ["none"]:
+    # Solo actualizar sticky si hay categorias concretas
+    await repository.save_conversation_state(
+        phone_number, "sticky_categories", json.dumps(categories)
+    )
+```
+
+<Callout variant="info" title="Las stickies NO se sobreescriben con 'none'">
+Si la clasificacion retorna `["none"]` (y el sticky fallback tambien da "none"), las sticky categories previas se mantienen intactas. Solo se actualizan cuando hay categorias concretas. Esto preserva el contexto para mensajes futuros.
+</Callout>
+
+## Persistencia en conversation_state
+
+Las sticky categories viven en la tabla `conversation_state`, un key-value store por usuario:
+
+```sql
+CREATE TABLE IF NOT EXISTS conversation_state (
+    phone_number TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT (datetime('now')),
+    PRIMARY KEY (phone_number, key)
+);
+
+-- Ejemplo de datos:
+INSERT OR REPLACE INTO conversation_state
+    (phone_number, key, value)
+VALUES
+    ('+5491100000', 'sticky_categories', '["projects"]');
+```
+
+<Concept title="Key-value simple y extensible">
+`conversation_state` no es solo para stickies -- guarda cualquier estado por usuario con un par key/value. Otros usos incluyen preferencias de idioma, configuraciones del agente, etc.
+</Concept>
+
+## Cuando se Limpian las Stickies
+
+Las sticky categories no tienen TTL (time-to-live) explicito. Se limpian en estos casos:
+
+1. **Categoria concreta nueva**: si el turno siguiente clasifica como `["weather"]`, eso reemplaza `["projects"]`.
+2. **Comando /clear**: limpiar la conversacion tambien limpia el estado.
+3. **Inactividad prolongada**: si el usuario no escribe por horas y vuelve con un tema nuevo, el clasificador detecta la nueva intencion y actualiza las stickies.
+
+## Comparacion: Stickies vs Re-clasificacion con Contexto
+
+Una alternativa a las stickies seria hacer una segunda llamada LLM con contexto:
+
+```python
+# Alternativa: re-clasificar con contexto (NO usado en produccion)
+if categories == ["none"]:
+    categories = await classify_intent(
+        messages,
+        context=f"Previous categories: {sticky}",
+    )
+```
+
+<Callout variant="warning" title="Por que LocalForge no re-clasifica">
+Re-clasificar duplica la latencia (~400ms en vez de ~200ms). Las stickies son instantaneas (un dict lookup) y cubren el 90% de los casos. El trade-off es aceptar un pequeno porcentaje de falsos positivos donde el LLM recibe tools que no necesita.
+</Callout>
+
+## Ejemplo: Multi-categoria con Stickies
+
+```
+Turno 1: "Busca las issues de mi repo y el clima"
+  classify -> ["github", "weather"]
+  save_sticky(["github", "weather"])
+
+Turno 2: "Y los PRs?"
+  classify("Y los PRs?") -> "none"  (ambiguo)
+  sticky -> ["github", "weather"]
+  -> tools: github + weather tools disponibles
+  -> LLM usa list_pull_requests (ignora weather tools)
+
+Turno 3: "Ahora busca noticias de AI"
+  classify("busca noticias de AI") -> ["news"]  (claro)
+  save_sticky(["news"])  -- reemplaza las stickies anteriores
+```
+
+<Quiz
+  question="Cuando se usan las sticky categories?"
+  options={[
+    "Siempre, antes de cada clasificacion",
+    "Como fallback cuando classify_intent retorna ['none'] para mensajes ambiguos",
+    "Solo en modo agente para persistir herramientas entre rondas",
+    "Cuando el usuario las pide explicitamente con un comando"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que pasa si el sticky fallback activa herramientas que el usuario no necesita?"
+  options={[
+    "Se produce un error porque el LLM intenta usar tools irrelevantes",
+    "Se borran las sticky categories automaticamente",
+    "El LLM recibe las tools pero simplemente no las usa y responde con texto",
+    "Se pide al usuario que clarifique su intencion"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Cuando se actualizan las sticky categories?"
+  options={[
+    "En cada turno, incluso si la clasificacion retorna 'none'",
+    "Solo cuando hay categorias concretas (no 'none'), reemplazando las anteriores",
+    "Nunca se actualizan una vez seteadas",
+    "Solo cuando el usuario ejecuta el comando /clear"
+  ]}
+  correct={1}
+/>
+
+En la ultima leccion veremos como testear todo el sistema de routing.

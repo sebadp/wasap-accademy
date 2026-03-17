@@ -1,0 +1,172 @@
+---
+title: "SQLite Async con aiosqlite"
+description: "Base de datos embebida, async, y optimizada para apps de IA local-first"
+xpReward: 50
+---
+
+## Por que SQLite para Apps de IA
+
+Cuando construis un asistente de IA como LocalForge, necesitas una base de datos que sea **rapida**, **embebida** (sin servidor separado), y que soporte el volumen de operaciones de un chatbot. SQLite es la eleccion perfecta para arquitecturas **local-first**.
+
+<Callout variant="info" title="Local-first">
+SQLite vive en un solo archivo. No necesitas PostgreSQL, MySQL ni ningun servidor de base de datos. Esto simplifica enormemente el deploy y reduce la superficie de ataque.
+</Callout>
+
+## aiosqlite: SQLite sin bloquear el Event Loop
+
+FastAPI es completamente async. Si usas `sqlite3` directo, cada query bloquea el event loop y tu app deja de responder. `aiosqlite` resuelve esto ejecutando las queries en un thread dedicado.
+
+<Concept title="Event Loop Blocking">
+En una app async, el event loop procesa una tarea a la vez cooperativamente. Si una query SQL tarda 50ms de forma sincronica, durante esos 50ms NINGUN otro request se procesa. Con aiosqlite, el thread background ejecuta la query mientras el event loop sigue atendiendo otros requests.
+</Concept>
+
+Asi se inicializa la conexion en LocalForge (`app/database/db.py`):
+
+```python
+import aiosqlite
+
+async def init_db(db_path: str, embedding_dims: int = 768) -> tuple[aiosqlite.Connection, bool]:
+    """Initialize database and optionally load sqlite-vec.
+    Returns (connection, vec_available).
+    """
+    # check_same_thread=False allows accessing the raw connection from
+    # the main thread (needed for enable_load_extension during init)
+    conn = await aiosqlite.connect(db_path, check_same_thread=False)
+```
+
+<Callout variant="warning" title="check_same_thread=False">
+SQLite por defecto verifica que la conexion se use solo desde el thread que la creo. Como `aiosqlite` usa un thread interno, necesitamos desactivar esta verificacion. Es seguro porque aiosqlite serializa el acceso internamente.
+</Callout>
+
+## PRAGMA Tuning: Rendimiento de Produccion
+
+LocalForge configura SQLite con PRAGMAs optimizados para rendimiento. Estos se aplican inmediatamente despues de crear la conexion:
+
+```python
+# app/database/db.py — init_db()
+await conn.execute("PRAGMA journal_mode=WAL")        # Write-Ahead Logging
+await conn.execute("PRAGMA synchronous=NORMAL")       # Balance seguridad/velocidad
+await conn.execute("PRAGMA cache_size=-32000")        # 32MB de cache en memoria
+await conn.execute("PRAGMA temp_store=MEMORY")        # Tablas temporales en RAM
+await conn.execute("PRAGMA mmap_size=30000000")       # 30MB de memory-mapped I/O
+await conn.execute("PRAGMA busy_timeout=5000")        # Esperar 5s si la DB esta bloqueada
+await conn.execute("PRAGMA foreign_keys=ON")          # Activar foreign keys
+```
+
+Veamos que hace cada PRAGMA:
+
+| PRAGMA | Efecto | Por que importa |
+|--------|--------|-----------------|
+| `journal_mode=WAL` | Write-Ahead Logging | Lecturas no bloquean escrituras |
+| `synchronous=NORMAL` | fsync menos frecuente | 2-3x mas rapido que FULL, seguro con WAL |
+| `cache_size=-32000` | 32MB page cache | Menos lecturas a disco |
+| `temp_store=MEMORY` | Temp tables en RAM | ORDER BY y JOINs mas rapidos |
+| `mmap_size=30000000` | Memory-mapped I/O | Bypass del page cache del OS |
+| `busy_timeout=5000` | Retry automatico | Evita errores "database is locked" |
+| `foreign_keys=ON` | Activar foreign keys | Garantiza integridad referencial entre tablas |
+
+<Concept title="WAL Mode">
+Sin WAL, SQLite usa un journal que bloquea toda la base de datos durante una escritura. Con WAL, las escrituras van a un archivo separado mientras los lectores siguen leyendo la version anterior. Es **critico** para una app async donde multiples coroutines acceden a la DB simultaneamente.
+</Concept>
+
+## El Patron de Inicializacion con Lifespan
+
+En LocalForge, la conexion se crea durante el `lifespan` de FastAPI. Esto garantiza que la DB este lista antes de recibir requests:
+
+```python
+# app/main.py — lifespan pattern
+from contextlib import asynccontextmanager
+from app.database.db import init_db
+from app.database.repository import Repository
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = Settings()
+    conn, vec_available = await init_db(
+        settings.database_path,
+        settings.embedding_dimensions,
+    )
+    repository = Repository(conn)
+    app.state.repository = repository
+    app.state.vec_available = vec_available
+
+    yield  # La app corre aqui
+
+    await conn.close()  # Cleanup al cerrar
+```
+
+<Callout variant="tip" title="Retorno dual">
+`init_db()` retorna `(conn, vec_available: bool)`. Esto permite **degradacion gracil**: si sqlite-vec no esta disponible, la app funciona sin busqueda vectorial. Nunca falla el startup por una extension opcional.
+</Callout>
+
+## Creacion Idempotente de Tablas
+
+Despues de los PRAGMAs, `init_db()` crea todas las tablas usando `executescript`:
+
+```python
+# app/database/db.py
+await conn.executescript(SCHEMA)          # Tablas principales
+await conn.executescript(TRACING_SCHEMA)  # Trazas y spans
+await conn.executescript(DATASET_SCHEMA)  # Eval dataset
+await conn.executescript(PROMPT_SCHEMA)   # Prompt versioning
+await conn.executescript(ONTOLOGY_SCHEMA) # Knowledge graph
+await conn.executescript(PROVENANCE_SCHEMA) # Audit trail
+await conn.executescript(AUTOMATION_SCHEMA) # Reglas automaticas
+```
+
+<Callout variant="info" title="Idempotencia">
+Todas las tablas usan `CREATE TABLE IF NOT EXISTS`. Podes ejecutar `init_db()` multiples veces sin romper nada. Esto es fundamental para deploys sin downtime y para development donde reinicias la app frecuentemente.
+</Callout>
+
+## Migraciones sin Framework
+
+LocalForge no usa Alembic ni otro framework de migraciones. En su lugar, detecta schemas obsoletos y los actualiza in-place:
+
+```python
+# Ejemplo: migrar tabla traces para agregar 'agent' al CHECK constraint
+cursor = await conn.execute(
+    "SELECT sql FROM sqlite_master WHERE name='traces' AND type='table'"
+)
+row = await cursor.fetchone()
+if row and "'agent'" not in row[0]:
+    logger.info("Migrating traces table: adding 'agent' to message_type CHECK")
+    await conn.executescript(_TRACES_MIGRATION)
+    await conn.commit()
+```
+
+Este patron inspecciona `sqlite_master` para detectar si la migracion ya fue aplicada, evitando cambios innecesarios.
+
+<Quiz
+  question="Por que usamos check_same_thread=False con aiosqlite?"
+  options={[
+    "Para permitir multiples conexiones simultaneas",
+    "Porque aiosqlite ejecuta queries en un thread interno diferente al que creo la conexion",
+    "Para desactivar el WAL mode",
+    "Para mejorar el rendimiento de las queries"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="Que hace PRAGMA synchronous=NORMAL?"
+  options={[
+    "Desactiva la escritura a disco completamente",
+    "Fuerza escritura sincronica despues de cada operacion",
+    "Balancea entre seguridad de datos y velocidad de escritura",
+    "Activa el modo de solo lectura"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="Que retorna init_db() y por que?"
+  options={[
+    "Solo la conexion — sqlite-vec siempre esta disponible",
+    "Un booleano indicando si la DB es nueva",
+    "Una tupla (connection, vec_available) para permitir degradacion gracil sin sqlite-vec",
+    "Un diccionario con todas las tablas creadas"
+  ]}
+  correct={2}
+/>
+
+En la siguiente leccion veremos como se disenan los 13 grupos de tablas que sostienen todo el sistema.

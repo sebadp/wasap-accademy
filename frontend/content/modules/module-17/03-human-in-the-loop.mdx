@@ -1,0 +1,259 @@
+---
+title: "Human-in-the-Loop"
+description: "Pausar agentes para aprobación humana via asyncio.Event y timeout"
+xpReward: 100
+---
+
+## El Concepto: Pausar y Preguntar
+
+Cuando el PolicyEngine marca una acción como FLAG, el agente no puede ejecutarla automáticamente. Necesita **aprobación humana**. Pero el agente corre en una coroutine async — ¿cómo pausarlo y esperar una respuesta por WhatsApp?
+
+<Callout variant="info" title="asyncio.Event como gate">
+`asyncio.Event` es una primitiva de sincronización: una coroutine puede hacer `await event.wait()` y se pausa hasta que otra coroutine llame `event.set()`. Es como un semáforo con dos estados: cerrado (wait) y abierto (set).
+</Callout>
+
+## La Arquitectura
+
+```
+[Agente llama tool flaggeada]
+     ↓
+[PolicyEngine: FLAG → "Push to main requires approval"]
+     ↓
+[request_user_approval() envía mensaje al usuario]
+     ↓
+[await asyncio.Event → agente pausado]
+     ↓                    ↓
+[Usuario responde    [120s timeout]
+ "aprobar" por WA]         ↓
+     ↓              [Retorna "TIMEOUT"]
+[resolve_hitl()
+ → event.set()]
+     ↓
+[Agente continúa con la respuesta del usuario]
+```
+
+## El Módulo HITL
+
+```python
+# app/agent/hitl.py
+import asyncio
+
+# Estado global por usuario
+_approval_events: dict[str, asyncio.Event] = {}
+_approval_replies: dict[str, str] = {}
+
+
+async def request_user_approval(
+    phone_number: str,
+    question: str,
+    wa_client,
+    timeout: int = 120,
+) -> str:
+    """Pausar el agente y esperar respuesta del usuario."""
+    # 1. Crear evento de sincronización
+    event = asyncio.Event()
+    _approval_events[phone_number] = event
+
+    # 2. Enviar pregunta al usuario
+    await wa_client.send_message(
+        phone_number,
+        f"⏸️ {question}\n\n"
+        "Respondé para continuar."
+    )
+
+    # 3. Esperar respuesta (con timeout)
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+        reply = _approval_replies.pop(phone_number, "")
+        return reply
+    except asyncio.TimeoutError:
+        return (
+            "TIMEOUT: The user did not respond within "
+            f"{timeout} seconds. Proceeding with the safest option."
+        )
+    finally:
+        _approval_events.pop(phone_number, None)
+        _approval_replies.pop(phone_number, None)
+```
+
+<Concept title="El evento es per-user">
+Cada usuario tiene su propio `asyncio.Event`. Si dos usuarios tienen agentes corriendo simultáneamente, cada uno espera independientemente. El diccionario `_approval_events` es keyed por `phone_number`.
+</Concept>
+
+## Resolver la Aprobación
+
+Cuando llega un mensaje normal del usuario, el webhook router verifica si hay un HITL pendiente:
+
+```python
+def resolve_hitl(phone_number: str, user_message: str) -> bool:
+    """Resolver un HITL pendiente. Retorna True si fue consumido."""
+    event = _approval_events.get(phone_number)
+    if event and not event.is_set():
+        _approval_replies[phone_number] = user_message
+        event.set()  # Desbloquear al agente
+        return True  # Mensaje fue consumido (no procesar como chat)
+    return False  # No hay HITL pendiente
+```
+
+<Callout variant="warning" title="return True consume el mensaje">
+Si `resolve_hitl` retorna `True`, el webhook router NO procesa ese mensaje como chat normal. Fue "consumido" por el HITL. Esto evita que la respuesta de aprobación genere una respuesta del bot.
+</Callout>
+
+## El Callback de Seguridad
+
+El agente recibe un callback que conecta PolicyEngine con HITL:
+
+```python
+# app/agent/loop.py
+def _build_security_hitl_callback(session, wa_client):
+    """Construir callback de HITL para tools flaggeadas."""
+
+    async def _security_hitl_callback(
+        tool_name: str,
+        arguments: dict,
+        reason: str,
+    ) -> bool:
+        # Pausar la sesión
+        session.status = AgentStatus.WAITING_USER
+
+        # Formatear pregunta de seguridad
+        args_preview = json.dumps(arguments, indent=2)[:200]
+        question = (
+            f"⚠️ *Alerta de Seguridad*\n"
+            f"El agente quiere ejecutar `{tool_name}`\n"
+            f"```\n{args_preview}\n```\n"
+            f"Razón: {reason}\n\n"
+            f"¿Autorizás esta acción? "
+            f"(Respondé 'aprobar', 'sí', o 'no')"
+        )
+
+        try:
+            user_reply = await request_user_approval(
+                session.phone_number,
+                question,
+                wa_client,
+                timeout=120,
+            )
+            # Interpretar respuesta
+            affirmative = [
+                "aprobar", "sí", "si", "yes", "ok",
+                "dale", "autorizar", "approve",
+            ]
+            return user_reply.lower().strip() in affirmative
+        finally:
+            session.status = AgentStatus.RUNNING
+
+    return _security_hitl_callback
+```
+
+## Integración en el Tool Loop
+
+```python
+# En execute_tool_loop
+if decision.requires_flag:
+    if hitl_callback:
+        approved = await hitl_callback(
+            tool_call.name,
+            tool_call.arguments,
+            decision.reason,
+        )
+        if approved:
+            # Usuario aprobó → ejecutar
+            result = await execute_tool(tool_call)
+            audit_trail.record(
+                tool_name=tool_call.name,
+                decision="flag_approved",
+                execution_result=result,
+            )
+        else:
+            # Usuario rechazó → bloquear
+            result = "DENIED: User rejected the action."
+            audit_trail.record(
+                tool_name=tool_call.name,
+                decision="flag_denied",
+            )
+    else:
+        # No hay callback → bloquear por seguridad
+        result = "BLOCKED: HITL required but no callback available"
+```
+
+## Timeout: El Safety Net
+
+```python
+# Si el usuario no responde en 120 segundos
+except asyncio.TimeoutError:
+    return (
+        "TIMEOUT: The user did not respond within 120 seconds. "
+        "Proceeding with the safest option."
+    )
+```
+
+<Callout variant="tip" title="'Safest option' = no ejecutar">
+El mensaje dice "proceeding with the safest option" — el agente recibe este string y decide qué hacer. En la práctica, el callback retorna `False` (porque "TIMEOUT" no está en la lista de respuestas afirmativas), lo que bloquea la acción. Timeout = deny.
+</Callout>
+
+## Ejemplo de Flujo Completo
+
+```
+[Agente: "Voy a hacer git push a main"]
+  ↓
+[PolicyEngine evalúa: rule_git_push_flag → FLAG]
+  ↓
+[AuditTrail registra: decision=flag]
+  ↓
+[session.status = WAITING_USER]
+  ↓
+[WhatsApp al usuario:]
+  "⚠️ Alerta de Seguridad
+   El agente quiere ejecutar `git_push`
+   {"branch": "main"}
+   Razón: Push to main requires human approval
+   ¿Autorizás esta acción?"
+  ↓
+[120s esperando...]
+  ↓
+[Usuario responde: "sí"]
+  ↓
+[resolve_hitl → event.set()]
+  ↓
+[callback retorna True]
+  ↓
+[Tool se ejecuta + AuditTrail: flag_approved]
+  ↓
+[session.status = RUNNING]
+```
+
+<Quiz
+  question="¿Cómo se pausa el agente para esperar aprobación humana?"
+  options={[
+    "Con time.sleep()",
+    "Con await asyncio.Event.wait() — la coroutine se pausa hasta que otra coroutine llame event.set()",
+    "Con un polling loop",
+    "Con un webhook"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Qué pasa si el usuario no responde al HITL en 120 segundos?"
+  options={[
+    "La sesión se cancela",
+    "Se ejecuta la acción de todas formas",
+    "El callback retorna False (timeout = deny) y la acción se bloquea",
+    "Se reenvía el mensaje"
+  ]}
+  correct={2}
+/>
+
+<Quiz
+  question="¿Por qué resolve_hitl retorna True cuando consume un mensaje?"
+  options={[
+    "Para confirmar que la aprobación fue exitosa",
+    "Para indicar al webhook router que NO procese ese mensaje como chat normal — fue consumido por el HITL",
+    "Para registrar en el audit log",
+    "No retorna nada"
+  ]}
+  correct={1}
+/>
+
+En la última lección veremos los shell controls y la denylist/allowlist.

@@ -1,0 +1,164 @@
+---
+title: "Checks Determinísticos"
+description: "5 validaciones rápidas sin LLM: vacío, largo, JSON, idioma y PII"
+xpReward: 75
+---
+
+## Rápidos, Confiables, Sin IA
+
+Los checks determinísticos son la primera línea de defensa. No necesitan llamar al LLM — usan regex, contadores y heurísticas simples. Corren en **microsegundos**.
+
+<Callout variant="tip" title="Determinístico = predecible">
+Dado el mismo input, siempre producen el mismo resultado. No hay variabilidad de un modelo de lenguaje. Esto los hace ideales para validaciones críticas.
+</Callout>
+
+## Check 1: not_empty
+
+```python
+def check_not_empty(response: str) -> GuardrailResult:
+    """La respuesta debe tener contenido real, no solo whitespace."""
+    passed = bool(response and response.strip())
+    return GuardrailResult(
+        check_name="not_empty",
+        passed=passed,
+        message="" if passed else "Response is empty or whitespace-only",
+    )
+```
+
+A veces el LLM genera solo espacios, newlines, o strings vacíos. Este check lo atrapa.
+
+## Check 2: excessive_length
+
+```python
+def check_excessive_length(
+    response: str, max_chars: int = 8000
+) -> GuardrailResult:
+    """Limitar respuestas absurdamente largas."""
+    passed = len(response) <= max_chars
+    return GuardrailResult(
+        check_name="excessive_length",
+        passed=passed,
+        message="" if passed else f"Response too long: {len(response)} chars (max {max_chars})",
+    )
+```
+
+8000 caracteres es ~2 mensajes de WhatsApp. Si el LLM genera más, probablemente entró en un loop de generación.
+
+## Check 3: no_raw_tool_json
+
+```python
+def check_no_raw_tool_json(response: str) -> GuardrailResult:
+    """Detectar JSON crudo de herramientas expuesto al usuario."""
+    suspicious_patterns = [
+        r'"tool_calls"\s*:',
+        r'"function"\s*:\s*\{',
+        r'"arguments"\s*:\s*\{',
+        r'"tool_call_id"\s*:',
+    ]
+    has_json = any(re.search(p, response) for p in suspicious_patterns)
+    return GuardrailResult(
+        check_name="no_raw_json",
+        passed=not has_json,
+        message="Response contains raw tool JSON" if has_json else "",
+    )
+```
+
+<Callout variant="warning" title="Problema común">
+Cuando el tool calling loop falla parcialmente, el LLM a veces incluye el JSON interno de las herramientas en su respuesta. El usuario vería algo como `{"function": {"name": "get_weather", ...}}` en vez de una respuesta legible.
+</Callout>
+
+## Check 4: language_match
+
+```python
+async def check_language_match(
+    response: str, expected_lang: str
+) -> GuardrailResult:
+    """Verificar que la respuesta está en el idioma del usuario."""
+    if len(response.strip()) < 30:
+        return GuardrailResult(check_name="language_match", passed=True)
+
+    # langdetect es bloqueante → asyncio.to_thread
+    detected = await asyncio.to_thread(detect_language, response)
+    passed = detected == expected_lang
+    return GuardrailResult(
+        check_name="language_match",
+        passed=passed,
+        message=f"Expected {expected_lang}, got {detected}" if not passed else "",
+    )
+```
+
+<Concept title="Skip si &lt; 30 caracteres">
+Textos muy cortos como "OK", "Listo", "Sure" no tienen suficiente señal para detectar el idioma confiablemente. El check se skipea para evitar falsos positivos.
+</Concept>
+
+## Check 5: no_pii
+
+```python
+def check_no_pii(response: str) -> GuardrailResult:
+    """Detectar PII (información personal) en la respuesta."""
+    pii_patterns = [
+        # Tarjetas de crédito (4 grupos de 4 dígitos)
+        r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',
+        # Emails
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        # Teléfonos (10-15 dígitos con posible +)
+        r'\b\+?\d{10,15}\b',
+    ]
+    for pattern in pii_patterns:
+        if re.search(pattern, response):
+            return GuardrailResult(
+                check_name="no_pii",
+                passed=False,
+                message="PII detected in response",
+                severity="error",  # Severidad alta
+            )
+    return GuardrailResult(check_name="no_pii", passed=True)
+```
+
+<Callout variant="error" title="Severidad error">
+`no_pii` es el único check con `severity="error"`. Filtrar datos personales de un usuario es una violación de privacidad que podría tener consecuencias legales.
+</Callout>
+
+## Orden de Ejecución
+
+Los 5 checks corren en secuencia porque son tan rápidos (microsegundos) que paralelizarlos no tiene sentido:
+
+```python
+results = [
+    check_not_empty(response),
+    check_excessive_length(response),
+    check_no_raw_tool_json(response),
+    await check_language_match(response, user_lang),
+    check_no_pii(response),
+]
+```
+
+<Quiz
+  question="¿Por qué check_language_match usa asyncio.to_thread()?"
+  options={[
+    "Para paralelizar la detección en múltiples textos",
+    "Porque langdetect es una librería bloqueante que detendría el event loop",
+    "Para comprimir el texto antes de analizar",
+    "Para enviar el texto a un servidor de detección"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuándo se skipea el check de idioma?"
+  options={[
+    "Nunca, siempre corre",
+    "Si el texto tiene menos de 30 caracteres (insuficiente señal)",
+    "Si el LLM no soporta el idioma",
+    "Si el usuario no configuró un idioma preferido"
+  ]}
+  correct={1}
+/>
+
+<Quiz
+  question="¿Cuál es el único check con severity='error'?"
+  options={["not_empty", "excessive_length", "language_match", "no_pii"]}
+  correct={3}
+/>
+
+En la siguiente lección veremos los 2 checks que sí necesitan al LLM.

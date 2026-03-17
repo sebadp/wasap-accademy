@@ -1,4 +1,4 @@
-# AgentCraft
+   # AgentCraft
 
 Plataforma gamificada para aprender Inteligencia Artificial Generativa construyendo **WasAP**: un asistente de WhatsApp con IA real — memoria, RAG, tool calling, agentes, trazabilidad y guardrails.
 
